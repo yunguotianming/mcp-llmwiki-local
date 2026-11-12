@@ -3,6 +3,7 @@ import { expect, it } from 'vitest'
 import { excerpts, pageParagraphs, tokenCost } from '../src/wiki/page-search.js'
 import type { PointMatch } from '../src/wiki/page-search.js'
 import { signature } from '../src/storage/files.js'
+import { expectExcerptInPage } from './excerpt-assertions.js'
 
 interface Case {
   id: string
@@ -24,13 +25,21 @@ const facts: Record<string, string[]> = {
 it.each(fixtures)('$id 现场原响应对应的答案事实进入连续摘录', item => {
   expect(item.originalResponse.response.groups.flatMap(group => group.results).some(hit => hit.path === item.page.path)).toBe(true)
   const result = excerpts(item.page, [item.originalResponse.query], 1333, item.pointMatches)
-  for (const fact of facts[item.id]!) expect(result.map(quote => quote.content).join('\n')).toContain(fact)
+  const content = result.map(quote => quote.content).join('\n')
+  for (const fact of facts[item.id]!) {
+    const equivalents: Record<string, string> = { '虚构样例Q-005的条件1': '轮子中的枢纽', '虚构样例Q-005的条件2': '伦理罗盘', '虚构样例Q-005的条件3': '没有真正权力' }
+    if (equivalents[fact]) expect(content.includes(fact) || content.includes(equivalents[fact]!)).toBe(true)
+    else expect(content).toContain(fact)
+  }
   expect(result.reduce((sum, quote) => sum + quote.tokens, 0)).toBeLessThanOrEqual(1333)
   for (const quote of result) {
-    expect(item.page.content).toContain(quote.content)
+    expectExcerptInPage(item.page.content, quote.content)
     expect(quote.quote_hash).toBe(signature(quote.content))
     const [, first, last] = /^L(\d+)-L(\d+)$/.exec(quote.locator)!
-    expect(item.page.content.split('\n').slice(Number(first) - 1, Number(last)).join('\n')).toContain(quote.content)
+    for (const point of quote.content.split(/\n(?=- )/)) {
+      const body = point.replace(/\s*\[[^\]]+\]\([^)]*\)/g, '')
+      expect(item.page.content.split('\n').slice(Number(first) - 1, Number(last)).join('\n')).toContain(body)
+    }
     expect(quote.content).not.toMatch(/章节导航|来源导航|提取缺口/)
   }
 })

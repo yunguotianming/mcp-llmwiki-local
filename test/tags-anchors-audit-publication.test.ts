@@ -9,6 +9,7 @@ import { putPage } from '../src/layered/objects.js'
 import { validatePublication } from '../src/layered/publication.js'
 import { LayeredQuery } from '../src/wiki/layered-query.js'
 import { evidenceBlockIds } from '../src/layered/anchors.js'
+import { expectExcerptInPage } from './excerpt-assertions.js'
 import { cleanupLayeredFixtures, snapshotManifest, snapshotFixture } from './layered-fixture.js'
 import type { Extraction, Processing } from '../src/layered/schema.js'
 import type { LocalSource } from '../src/layered/snapshot.js'
@@ -81,8 +82,8 @@ it('P03 生成块 ID 不进入引文和 FTS 摘录，伪造页面锚点仍被校
   const results = (await query.search(f.library, layered, '可核验', ['source'])).value
   expect(results.length).toBeGreaterThan(0)
   for (const hit of results) {
-    expect(page).toContain(hit.snippet); expect(hit.snippet).not.toMatch(/ \^[\w-]+/)
-    for (const excerpt of hit.excerpts) { expect(page).toContain(excerpt.content); expect(excerpt.content).not.toMatch(/ \^[\w-]+/) }
+    expectExcerptInPage(page, hit.snippet); expect(hit.snippet).not.toMatch(/ \^[\w-]+/)
+    for (const excerpt of hit.excerpts) { expectExcerptInPage(page, excerpt.content); expect(excerpt.content).not.toMatch(/ \^[\w-]+/) }
   }
   f.manifest.pages!['sources/S-0001.md'] = await putPage(f.root, page.replace(/ \^p[\da-f]+/, ' ^伪造'))
   await saveManifest(f.root, f.manifest)

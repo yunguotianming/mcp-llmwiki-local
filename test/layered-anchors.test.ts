@@ -13,6 +13,7 @@ import { indexDependencies } from '../src/layered/revocations.js'
 import { hydrateVectors, storageJson } from '../src/layered/vectors.js'
 import type { PendingBuild, Point } from '../src/layered/schema.js'
 import { excerpts, pageParagraphs } from '../src/wiki/page-search.js'
+import { expectExcerptInPage } from './excerpt-assertions.js'
 import { LayeredQuery } from '../src/wiki/layered-query.js'
 import { cleanupLayeredFixtures, layeredFixture, layeredIncrementalFixture, modelOutput, snapshotManifest } from './layered-fixture.js'
 
@@ -147,9 +148,9 @@ it('全部页面链接命中真实块，旧待发布及已发布状态零提取�
   expect(results).toHaveLength(1)
   expect(results[0]!.anchor).toMatch(/^\^p[a-f0-9]{12}(?:-\d+)?$/)
   for (const hit of results) {
-    expect(pages.get(hit.path)).toContain(hit.snippet)
+    expectExcerptInPage(pages.get(hit.path)!, hit.snippet)
     expect(hit.snippet).not.toMatch(/ \^[a-zA-Z0-9-]+/)
-    for (const quote of hit.excerpts) { expect(pages.get(hit.path)).toContain(quote.content); expect(quote.content).not.toMatch(/ \^[a-zA-Z0-9-]+/) }
+    for (const quote of hit.excerpts) { expectExcerptInPage(pages.get(hit.path)!, quote.content); expect(quote.content).not.toMatch(/ \^[a-zA-Z0-9-]+/) }
   }
   // 模拟已发布旧版：旧引用及分节依赖落盘，提取快照保持逐字不变。
   delete first.anchor_format
