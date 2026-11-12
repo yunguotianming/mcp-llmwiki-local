@@ -19,9 +19,13 @@ import { locatorRange, processingFingerprint, renderSource, resultFingerprint, s
 import { formatVersion } from './schema.js'
 import type { Dependencies, Extraction, LibraryCard, PendingBuild, Point, SnapshotManifest } from './schema.js'
 import { checkGeneration, indexDependencies, readRevocations, revocationLog } from './revocations.js'
-import { topicHeader } from './topics.js'
+import { topicHeader, topicInputFingerprint, topicPointHashes } from './topics.js'
+import { topicReviewFingerprint } from './topic-review.js'
+import { citedTopicPoints } from './topic-metadata.js'
+import type { TopicEvidenceSource } from './topic-metadata.js'
+import { layeredSettings } from '../domain/config.js'
 import { costMarkdown, costReport, saveCosts } from './costs.js'
-import { topicDepth, topicPath } from './hierarchy.js'
+import { pageLink, topicDepth, topicPath } from './hierarchy.js'
 import { validSourceId } from './revocations.js'
 import { validateSiyuanSnapshot } from './siyuan.js'
 import { prepareTags, mergedTags, personalTag, tagStatus } from './tags.js'
@@ -166,7 +170,13 @@ export async function validatePublication(root: string, version: string): Promis
       const pointLimit = extraction.point_limit ?? extraction.processing.tier
       if (!Number.isSafeInteger(pointLimit) || pointLimit < 1 || extraction.segments.flatMap(segment => segment.points).length > pointLimit) throw new Error('篇级要点超过提取配额上限。')
       for (const call of extraction.calls) if (!Number.isFinite(call.input_limit) || call.input_limit <= 0 || call.input_bytes > call.input_limit) throw new Error('提取调用超出上下文上限。')
-      if (settledValue(pageRead) !== renderSource(entry, extraction)) throw new Error('来源页与提取快照不一致。')
+      const content = settledValue(pageRead)
+      if (content !== renderSource(entry, extraction)) {
+        // 旧版本未记录重试标记，也未渲染提示；只接受这一处格式差异，其他正文仍须逐字匹配。
+        const legacy = manifest.source_page_format === undefined && extraction.gaps?.length && extraction.gaps.every(gap => gap.retryable === undefined)
+          ? { ...extraction, gaps: extraction.gaps.map(gap => ({ ...gap, retryable: false })) } : undefined
+        if (!legacy || content !== renderSource(entry, legacy)) throw new Error('来源页与提取快照不一致。')
+      }
     }))
     for (const result of results) settledValue(result)
   }
@@ -253,6 +263,70 @@ export async function finishPublication(root: string, pending: PendingBuild): Pr
 }
 export async function publishLibrary(root: string, pending: PendingBuild, signal?: AbortSignal, activate = true, options?: BuildLayeredOptions): Promise<string> {
   await checkGeneration(root, pending.manifest.revocation_generation)
+  if (pending.topics) {
+    const topics = pending.topics
+    // 兼容旧 pending：收缩合并已转移要点，但曾同时保存源主题的归档实体和重定向。
+    const redirects = new Map(topics.state.topics.filter(topic => topic.archived && topics.aliases?.[topic.id])
+      .map(topic => [topic.path, topicPath(topics.aliases![topic.id]!)]))
+    if (redirects.size) {
+      const changed = new Set<string>()
+      for (const topic of topics.state.topics) if (redirects.has(topic.path) && topic.parent_id) changed.add(topic.parent_id)
+      topics.state.topics = topics.state.topics.filter(topic => !redirects.has(topic.path))
+      for (const page of redirects.keys()) delete topics.pages[page]
+      const redirectLinks = (content: string, page: string) => content.replace(/\[([^\]]*)\]\(([^)]+)\)/g, (link, label: string, target: string) => {
+        if (/^(?:[a-z][a-z\d+.-]*:|\/)/i.test(target)) return link
+        const split = target.search(/[?#]/), file = split < 0 ? target : target.slice(0, split), suffix = split < 0 ? '' : target.slice(split)
+        const destination = redirects.get(file ? path.posix.normalize(path.posix.join(path.posix.dirname(page), file)) : page)
+        return destination ? `[${label}](${pageLink(page, destination)}${suffix})` : link
+      })
+      for (const [page, value] of [...Object.entries(topics.pages), ...Object.entries(pending.terms?.pages ?? {})]) {
+        const content = redirectLinks(value.content, page)
+        if (content !== value.content) {
+          const topic = topics.state.topics.find(topic => topic.path === page)
+          if (topic) changed.add(topic.id)
+        }
+        value.content = content
+        // 合并的是兄弟叶页，父页保留目标依赖，去掉源页依赖。
+        if (value.dependencies.children) value.dependencies.children = value.dependencies.children.filter(child => !redirects.has(child.page))
+      }
+      for (const topic of topics.state.topics) {
+        const summary = redirectLinks(topic.summary, topic.path)
+        if (summary !== topic.summary && topic.parent_id) changed.add(topic.parent_id)
+        topic.summary = summary
+      }
+      // 兼容清理只改本地链接；检查点中的三处指纹必须与续跑判定使用同一公式。
+      const points = new Map<string, Point>(), contexts = new Map<string, TopicEvidenceSource>()
+      const affected = topics.state.topics.filter(topic => changed.has(topic.id) && topics.pages[topic.path])
+      const reviewSources = new Set(affected.filter(topic => topics.pages[topic.path]!.dependencies.review)
+        .flatMap(topic => topic.point_ids.map(id => id.split(':')[0]!)))
+      for (const source of pending.manifest.sources) {
+        const extraction = await readExtraction(root, source.extract.path)
+        for (const point of extraction.segments.flatMap(segment => segment.points)) points.set(point.point_id, point)
+        if (!reviewSources.has(source.source_id)) continue
+        const input = source.siyuan?.input ?? source.files.source, bytes = await readFile(await safePath(root, input))
+        const expected = source.siyuan ? source.siyuan.objects.find(object => object.path === input)?.hash : source.content_hash
+        if (!expected || hash(bytes) !== expected) throw new Error('主题核对来源快照校验失败：' + source.source_id)
+        contexts.set(source.source_id, { title: source.metadata.title, source_version: source.source_version,
+          text: decodeSourceText(bytes), segments: source.segments })
+      }
+      const pointHashes = topics.point_hashes ?? topicPointHashes(points, pending.manifest.sources)
+      const settings = layeredSettings(options?.topics || {}, options?.tier)
+      for (const topic of affected) {
+        const page = topics.pages[topic.path]!, header = topicHeader(page.content)
+        page.input_fingerprint = topicInputFingerprint(topic, topics.state, pointHashes)
+        page.content = page.content.replace(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/,
+          '---\n' + stringify({ ...header, input_fingerprint: page.input_fingerprint }).trimEnd() + '\n---\n')
+        if (page.dependencies.review) {
+          let members = topic.point_ids.map(id => points.get(id)!).filter(Boolean)
+          if ((page.dependencies.review.removed.length || page.dependencies.review.metadata_members) && !page.content.includes('## 子主题导航')) {
+            const cited = citedTopicPoints(page.content, members)
+            if (cited.length) members = cited
+          }
+          page.dependencies.review.fingerprint = topicReviewFingerprint(page.content, members, settings.contradictionReview, contexts)
+        }
+      }
+    }
+  }
   // 失败的发布尝试不确定首次发布时间；只继承已发布版本固化的时间。
   pending.manifest.page_created = pending.base_version ? (await readVersion(root, pending.base_version)).page_created ?? {} : {}
   const publishRoot = await safePath(root, 'versions')
@@ -342,6 +416,7 @@ export async function publishLibrary(root: string, pending: PendingBuild, signal
     for (const result of results) if (result.status === 'rejected') throw result.reason
   }
   pending.manifest.anchor_format = 'obsidian-block-v1'
+  pending.manifest.source_page_format = 'retryable-gaps-v1'
   pending.manifest.pages = Object.fromEntries(Object.entries(pending.manifest.pages).sort(([a], [b]) => a.localeCompare(b)))
   pending.manifest.deps = deps; pending.manifest.aliases = pending.topics?.aliases ?? {}
   if (pending.topics) { pending.topics.state.version = version; pending.manifest.topics = pending.topics.state }

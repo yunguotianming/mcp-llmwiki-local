@@ -71,6 +71,24 @@ const topicProtocolVersion = hash(JSON.stringify(['rules-before-topic-v1', syste
   referenceCorrectionSystem, referenceCorrectionInstruction, memberBlockInstruction, memberMergeInstruction, parentMergeInstruction,
   syntaxCorrectionInstruction, citationCorrectionInstruction, schemaJSON(topicOutput), schemaJSON(singleSourceTopicOutput),
   schemaJSON(referenceCorrectionOutput), schemaJSON(topicClaims), schemaJSON(parentOutput), topicReviewVersion]))
+const topicGenerationHash = hash(JSON.stringify(['topic-members-v4', topicProtocolVersion]))
+export function topicPointHashes(points: Map<string, Point>, sources: SourceEntry[]): Record<string, string> {
+  return Object.fromEntries([...points].sort(([a], [b]) => a.localeCompare(b)).map(([id, point]) => {
+    const source = sources.find(source => source.source_id === id.split(':')[0])!
+    return [id, hash(JSON.stringify([
+      point.point_id, point.text_hash, point.text, point.section,
+      point.evidence.map(({ source_id, quote }) => [source_id, quote]),
+      [source.metadata.title, source.metadata.source_type, source.metadata.credibility, source.metadata.credibility_reason,
+        source.metadata.source_date, source.metadata.source_date_basis],
+      source.logical_source_id ?? source.source_id,
+    ]))]
+  }))
+}
+export function topicInputFingerprint(topic: Topic, state: TopicState, pointHashes: Record<string, string>): string {
+  return hash(JSON.stringify([topicGenerationHash, topic.id, topic.path,
+    [...topic.point_ids].sort().map(id => [id, pointHashes[id]]), [...(topic.direct_point_ids ?? [])].sort(),
+    childrenOf(state, topic).map(child => [child.id, child.title, child.summary]).sort(([a], [b]) => a!.localeCompare(b!))]))
+}
 export function topicHeader(page: string): Record<string, unknown> {
   const match = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(page)
   if (!match) throw new Error('主题页缺少 YAML 头。')
@@ -201,20 +219,11 @@ export async function prepareTopics(root: string, pending: PendingBuild, committ
     }
     if (!next) for (const page of deps.reverse_sources?.[entry.source_id] ?? []) affected.add(page)
   }
-  const generationHash = hash(JSON.stringify(['topic-members-v4', topicProtocolVersion]))
+  const generationHash = topicGenerationHash
   const configurationFingerprint = hash(JSON.stringify([generationHash, semanticStageSettings(settings, 'topic'), clusteringVersion, options.promptVersion,
     settings.topicSimilarityThreshold, settings.topicAttachThreshold, settings.topicClusterBlockSize, settings.topicNeighborCount]))
   // text_hash 是原段哈希；同一段纠正提取后，要点正文与证据也必须参与主题失效判定。
-  const pointHashes = Object.fromEntries([...points].sort(([a], [b]) => a.localeCompare(b)).map(([id, point]) => {
-    const source = pending.manifest.sources.find(source => source.source_id === id.split(':')[0])!
-    return [id, hash(JSON.stringify([
-      point.point_id, point.text_hash, point.text, point.section,
-      point.evidence.map(({ source_id, quote }) => [source_id, quote]),
-      [source.metadata.title, source.metadata.source_type, source.metadata.credibility, source.metadata.credibility_reason,
-        source.metadata.source_date, source.metadata.source_date_basis],
-      source.logical_source_id ?? source.source_id,
-    ]))]
-  }))
+  const pointHashes = topicPointHashes(points, pending.manifest.sources)
   const fingerprint = hash(JSON.stringify([configurationFingerprint, pointHashes, options.vectorIdentity]))
   const previous = await previousState(root, committed, deps, settings), originalState = storageJson(previous)
   const aliases = committed.version ? (await readVersion(root, committed.version)).aliases ?? {} : {}
@@ -342,9 +351,7 @@ export async function prepareTopics(root: string, pending: PendingBuild, committ
     await checkpoint()
   }
   const build = pending.topics!, before = build.model_calls, anchors = evidenceBlockIds(points.values())
-  const pageInput = (topic: Topic) => hash(JSON.stringify([generationHash, topic.id, topic.path,
-    [...topic.point_ids].sort().map(id => [id, pointHashes[id]]), [...(topic.direct_point_ids ?? [])].sort(),
-    childrenOf(build.state, topic).map(child => [child.id, child.title, child.summary]).sort(([a], [b]) => a!.localeCompare(b!))]))
+  const pageInput = (topic: Topic) => topicInputFingerprint(topic, build.state, pointHashes)
   for (const topic of [...build.state.topics].sort((a, b) => topicDepth(b) - topicDepth(a))) {
     const page = build.pages[topic.path]
     if (page?.input_fingerprint && page.input_fingerprint !== pageInput(topic)) affected.add(topic.path)

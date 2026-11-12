@@ -12,6 +12,7 @@ import type { ModelRuntime } from '../src/llm/client.js'
 import { recognizeImage } from '../src/ingest/vision.js'
 import { candidatesFrom } from '../src/ingest/extraction.js'
 import { generateWiki } from '../src/wiki/generation.js'
+import { pageLabels } from '../src/wiki/language.js'
 import { ChangeStore } from '../src/storage/changes.js'
 import { WikiQuery } from '../src/wiki/query.js'
 import { listSources,prepareSourceState } from '../src/wiki/sources.js'
@@ -168,7 +169,11 @@ describe('真实图片输入与识别依据',()=>{
       expect(source.after).toContain('初检记录');expect(source.after).toContain('引用式记录');expect(source.after).toContain('趋势图')
       expect(source.after?.match(/!\[/g)).toHaveLength(3);expect(source.after).toContain(png.toString('base64'));expect(source.after).toContain('charts/trend.png')
       expect(preview.pages.find(page=>page.path==='index.md')?.after).toContain(source.path)
-      expect(JSON.parse(preview.pages.find(page=>page.path==='.llmwiki/knowledge/catalog.json')!.after!)).toEqual({version:1,pages:[]})
+      expect(JSON.parse(preview.pages.find(page=>page.path==='.llmwiki/knowledge/catalog.json')!.after!)).toEqual({version:1,pages:[],
+        labels:pageLabels((await f.store.policy(f.library.id)).policy.wikiLanguage),
+        compilation:expect.objectContaining({version:1,inputKey:expect.any(String),analysisKey:expect.any(String),
+          sources:expect.arrayContaining([expect.objectContaining({path:file,state:'active',hash:expect.any(String)})]),
+          files:expect.arrayContaining([expect.objectContaining({path:source.path,hash:expect.any(String)})])})})
       await expect(readFile(path.join(f.library.wikiPath,source.path))).rejects.toThrow()
       await changes.commit(f.library.id,job.batchId!,preview.batch.digest)
       const query=new WikiQuery(f.store),read=await query.read(source.path)

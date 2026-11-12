@@ -67,6 +67,7 @@ export function splitTopic(state: TopicState, topic: Topic, settings: LayeredSet
 export function mergeShrunken(state: TopicState, previous: TopicState, minimum: number, aliases: Record<string, string>): Set<string> {
   const rebuilt = new Set<string>(), visited = new Set<string>()
   for (const old of previous.topics) {
+    if (visited.has(old.id)) continue
     let topic = state.topics.find(item => item.id === old.id)
     if (!topic && old.parent_id && !childrenOf(previous, old).length) {
       const sibling = state.topics.filter(item => item.parent_id === old.parent_id && !childrenOf(state, item).length)
@@ -79,7 +80,7 @@ export function mergeShrunken(state: TopicState, previous: TopicState, minimum: 
       }
       continue
     }
-    if (!topic?.parent_id || topic.archived || visited.has(topic.id) || childrenOf(state, topic).length || logicalSourceCount(state, topic) >= minimum || logicalSourceCount(state, topic) >= logicalSourceCount(previous, old)) continue
+    if (!topic?.parent_id || topic.archived || childrenOf(state, topic).length || logicalSourceCount(state, topic) >= minimum || logicalSourceCount(state, topic) >= logicalSourceCount(previous, old)) continue
     const sibling = state.topics.filter(item => !item.archived && item.parent_id === topic!.parent_id && item.id !== topic!.id && !childrenOf(state, item).length)
       .map(item => ({ item, score: similarity(topic!.centroid, item.centroid) }))
       .sort((a, b) => b.score - a.score || a.item.id.localeCompare(b.item.id))[0]?.item
@@ -89,7 +90,7 @@ export function mergeShrunken(state: TopicState, previous: TopicState, minimum: 
     if (removed.point_ids.some(id => excludedMember(state, keep.id, id)) || keep.point_ids.some(id => excludedMember(state, removed.id, id))) continue
     if (state.excluded_members?.[removed.id]) state.excluded_members[keep.id] = { ...state.excluded_members[keep.id], ...state.excluded_members[removed.id] }
     keep.point_ids.push(...removed.point_ids); keep.revisions = 0; refreshTopic(state, keep)
-    removed.archived = true
+    state.topics = state.topics.filter(topic => topic.id !== removed.id)
     aliases[removed.id] = keep.id
     for (const [id, target] of Object.entries(aliases)) if (target === removed.id) aliases[id] = keep.id
     rebuilt.add(keep.path); visited.add(keep.id); visited.add(removed.id)

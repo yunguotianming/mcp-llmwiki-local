@@ -104,6 +104,8 @@ export interface SnapshotManifest {
   topic_gaps?: { topic_id: string; point_ids: string[]; message: string; reasons?: TopicCorrectionReason[] }[]
   term_gaps?: { term_id: string; section_id: string; message: string }[]
   pages?: Record<string, string>
+  /** 新发布的来源页必须包含可重试缺口提示；缺省只用于兼容旧版本。 */
+  source_page_format?: 'retryable-gaps-v1'
   deps?: Dependencies
   aliases?: Record<string, string>
   topics?: TopicState

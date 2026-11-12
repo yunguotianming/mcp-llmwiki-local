@@ -80,6 +80,18 @@ export function topicSentences(content: string) {
   return result
 }
 
+const topicNavigation = (content: string) => /## 子主题导航\n([\s\S]*?)(?=\n## |$)/.exec(content)?.[1] ?? ''
+export function topicReviewFingerprint(content: string, members: Point[], contradictionReview: boolean,
+  sourceContexts?: ReadonlyMap<string, TopicEvidenceSource>): string {
+  return hash(JSON.stringify([topicReviewVersion, contradictionReview,
+    topicSentences(content).map(item => item.text.replace(/\[[^\]]*\]\([^)]*\)/g, '')), topicNavigation(content),
+    orderedMembers(members).map(point => [point.point_id, point.text, sourceContexts?.get(point.point_id.split(':')[0]!)?.title,
+      point.evidence.map(evidence => {
+        const context = topicEvidenceContext(evidence, sourceContexts?.get(evidence.source_id))
+        return [evidence.source_id, evidence.quote, context === evidence.quote ? undefined : context]
+      })])]))
+}
+
 export async function reviewTopicContent(topicId: string, content: string, members: Point[], options: BuildLayeredOptions,
   previous?: PageDependencies['review'], metadataPass = false,
   sourceContexts?: ReadonlyMap<string, TopicEvidenceSource>): Promise<{ content: string; review?: PageDependencies['review']; calls: number; failure?: string }> {
@@ -106,11 +118,7 @@ async function reviewTopicContentOnce(topicId: string, content: string, members:
     return { source_id: evidence.source_id, locator: evidence.locator, quote: evidence.quote,
       context: context === evidence.quote ? undefined : context }
   })]))
-  const navigation = (body: string) => /## 子主题导航\n([\s\S]*?)(?=\n## |$)/.exec(body)?.[1] ?? ''
-  const fingerprint = (body: string) => hash(JSON.stringify([topicReviewVersion, settings.contradictionReview,
-    topicSentences(body).map(item => item.text.replace(/\[[^\]]*\]\([^)]*\)/g, '')), navigation(body),
-    members.map(point => [point.point_id, point.text, sourceContexts?.get(point.point_id.split(':')[0]!)?.title,
-      memberEvidence.get(point.point_id)!.map(({ source_id, quote, context }) => [source_id, quote, context])])]))
+  const fingerprint = (body: string) => topicReviewFingerprint(body, members, settings.contradictionReview, sourceContexts)
   if (previous?.fingerprint === fingerprint(content) && aliases.every(alias => previous.aliases?.includes(alias))) return { content, review: { ...previous, aliases }, calls: 0 }
   if (!sentences.length) return { content, review: { fingerprint: fingerprint(content), removed: [], models: [] }, calls: 0 }
   const usage = modelUsage(options.client)
@@ -118,7 +126,7 @@ async function reviewTopicContentOnce(topicId: string, content: string, members:
   const memberInput = (point: Point) => ({ point_id: references.alias(point.point_id), text: point.text,
     source_title: sourceContexts?.get(point.point_id.split(':')[0]!)?.title, evidence: memberEvidence.get(point.point_id)! })
   const input = { review_stage: 'topic', contradiction_attribution: settings.contradictionReview, topic_id: topicId, sentences: sentences.map(({ id, text }): TopicReviewSentence => ({ id, text })),
-    navigation: navigation(content),
+    navigation: topicNavigation(content),
     members: members.map(memberInput) }
   const limit = await topicBudget(options, 'extract', settings.topicReviewInputBudget)
   let calls = 0
