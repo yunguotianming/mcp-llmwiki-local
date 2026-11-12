@@ -13,6 +13,7 @@ import { createEmbeddingClient } from '../layered/cloud-embedding.js'
 import { embeddingReadiness, embeddingTimedOut, type EmbeddingReadiness } from '../layered/embedding-readiness.js'
 import type { EmbeddingClient, LibraryCard, EmbeddingIdentity } from '../layered/schema.js'
 import { validSourceId, withLayeredRead } from '../layered/revocations.js'
+import { withStateLayout } from '../storage/paths.js'
 import { SiyuanAdapter, validateSiyuanRoot, WikiExportClient } from '../layered/siyuan.js'
 import type { LayeredReadOptions, LayeredReadResult, LayeredReadView } from '../layered/revocations.js'
 import { terms } from './identity-search.js'
@@ -75,8 +76,18 @@ function pageValue(library: LibraryRegistration, view: LayeredReadView, relative
     hash: signature(raw), links: [], sources, ...(view.warning ? { warning: view.warning } : {}), sourceVersions: sources.map(sourceId => ({ sourceId, sourceVersion: view.manifest.sources.find(source => source.source_id === sourceId)?.source_version ?? '' })),
     sourceDate: text(header.source_date), sourceType: text(header.source_type), credibility: text(header.credibility), version: view.version, currentVersion: view.current.version, vector: [], pointVectors: [], vectorIds: [], pointVectorIds: [] }
 }
+// 向量记录对象由已校验对象缓存按文件元数据复用，内容不可变；同一记录的归一化结果跟随记录对象复用，记录被淘汰或文件变化时一并失效。
+// 返回的数组被多个查询共享，调用方只读不改（相似度与质心计算都不改写输入）。
+const normalizedRecords = new WeakMap<object, number[]>()
+function normalizedRecord(record: { vector: number[] }): number[] {
+  let value = normalizedRecords.get(record)
+  if (!value) { value = normalized(record.vector); normalizedRecords.set(record, value) }
+  return value
+}
 async function run<T>(root: string, options: LayeredReadOptions, action: (view: LayeredReadView) => Promise<T>) {
-  return withLayeredRead(root, async view => ({ value: await action(view), view }), { ...options, filterConflicts: true })
+  // 一次查询要解析上千个库内路径；布局在本次读取开始时确定，与写入路径相同，每个目标仍单独解析真实路径并校验边界。
+  // 布局只会在停止写入后由迁移改变，查询期间不变；查询结束即失效，下一次查询重新识别。
+  return withStateLayout(root, () => withLayeredRead(root, async view => ({ value: await action(view), view }), { ...options, filterConflicts: true }))
 }
 async function admission(library: LibraryRegistration, layered: LayeredLibrary, signal?: AbortSignal): Promise<void> {
   if (layered.card.origin_type !== 'siyuan') return
@@ -209,7 +220,7 @@ export class LayeredQuery {
       const load = (id: string) => {
         if (!loaded.has(id)) loaded.set(id, readVectorRecord(layered.root, id).then(record => {
           if (!sameIdentity(locked, recordIdentity(record, view.manifest.topics?.embedding.url))) throw new Error('向量身份不符。')
-          const vector = normalized(record.vector)
+          const vector = normalizedRecord(record)
           availableVectors.add(id)
           return vector
         }).catch(error => { if (!vectorUnavailable(error) && !(error instanceof Error && /向量.*身份/.test(error.message))) throw error; missingVectors++; return [] }))

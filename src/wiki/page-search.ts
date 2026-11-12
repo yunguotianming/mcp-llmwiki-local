@@ -81,9 +81,13 @@ export function pageParagraphs(content: string, queries: string[], pointMatches:
   paragraphCache.length = Math.min(paragraphCache.length, 8)
   return value
 }
-function computeParagraphs(content: string, queries: string[], pointMatches: PointMatch[]) {
-  const needles = passageTerms(queries), question = passageQueries(queries).join('\n'), lines = content.split('\n')
-  const blocks: { content: string; anchor: string; locator: string; score: number; line: number; pointScore: number; evidence: boolean; refs: string[]; matched: string[]; penalty: number; section: string }[] = []
+// 独立块 ID 行归属哪几行只由页面正文决定，与查询无关；整页 Markdown 解析是查询里最重的一步，按正文复用。
+// 按正文全文比较（不按路径），页面一改就重新解析；调用方只读不改，返回同一个只读映射。
+const attachedCache = new Map<string, ReadonlyMap<number, string>>()
+let attachedBytes = 0
+function attachedBlockIds(content: string): ReadonlyMap<number, string> {
+  const hit = attachedCache.get(content)
+  if (hit) { attachedCache.delete(content); attachedCache.set(content, hit); return hit }
   const attached = new Map<number, string>()
   if (/^[ \t]+\^[a-zA-Z0-9-]+[ \t]*\r?$/m.test(content)) {
     const nodes = parseMarkdown(content).children
@@ -94,6 +98,18 @@ function computeParagraphs(content: string, queries: string[], pointMatches: Poi
       if (id && previous?.position) for (let line = previous.position.start.line - 1; line < previous.position.end.line; line++) attached.set(line, id)
     })
   }
+  // 上限按正文字节计，最多约 32MB；超出时淘汰最久未用的页面。
+  while (attachedCache.size && attachedBytes + content.length > 32 * 1024 * 1024) {
+    const oldest = attachedCache.keys().next().value!
+    attachedBytes -= oldest.length; attachedCache.delete(oldest)
+  }
+  attachedCache.set(content, attached); attachedBytes += content.length
+  return attached
+}
+function computeParagraphs(content: string, queries: string[], pointMatches: PointMatch[]) {
+  const needles = passageTerms(queries), question = passageQueries(queries).join('\n'), lines = content.split('\n')
+  const blocks: { content: string; anchor: string; locator: string; score: number; line: number; pointScore: number; evidence: boolean; refs: string[]; matched: string[]; penalty: number; section: string }[] = []
+  const attached = attachedBlockIds(content)
   let anchor = '', headingAnchor = '', start = 0, buffer: string[] = [], excludedDepth = 0, sectionName = ''
   let frontmatter = lines[0]?.trim() === '---'
   const flush = () => {
