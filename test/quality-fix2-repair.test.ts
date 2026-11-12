@@ -71,6 +71,7 @@ it('主题标题和成员列表不变，正文纠正保持编号且拒绝注入�
     const f = reviewFixture()
     f.call.mockImplementation(async (_task, _system, raw) => {
       const input = JSON.parse(raw)
+      if (input.sentences?.some((s: any) => s.original_text !== undefined)) return JSON.stringify({ items: input.sentences.map((s: any) => ({ id: s.id, support: '完整支撑', missing: null, claim_preserved: true })) })
       if (input.review_stage === 'topic') return JSON.stringify({ items: input.sentences.map((s: any) => ({ id: s.id, support: '不支撑', missing: '待纠正' })) })
       return JSON.stringify({ sentences: input.validationFeedback.map((s: any) => ({ id: s.id,
         text: input.sentences.find((v: any) => v.id === s.id).text.startsWith('#') ? '# 被改写的标题' : revision,

@@ -48,7 +48,7 @@ it.each([
     const d = JSON.parse(raw)
     return JSON.stringify(d.review_stage === 'topic-correction'
       ? { sentences: d.sentences.map((s: any) => ({ id: s.id, text: s.text.replace(original, changed), point_ids: ['P1'], support: '完整支撑', missing: null })) }
-      : { items: d.sentences.map((s: any) => ({ id: s.id, support: s.text.includes(original) ? '不支撑' : '完整支撑', missing: s.text.includes(original) ? '主张待纠正' : null })) })
+      : { items: d.sentences.map((s: any) => ({ id: s.id, ...(s.original_text !== undefined ? { claim_preserved: true } : {}), support: s.text.includes(original) ? '不支撑' : '完整支撑', missing: s.text.includes(original) ? '主张待纠正' : null })) })
   })
   const result = await reviewTopicContent('T-0001', '# 主题\n\n' + original + link, members, f.options)
   expect(result.content).not.toContain(changed)
@@ -67,7 +67,7 @@ it.each([
     const d = JSON.parse(raw)
     return JSON.stringify(d.review_stage === 'topic-correction'
       ? { sentences: d.sentences.map((s: any) => ({ id: s.id, text: s.text.replace(original, changed), point_ids: ['P1'], support: '完整支撑', missing: null })) }
-      : { items: d.sentences.map((s: any) => ({ id: s.id, support: s.text.includes(original) ? '不支撑' : '完整支撑', missing: s.text.includes(original) ? '措辞或多余分句待纠正' : null })) })
+      : { items: d.sentences.map((s: any) => ({ id: s.id, ...(s.original_text !== undefined ? { claim_preserved: true } : {}), support: s.text.includes(original) ? '不支撑' : '完整支撑', missing: s.text.includes(original) ? '措辞或多余分句待纠正' : null })) })
   })
   const result = await reviewTopicContent('T-0001', '# 主题\n\n' + original + link, members, f.options)
   expect(result.content).toContain(changed)

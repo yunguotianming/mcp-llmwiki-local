@@ -5,38 +5,52 @@ import type { EvidenceParagraph } from './evidence.js'
 export const sameClaim = (original: unknown, corrected: unknown): boolean => typeof original === 'string'
   && typeof corrected === 'string' && normalizeQuotation(original) === normalizeQuotation(corrected)
 
-// 综合句可以改措辞、删除完整分句，但保留分句的否定、数量与归属锚点必须不变。
-// 无法证明锚点一致就拒收，由主题核对的既有删句/缺口路径处理。
-export function preservesClaimFacts(original: string, corrected: string): boolean {
-  if (sameClaim(original, corrected)) return true
-  const clauses = (text: string) => normalizeQuotation(text).split(/[，,；;。！？!?]|\.(?=\s|$)|并且|而且|但是|然而|\band\b(?=\s+(?:did|does|do|is|are|was|were|has|have)\b)/u).map(value => value.trim()).filter(Boolean)
-  const anchors = (text: string) => {
-    const negatives = text.match(/没有|不得|不能|不曾|从未|并非|未|不|无|非|\b(?:not|no|never|neither|without)\b|n['’]t/giu) ?? []
-    const quantities = text.match(/\d+(?:[.,]\d+)*(?:%|％)?|[零〇一二三四五六七八九十百千万亿两]+|全部|部分|多数|少数|\b(?:all|some|many|few|one|two|three|four|five|six|seven|eight|nine|ten)\b/giu) ?? []
-    // 谓语之前的对象及“某研究/作者的”归属保持逐字；不把措辞变化当作对象替换。
-    const predicate = /没有|未|不|无|并非|采用|使用|参与|纳入|包括|包含|发现|显示|表明|报告|认为|指出|提出|负责|实施|开展|进行|接受|提供|完成|作出|作贡献|贡献|提高|降低|增加|减少|改善|导致|属于|是|为|有|\b(?:is|are|was|were|has|have|had|did|does|do|used?|participat\w*|includ\w*|report\w*|found|show\w*|suggest\w*|conduct\w*|receiv\w*)\b/iu.exec(text)
-    const subject = predicate ? text.slice(0, predicate.index).trim() : ''
-    const head = predicate ? text.slice(0, predicate.index) : text
-    const attribution = [
-      ...(text.match(/[\p{L}\p{N}]+(?:研究|团队|作者|组|机构|医院|大学)(?:中|内)?的|\b[\p{L}\p{N}]+['’]s\b/giu) ?? []),
-      ...(head.match(/[\p{L}\p{N}]+?(?:研究|团队|组|机构|医院|大学)/gu) ?? []),
-      ...(text.match(/\b[A-Z][\p{L}\p{N}-]*\b/gu) ?? []),
-    ]
-    return { facts: JSON.stringify([negatives, quantities, attribution]), subject }
+// 词法层只给出硬拒收信号；返回 true 仍须逐句核对证据与原主张，不能作为语义等价证明。
+// 来源标题是身份：只按提供的 source_id＋source_title 绑定，不把标题中的词当正文事实。
+export function preservesClaimFacts(original: string, corrected: string,
+  sources: readonly { source_id: string; source_title: string }[] = []): boolean {
+  const normalize = (text: string) => {
+    let value = normalizeQuotation(text).replace(/(?<![A-Za-z0-9])P\d+(?![A-Za-z0-9])/g, '').replace(/[（(][、,，\s]*[）)]/g, '')
+    for (const source of [...sources].sort((a, b) => b.source_title.length - a.source_title.length)) {
+      if (source.source_title.trim()) value = value.replaceAll(normalizeQuotation(source.source_title), source.source_id)
+    }
+    // 只规范已知单复数，不推断陌生缩写或角色称谓的等价关系。
+    return value.replace(/\bCRNs\b/g, 'CRN').replace(/\b(nurse|researcher|student|participant|patient)s\b/gi, '$1')
+      .replace(/不一定/g, '未必').replace(/\s+/g, ' ').trim()
   }
-  const before = clauses(original), after = clauses(corrected)
-  let offset = 0
-  return after.every(clause => {
-    const next = anchors(clause)
-    const index = before.findIndex((value, i) => {
-      const previous = anchors(value)
-      // 无主语的概括可补明对象；已有归属不可替换或删除。
-      return i >= offset && previous.facts === next.facts && (!previous.subject || previous.subject === next.subject)
+  const beforeText = normalize(original), afterText = normalize(corrected)
+  // P 编号变动是补证；正文相同不作事实比较，引用有效性仍由调用方校验。
+  if (beforeText === afterText) return true
+  const clauses = (text: string) => text.split(/[，,；;。！？!?]|\.(?=\s|$)|并且|而且|但是|然而|\band\b(?=\s+(?:did|does|do|is|are|was|were|has|have)\b)/u).map(value => value.trim()).filter(Boolean)
+  const dependency = /(?:如果|仅当|只有|除非|前提|条件下|期间|范围内|之后|之前|后方可|除.+外|与.+相比|经.+后|在.+时|相对于|回复邀请且|符合.+(?:条件|标准)|仅限)/u
+  const predicates = /参与(?!者)|参加|使用|采用|提供|纳入|包括|包含|贡献|负责|实施|开展|进行|接受|完成|提高|降低|增加|减少|改善|导致|属于|存在|代表|支持|反对|签署|申请|\b(?:participat\w*|provid\w*|includ\w*|use[ds]?|support\w*|oppose[ds]?|increas\w*|decreas\w*)\b/giu
+  const anchors = (text: string) => {
+    // 否定必须作用于谓词；不把“一无所知”“非临床”的单字当整句否定。
+    const negatives = [...text.matchAll(predicates)].flatMap(match => {
+      const prefix = text.slice(0, match.index)
+      return /(?:没有|不能|不得|不曾|从未|并非|未|不)(?:再|曾|曾经|直接|明确)?$|\b(?:not|no|never|neither|without)\s+$|n['’]t\s*$/iu.test(prefix) ? [match[0]] : []
     })
-    if (index < 0) return false
+    const quantities = text.match(/\d+(?:[.,]\d+)*(?:%|％)?|首次|第[零〇一二三四五六七八九十百千万亿两\d]+(?:次|轮|期|位|名)|[零〇一二三四五六七八九十百千万亿两]+(?=名|人|项|个|组|场|次|轮|年|月|天|分钟|小时|篇|位|种|份|类|周)|全部|所有|部分|多数|少数|许多|\b(?:all|some|many|few|one|two|three|four|five|six|seven|eight|nine|ten)\b/giu) ?? []
+    const attribution = text.match(/\bS-\d+\b|[甲乙丙丁戊己庚辛壬癸](?:研究|团队|组|机构|医院|大学)|[\p{L}\p{N}]+(?:研究|团队|作者|组|机构|医院|大学)(?:中|内)?的|\b[A-Z][\p{L}\p{N}-]*\b/gu) ?? []
+    const modal = text.match(/可能|或许|也许|未必|一定|必然|必须|应当|须|可(?=以|在|向|由|被|获得|获取|提供|使用|参与|签署|申请)|\b(?:may|might|must|should|could)\b/giu) ?? []
+    const bounds = text.match(/少于|多于|至少|至多|超过|不足|不超过|不低于|大于|小于|等于|[<>≤≥]=?/gu) ?? []
+    const directions = (text.match(/提高|提升|升高|上升|降低|下降|增加|增多|减少|支持|赞成|反对|参与(?!者)|参加|使用|采用/gu) ?? [])
+      .map(word => /提高|提升|升高|上升/.test(word) ? '提高' : /降低|下降/.test(word) ? '降低' : /增加|增多/.test(word) ? '增加'
+        : /支持|赞成/.test(word) ? '支持' : /参与|参加/.test(word) ? '参与' : /使用|采用/.test(word) ? '使用' : word)
+    const restrictions = text.match(/回复邀请且|符合[^，；。]*?(?:条件|标准)|仅限[^，；。]*|除[^，；。]+外|与[^，；。]+相比|(?<=在)[^，；。]*?期间|(?:研究|随访|治疗|观察|干预)期间|经[^，；。]+后/g) ?? []
+    return JSON.stringify([negatives, quantities, attribution, modal, bounds, directions, restrictions])
+  }
+  const before = clauses(beforeText), after = clauses(afterText)
+  if (!after.length) return false
+  let offset = 0
+  for (const clause of after) {
+    let index = before.findIndex((value, i) => i >= offset && value === clause)
+    if (index < 0) index = before.findIndex((value, i) => i >= offset && anchors(value) === anchors(clause))
+    if (index < 0 || before.slice(offset, index).some(value => dependency.test(value))) return false
     offset = index + 1
-    return true
-  })
+  }
+  // 删除独立无据断言可以保留其余部分；被删条件、时间、比较或例外不能放宽保留主张。
+  return !before.slice(offset).some(value => dependency.test(value))
 }
 
 // 只改同一来源内唯一逐字命中的定位；歧义和未命中继续交给原有纠正流程。

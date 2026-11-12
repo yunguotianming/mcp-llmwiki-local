@@ -365,10 +365,10 @@ export async function prepareTopics(root: string, pending: PendingBuild, committ
   const upgradeTopic = (topic: Topic) => options.reextract === undefined || options.reextract === 'all' || !deps.pages[topic.path]
     || affected.has(topic.path) || topic.point_ids.some(id => options.reextract!.includes(id.split(':')[0]!))
   pending.manifest.topic_gaps = build.gaps ??= []
-  const failTopic = async (topic: Topic, error: unknown, kind?: TopicGap['kind']) => {
+  const failTopic = async (topic: Topic, error: unknown, kind?: TopicGap['kind'], reasons?: TopicGap['reasons']) => {
     failed.add(topic.id)
     ;(build.retry_topics ??= []).push(structuredClone(topic))
-    const gap: TopicGap = { topic_id: topic.id, point_ids: [...topic.point_ids], message: error instanceof Error ? error.message : String(error), ...(kind ? { kind } : {}) }
+    const gap: TopicGap = { topic_id: topic.id, point_ids: [...topic.point_ids], message: error instanceof Error ? error.message : String(error), ...(kind ? { kind } : {}), ...(reasons?.length ? { reasons } : {}) }
     ;(build.gaps ??= []).push(gap)
     delete build.pages[topic.path]
     await checkpoint()
@@ -425,11 +425,11 @@ export async function prepareTopics(root: string, pending: PendingBuild, committ
     const checked = topic.archived ? { content, calls: 0, review: undefined } : await checkTopic(topic, content, dependencies.review)
     options.signal?.throwIfAborted()
     content = checked.content; build.model_calls += checked.calls
-    if ('failure' in checked && checked.failure) { await failTopic(topic, new Error(checked.failure)); return }
+    if ('failure' in checked && checked.failure) { await failTopic(topic, new Error(checked.failure), undefined, checked.review?.reasons); return }
     if (checked.review) dependencies = { ...dependencies, review: checked.review }
     topic.models = mergeModels(dependencies.models ?? [], dependencies.review?.models ?? [])
     dependencies = { ...dependencies, models: topic.models }
-    if (checked.review?.removed.length) (build.gaps ??= []).push({ topic_id: topic.id, point_ids: [...topic.point_ids], message: '删除未支撑句：' + checked.review.removed.join('；') })
+    if (checked.review?.removed.length) (build.gaps ??= []).push({ topic_id: topic.id, point_ids: [...topic.point_ids], message: '删除未支撑句：' + checked.review.removed.join('；'), ...(checked.review.reasons?.length ? { reasons: checked.review.reasons } : {}) })
     if (!topic.archived && !childrenOf(build.state, topic).length && !/\]\([^)]*sources\/(?:S-\d+|\d{14}-[a-z0-9]{7})\.md#\^/.test(content)) {
       await failTopic(topic, new Error('核对后没有可支撑的正文，保留来源层并登记主题缺口。'))
       return
@@ -873,7 +873,7 @@ export async function prepareTopics(root: string, pending: PendingBuild, committ
           if (page && !topic.archived && upgradeTopic(topic)) {
             const checked = await checkTopic(topic, page.content, page.dependencies.review, activeSignal)
             build.model_calls += checked.calls
-            if (checked.failure) await failTopic(topic, new Error(checked.failure))
+            if (checked.failure) await failTopic(topic, new Error(checked.failure), undefined, checked.review?.reasons)
             else if (checked.calls) await savePage(topic, checked.content, { ...page.dependencies, ...(checked.review ? { review: checked.review } : {}) })
           }
           if (build.pages[topic.path] || failed.has(topic.id)) finished.add(topic.id)
@@ -908,7 +908,7 @@ export async function prepareTopics(root: string, pending: PendingBuild, committ
     if (!page || topic.archived || !upgradeTopic(topic)) return
     const checked = await checkTopic(topic, page.content, page.dependencies.review, activeSignal)
     build.model_calls += checked.calls
-    if (checked.failure) { await failTopic(topic, new Error(checked.failure)); return }
+    if (checked.failure) { await failTopic(topic, new Error(checked.failure), undefined, checked.review?.reasons); return }
     if (checked.review && checked.review.fingerprint !== page.dependencies.review?.fingerprint) {
       if (!childrenOf(build.state, topic).length && !/\]\([^)]*sources\/(?:S-\d+|\d{14}-[a-z0-9]{7})\.md#\^/.test(checked.content)) {
         await failTopic(topic, new Error('核对后没有可支撑的正文，保留来源层并登记主题缺口。')); return
@@ -931,7 +931,7 @@ export async function prepareTopics(root: string, pending: PendingBuild, committ
       page.dependencies = { ...page.dependencies, review: checked.review, models: topic.models }
       page.input_fingerprint = pageInput(topic)
       if (!build.rewritten.includes(topic.id)) build.rewritten.push(topic.id)
-      if (checked.review.removed.length) (build.gaps ??= []).push({ topic_id: topic.id, point_ids: [...topic.point_ids], message: '删除未支撑句：' + checked.review.removed.join('；') })
+      if (checked.review.removed.length) (build.gaps ??= []).push({ topic_id: topic.id, point_ids: [...topic.point_ids], message: '删除未支撑句：' + checked.review.removed.join('；'), ...(checked.review.reasons?.length ? { reasons: checked.review.reasons } : {}) })
     }
   }, async (error, topic) => {
     signal.throwIfAborted()

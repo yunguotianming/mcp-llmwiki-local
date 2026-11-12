@@ -10,7 +10,7 @@ import { fullSentenceTopicFixture, referentialTopicFixture } from './fixtures/to
 interface ReviewRequest {
   review_stage: string
   topic_id: string
-  sentences: { id: string; text: string; previous_sentence?: { id: string; text: string } | null }[]
+  sentences: { id: string; text: string; original_text?: string; previous_sentence?: { id: string; text: string } | null }[]
   members: { point_id: string; text: string; source_title?: string;
     evidence: { source_id: string; locator: string; quote: string; context?: string }[] }[]
   validationFeedback?: { id: string; missing: string }[]
@@ -35,6 +35,7 @@ function harness(respond: (input: ReviewRequest) => unknown) {
 
 function verdicts(input: ReviewRequest, rejected: ReadonlySet<string> = new Set()) {
   return { items: input.sentences.map(sentence => ({ id: sentence.id,
+    ...(sentence.original_text !== undefined ? { claim_preserved: true } : {}),
     support: rejected.has(sentence.id) ? '不支撑' : '完整支撑',
     missing: rejected.has(sentence.id) ? '成员没有支撑该过度推断。' : null })) }
 }
@@ -143,11 +144,12 @@ it('核对与纠正均传完整句上下文，原引文不变且上下文变化�
     })) }
   })
   const result = await reviewTopicContent('T-0053-01', content, members, model.options, undefined, false, fixture.sources)
-  expect(result.calls).toBe(2)
+  // 补证后实际保留的句子也须独立最终核对，原有产物与上下文断言保持。
+  expect(result.calls).toBe(3)
   expect(result.failure).toBeUndefined()
   expect(result.content).toContain(corrected)
   expect(result.review?.removed).toEqual([])
-  expect(model.requests.map(request => request.input.review_stage)).toEqual(['topic', 'topic-correction'])
+  expect(model.requests.map(request => request.input.review_stage)).toEqual(['topic', 'topic-correction', 'topic'])
   for (const request of model.requests) {
     expect(request.input.members[0]!.source_title).toBe(fixture.source.title)
     expect(request.input.members[0]!.evidence).toEqual([{

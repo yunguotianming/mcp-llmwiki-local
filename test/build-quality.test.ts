@@ -21,7 +21,7 @@ it('T-0025标题、别名与页头随正文纠正，成员和逐字引文不变�
   f.call.mockImplementation(async (_task, _system, raw) => {
     const d = JSON.parse(raw)
     return JSON.stringify(d.review_stage === 'topic-correction' ? { sentences: d.sentences.map((s: any) => ({ id: s.id, text: '# 患者和公众未作贡献', point_ids: ['P1'], support: '完整支撑', missing: null })) }
-      : { items: d.sentences.map((s: any) => ({ id: s.id, support: s.text.includes('未参与') ? '不支撑' : '完整支撑', missing: s.text.includes('未参与') ? '贡献不等于参与' : null })) })
+      : { items: d.sentences.map((s: any) => ({ id: s.id, ...(s.original_text !== undefined ? { claim_preserved: true } : {}), support: s.text.includes('未参与') ? '不支撑' : '完整支撑', missing: s.text.includes('未参与') ? '贡献不等于参与' : null })) })
   })
   const result = await reviewTopicContent('T-0025', body, members, f.options)
   expect(result.failure).toBeUndefined(); expect(result.content).not.toContain('未参与研究')

@@ -101,7 +101,7 @@ export interface SnapshotManifest {
   next_term_number?: number
   topic_sequence?: { root: number; children: Record<string, number> }
   gaps?: { source_id: string; status: string; message: string }[]
-  topic_gaps?: { topic_id: string; point_ids: string[]; message: string }[]
+  topic_gaps?: { topic_id: string; point_ids: string[]; message: string; reasons?: TopicCorrectionReason[] }[]
   term_gaps?: { term_id: string; section_id: string; message: string }[]
   pages?: Record<string, string>
   deps?: Dependencies
@@ -135,9 +135,10 @@ export interface PointLabels {
   keyword_truncation?: { received: number; retained: number }
 }
 export interface PointDependency { point_id: string; text_hash: string }
+export interface TopicCorrectionReason { sentence_id: string; text: string; reason: '证据不完整' | '改变原主张' }
 export interface PageDependencies {
   models?: ModelRef[]
-  review?: { fingerprint: string; removed: string[]; models?: ModelRef[]; aliases?: string[]; metadata_members?: string[] }
+  review?: { fingerprint: string; removed: string[]; reasons?: TopicCorrectionReason[]; models?: ModelRef[]; aliases?: string[]; metadata_members?: string[] }
   sources: string[]; points: PointDependency[]; children?: { page: string; version: string }[]
   calls?: { input_bytes: number; input_limit: number; kind?: 'member-block' | 'member-merge' | 'parent-block' | 'parent-merge' }[]; revisions?: number
   terms?: TermRecord[]
