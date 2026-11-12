@@ -31,7 +31,7 @@ export interface Point {
 }
 export interface Term { models?: ModelRef[]; referent?: string | undefined; name: string; category: string; aliases: string[]; locator: string; note: string | null }
 export interface ExtractionRejection { rule: string; expected: string; actual: string }
-export interface ExtractionGap { kind: 'point' | 'term' | 'group' | 'summary' | 'unverified_claim'; segment_hashes: string[]; item: unknown; reasons: ExtractionRejection[] }
+export interface ExtractionGap { kind: 'point' | 'term' | 'group' | 'summary' | 'unverified_claim'; retryable?: boolean; segment_hashes: string[]; item: unknown; reasons: ExtractionRejection[] }
 export interface SourceChapter { id: string; title: string; depth: number; parent_id: string | null; paragraph_ids: number[]; quota: number }
 export interface SourceSummary { models?: ModelRef[]; id: string; point_ids: string[]; missing: string[]; level: number; children: string[]; fingerprint: string }
 export interface TagStatus { message?: '标签不足'; count: number; minimum: number; personal_information_removed: number }
@@ -225,7 +225,7 @@ export interface BuildLayeredOptions {
   /** 明确选择同一资料根下的模型库；省略时兼容旧库，否则按模型生成目录名。 */
   wikiPath?: string
   reextract?: 'all' | string[] | undefined
-  /** 用户显式重试已发布的提取与补标缺口；默认缺口原样保留，只在来源内容或处理身份变化时随之重做。 */
+  /** 用户显式重试已发布的提取与补标缺口；传输错误产生的组级缺口在普通建库及续跑时也会自动重试。 */
   retryGaps?: boolean
   /** 已在本次写入探针核对的身份；不参与来源提取指纹。 */
   vectorIdentity?: EmbeddingIdentity

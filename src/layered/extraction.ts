@@ -11,7 +11,7 @@ import type { ModelAttempt } from '../llm/client.js'
 import { CallGate, mapConcurrent } from '../llm/scheduler.js'
 import { separateImages } from '../ingest/markdown.js'
 import { allocatePointQuotas } from './budget.js'
-import { ModelCallError } from '../llm/client.js'
+import { isModelTransportError, ModelCallError } from '../llm/client.js'
 import { appendLog, hash, hashName, writeJson } from './files.js'
 import { locatorRange, sections } from './schema.js'
 export { locatorRange } from './schema.js'
@@ -120,7 +120,7 @@ function schemaReasons(error: z.ZodError, value: unknown): ExtractionRejection[]
 }
 // 仅模型请求与输出校验失败可转为缺口；文件操作异常保持原样向外抛出。
 class ExtractionFailure extends Error {
-  constructor(readonly reason: unknown, readonly shrink: boolean) { super(reason instanceof Error ? reason.message : String(reason)) }
+  constructor(readonly reason: unknown, readonly shrink: boolean, readonly retryable = false) { super(reason instanceof Error ? reason.message : String(reason)) }
 }
 function globalFailure(error: unknown, signal: AbortSignal): boolean {
   if (signal.aborted) return true
@@ -181,8 +181,11 @@ export function resultFingerprint(extraction: Extraction): string {
   const segments = extraction.segments.length ? extraction.segments.map(segment => segment.processing_fingerprint) : [processingFingerprint(extraction.processing)]
   return hash(JSON.stringify(extraction.grouping_fingerprint ? [segments, extraction.grouping_fingerprint] : segments))
 }
-export function extractionNeedsRetry(extraction: Extraction): boolean {
-  return Boolean(extraction.gaps?.some(gap => gap.kind === 'group' || gap.kind === 'summary'))
+export function retryableExtractionGap(gap: ExtractionGap): boolean {
+  return gap.kind === 'group' && (gap.retryable ?? gap.reasons.some(reason => reason.rule === 'extract-group' && isModelTransportError(reason.actual)))
+}
+export function extractionNeedsRetry(extraction: Extraction, retryableOnly = false): boolean {
+  return Boolean(extraction.gaps?.some(gap => retryableOnly ? retryableExtractionGap(gap) : gap.kind === 'group' || gap.kind === 'summary'))
 }
 interface Paragraph { paragraph_id: number; locator: string; text_hash: string; text: string }
 function paragraphs(source: LocalSource): Paragraph[] {
@@ -476,6 +479,16 @@ async function extractSourceOnce(root: string, sourceId: string, source: LocalSo
   const wholeChars = whole.reduce((sum, part) => sum + Array.from(part.text).length, 0)
   const hardLimit = book ? undefined : packPointLimit(wholeChars, processing.tier, processing.granularity)
   const grouping = groupingFingerprint(plan, settings)
+  const groupIdentity = (hashes: string[]) => JSON.stringify([...new Set(hashes)].sort())
+  const gapKey = (gap: ExtractionGap) => {
+    const key = object(gap.item)?.chunk_key
+    return typeof key === 'string' ? key : groupIdentity(gap.segment_hashes)
+  }
+  const retryableGroups = new Set(previous?.gaps?.filter(retryableExtractionGap).map(gap => groupIdentity(gap.segment_hashes)))
+  // 自动补传输缺口时，同篇内已经确认的内容失败仍保留；显式重试沿用原入口。
+  const settledGroups = new Map(!options.retryGaps && previous?.source_hash === source.contentHash && previous.grouping_fingerprint === grouping
+    && sameProcessing(previous.processing, processing) && previous.segments.every((segment, index) => JSON.stringify(segment.resource_hashes) === JSON.stringify(resources[index] ?? []))
+    ? previous.gaps?.filter(gap => gap.kind === 'group' && !retryableExtractionGap(gap)).map(gap => [gapKey(gap), gap] as const) : [])
   const longdoc = retainedPlan ? previous!.plan_longdoc! : book && isLongdoc(plan), prompt = longdoc ? longdocSystem : system
   const input = (parts: Paragraph[], quota: number) => extractionInput(sourceId, source, processing, parts, quota, longdoc ? settings.sourceSummaryMaxPoints : undefined, allocation.chapters, vocabulary)
   const progressPath = (grouping: string) => 'work/extractions/' + sourceId + '/' + hashName(source.contentHash) + '/extract/' + hashName(extractionFingerprint(source, processing, resources, grouping))
@@ -797,7 +810,7 @@ async function extractSourceOnce(root: string, sourceId: string, source: LocalSo
       if (!attempts.some(attempt => attempt.error)) await record(prompt, request, cause instanceof ModelCallError ? cause.failure?.rawOutput ?? '' : '',
         [rejected('model-call', '模型调用完整结束', cause instanceof Error ? cause.message : String(cause))], cause instanceof ModelCallError ? cause.failure : undefined)
       if (globalFailure(cause, signal)) throw cause
-      throw new ExtractionFailure(cause, lengthFailure(cause))
+      throw new ExtractionFailure(cause, lengthFailure(cause), isModelTransportError(cause))
     }
     const call = { input_bytes: Buffer.byteLength(prompt + request), input_limit: inputLimit }
     state.callLog.push({ seq: sequence, call })
@@ -945,10 +958,19 @@ async function extractSourceOnce(root: string, sourceId: string, source: LocalSo
       split: false, groupFailed: false, children: [], coverageAttempted: new Set(), initialCandidates: [], callLog: calls.map((call, seq) => ({ seq, call })), callSeq: calls.length,
       models: mergeModels(cached?.models), initialModels: mergeModels(cached?.initial_models), itemModels: structuredClone(cached?.item_models ?? {}) }
     states.set(chunkKey, state)
+    const identity = groupIdentity(parts.map(part => part.text_hash))
+    // 长段切片可共用段落哈希；旧缺口不能区分切片且其中有传输失败时，重新提取该范围。
+    const settled = settledGroups.get(chunkKey) ?? (retryableGroups.has(identity) ? undefined : settledGroups.get(identity))
+    if (settled) {
+      state.groupFailed = true
+      if (!result.gaps!.some(gap => gap.kind === 'group' && gapKey(gap) === gapKey(settled))) result.gaps!.push(structuredClone(settled))
+      return state
+    }
     if (partial && !cached && !result.chunk_splits?.[chunkKey]) {
       // 失败组不列为完成；续跑前替换该组旧缺口和未完成候选，避免重复发布。
       const hashes = new Set(parts.map(part => part.text_hash))
-      result.gaps = result.gaps!.filter(gap => !gap.segment_hashes.some(value => hashes.has(value)))
+      result.gaps = result.gaps!.filter(gap => gap.kind === 'group' && typeof object(gap.item)?.chunk_key === 'string'
+        ? gapKey(gap) !== chunkKey : !gap.segment_hashes.some(value => hashes.has(value)))
       for (const segment of result.segments) segment.points = segment.points.filter(point => !point.point_id.includes(':' + order + '.'))
     }
     if (result.chunk_splits?.[chunkKey]) { await createChildren(state, result.chunk_splits[chunkKey]); return state }
@@ -1041,8 +1063,8 @@ async function extractSourceOnce(root: string, sourceId: string, source: LocalSo
       if (error.shrink && parts.length > 1 && depth < settings.extractMaxSplitDepth) await createChildren(state)
       else {
         state.groupFailed = true
-        result.gaps!.push({ kind: 'group', segment_hashes: [...new Set(parts.map(part => part.text_hash))],
-          item: { paragraphs: parts.map(part => ({ paragraph_id: part.paragraph_id, locator: part.locator })), depth },
+        result.gaps!.push({ kind: 'group', retryable: error.retryable, segment_hashes: [...new Set(parts.map(part => part.text_hash))],
+          item: { chunk_key: chunkKey, paragraphs: parts.map(part => ({ paragraph_id: part.paragraph_id, locator: part.locator })), depth },
           reasons: [rejected('extract-group', '该组完成提取', error.message)] })
       }
     }
@@ -1394,7 +1416,7 @@ export function renderSource(entry: SourceEntry, extraction: Extraction): string
   }
   if (entry.siyuan) blocks.push('## 思源回源\n\n请走 keeper_notes 回源，action="read"；target 与 revision 按具体块使用：\n\n'
     + entry.siyuan.source_refs.map(reference => `- ${reference.locator}：${JSON.stringify(reference)}`).join('\n'))
-  if (extraction.gaps?.length) blocks.push(`## 提取缺口\n\n${extraction.gaps.map(gap => `- ${gap.kind === 'unverified_claim' ? '要点未核实' : (gap.kind === 'point' ? '要点' : gap.kind === 'group' ? '提取组' : gap.kind === 'summary' ? '摘要' : '术语') + '未保留'}：${gap.reasons.map(reason => `${reason.rule}（期望：${reason.expected}；实际：${reason.actual}）`).join('；')}`).join('\n')}`)
+  if (extraction.gaps?.length) blocks.push(`## 提取缺口\n\n${extraction.gaps.map(gap => `- ${gap.kind === 'unverified_claim' ? '要点未核实' : (gap.kind === 'point' ? '要点' : gap.kind === 'group' ? '提取组' : gap.kind === 'summary' ? '摘要' : '术语') + '未保留'}${retryableExtractionGap(gap) ? '（可重试，下次建库自动重提）' : ''}：${gap.reasons.map(reason => `${reason.rule}（期望：${reason.expected}；实际：${reason.actual}）`).join('；')}`).join('\n')}`)
   for (const section of sections) {
     const content = section === '证据位置' ? points.flatMap(point => point.evidence.map((evidence, index) => renderEvidence(`${index === 0 && point.section === '证据位置' ? point.text + ' ' : ''}${point.point_id}：[${evidence.source_id}@${evidence.source_version}#${evidence.locator}]`, evidence.quote, anchors.get(point.point_id)![index]!)))
       : points.filter(point => point.section === section).map(point => `- ${point.verification?.status === 'unverified' ? '【未核实】' : ''}${point.text} ${point.evidence.map(evidence => `[${evidence.source_id}@${evidence.source_version}#${evidence.locator}]`).join('；')}`)

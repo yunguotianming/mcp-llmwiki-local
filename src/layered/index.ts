@@ -9,6 +9,7 @@ import { resumeReadingCopy } from './reading-copy.js'
 import { collectGarbage } from './retention.js'
 import path from 'node:path'
 import { mapConcurrent } from '../llm/scheduler.js'
+import { isModelTransportError } from '../llm/client.js'
 import { defaultPolicy } from '../domain/policy.js'
 import { readFile, readdir, unlink } from 'node:fs/promises'
 import { parse } from 'yaml'
@@ -273,7 +274,7 @@ export async function buildLayeredLibrary(options: BuildLayeredOptions): Promise
       const fingerprint = publishedUnchanged && !force ? previous!.extract.processing_fingerprint : extractionFingerprint(source, processing, segmentAssets, groupingFingerprint(plan, settings))
       if (!force && previous?.content_hash === source.contentHash && previous.extract.processing_fingerprint === fingerprint && (!source.siyuan || previous.siyuan?.references_hash === source.siyuan.references_hash) && (publishedUnchanged || sameProcessing(previous.extract.processing, processing))
         && reusableExtraction(previousResult) && previousResult.source_id === sourceId && previousResult.source_hash === source.contentHash
-        && (publishedUnchanged || sameProcessing(previousResult.processing, processing)) && !(options.retryGaps && (extractionNeedsRetry(previousResult) || reviewNeedsRetry(previousResult))) && [reviewPolicy(options), reviewPolicy(options, true)].includes(previousResult.review_policy ?? '') && JSON.stringify(previousResult.overview_limits) === JSON.stringify(overviewLimits(options))
+        && (publishedUnchanged || sameProcessing(previousResult.processing, processing)) && !extractionNeedsRetry(previousResult, true) && !(options.retryGaps && (extractionNeedsRetry(previousResult) || reviewNeedsRetry(previousResult))) && [reviewPolicy(options), reviewPolicy(options, true)].includes(previousResult.review_policy ?? '') && JSON.stringify(previousResult.overview_limits) === JSON.stringify(overviewLimits(options))
         && (!processing.image_policy || JSON.stringify(previous.resource_version) === JSON.stringify(resources))) {
         if (source.siyuan && source.sourceVersion !== previous.source_version) {
           const rebound = await readExtraction(root, previous.extract.path)
@@ -348,7 +349,7 @@ export async function buildLayeredLibrary(options: BuildLayeredOptions): Promise
       // 核对与概览独立于提取缓存；改变这些开关不重发原文提取。
       const reviewPath = progressPath.replace('-progress.json', '-review.json')
       const savedReview = await readCache(reviewPath)
-      extraction = structuredClone(reusableExtraction(savedReview) && savedReview.source_hash === source.contentHash
+      extraction = structuredClone(reusableExtraction(savedReview) && !extractionNeedsRetry(savedReview, !options.retryGaps) && savedReview.source_hash === source.contentHash
         && savedReview.source_id === sourceId && resultFingerprint(savedReview) === resultFingerprint(extraction) ? savedReview : extraction)
       const priorReviews = new Map((!force && reusableExtraction(previousResult) ? previousResult : undefined)?.segments.flatMap(segment => segment.points).filter(point => point.verification)
         .map(point => [reviewFingerprint(point), point.verification!] as const) ?? [])
@@ -404,7 +405,7 @@ export async function buildLayeredLibrary(options: BuildLayeredOptions): Promise
     })
     const extractionAttempts = (options.client.attempts ?? []).slice(extractionAttemptStart)
     const extractionCalls = extractionAttempts.filter(attempt => !attempt.structuredSchemaKind || attempt.structuredSchemaKind === 'extraction')
-    const protocolFailures = extractionCalls.filter(attempt => attempt.error && (attempt.status !== undefined && attempt.status >= 400 && attempt.status < 600
+    const protocolFailures = extractionCalls.filter(attempt => attempt.error && !isModelTransportError({ message: attempt.error, status: attempt.status }) && (attempt.status !== undefined && attempt.status >= 400 && attempt.status < 600
       || /schema|required|additionalproperties|structured|strict|invalid request|\b[45]\d\d\b/i.test(attempt.error)))
     const completedExtraction = extractionCalls.filter(attempt => attempt.finish === 'stop').length
     if (protocolFailures.length > extractionCalls.length / 2) {

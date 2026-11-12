@@ -86,6 +86,8 @@ tool_timeout_sec = 120
 
 生成流程：登记资料 → wiki_generate → 轮询 wiki_status → includePreview=true 阅读变更 → 携带 digest 调用 wiki_commit。取消运行任务后应轮询到终态。服务重启会把失去运行进程的任务标为 interrupted；再次生成复用核心持久检查点。完成预览的 jobId 和 digest 可在重启后继续使用。
 
+提取调用因连接、超时、上游流中断、HTTP 429 或 5xx 耗尽重试时，组级缺口标为可重试，普通建库及续跑会自动重提。其他 4xx 按状态码判为永久缺口；内容校验失败的组级缺口保留，可用 `reextract=gaps` 显式重试。旧缺口没有标记时按原因文本识别。
+
 复制 target 选择 `embeddingMode=ollama` 并提供 `localEmbeddingModel`（可选 `localEmbeddingUrl`），或选择 cloud 并提供 `cloudEmbeddingModel`、`cloudEmbeddingUrl`、`cloudEmbeddingKeyEnv`。目标目录存在时拒绝覆盖，完成后自动登记副本；该工具不走预览提交。
 
 ## 5. 库布局与兼容

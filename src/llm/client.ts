@@ -18,7 +18,22 @@ export class ModelCallError extends Error {
 export class ModelTransportError extends ModelCallError {}
 export const transportRetries = defaultProviderProfile.retryLimit, transportRetryDelayMs = defaultProviderProfile.backoffMs
 // dsh 适配器常返回标准错误码而不附 HTTP 状态；沿用插件供应商档案退避。
-const hostTransientCodes = new Set(['RATE_LIMIT', 'SERVER', 'TRANSPORT', 'TIMEOUT', 'NETWORK_ERROR', 'ECONNRESET', 'ETIMEDOUT'])
+const hostTransientCodes = new Set(['RATE_LIMIT', 'SERVER', 'TRANSPORT', 'TIMEOUT', 'NETWORK_ERROR', 'ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'EPIPE', 'ENOTFOUND', 'EAI_AGAIN'])
+// 请求重试与旧缺口识别共用分类；内容校验失败不属于传输失败。
+export function isModelTransportError(error: unknown): boolean {
+  const value = error && typeof error === 'object' ? error : undefined
+  const status = value && 'status' in value ? value.status : undefined
+  // HTTP 状态优先，其他 4xx 不因错误码或消息中的传输字样而重试。
+  if (typeof status === 'number') return status === 429 || status >= 500 && status < 600
+  if (error instanceof SyntaxError || error instanceof ModelOutputValidationError) return false
+  if (error instanceof ModelTransportError) return true
+  if (value && 'code' in value && hostTransientCodes.has(String(value.code).toUpperCase())) return true
+  if (error instanceof Error && error.name === 'TimeoutError') return true
+  const message = value && 'message' in value ? String(value.message) : String(error)
+  // 旧缺口只有原因文本，解析诊断里引用的模型正文不能当作连接故障。
+  if (/\b(?:SyntaxError|ZodError|ModelOutputValidationError)\b|is not valid JSON|Unexpected (?:token|end of JSON)|Expected .+ in JSON/i.test(message)) return false
+  return /\b(?:ECONNRESET|ETIMEDOUT|ECONNREFUSED|EPIPE|ENOTFOUND|EAI_AGAIN)\b|\bconnection (?:error|reset|closed|aborted|interrupted|refused)\b|fetch failed|socket hang up|network error|error decoding response body|stream (?:disconnected|closed)|\bupstream response stream was interrupted\b|\b(?:request|connection) (?:timed out|timeout)\b|请求超时|连接超时|(?:\bHTTP(?:\/\d(?:\.\d)?)?\s*|\bstatus(?: code)?[\s"':=]+)(?:429|5\d\d)\b|^\s*(?:Error:\s*)?(?:429|5\d\d)\b|\b(?:too many requests|rate limit exceeded|500 internal server error|502 bad gateway|503 service unavailable|504 gateway timeout)\b/i.test(message)
+}
 async function retryDelay(milliseconds: number, signal?: AbortSignal): Promise<void> {
   signal?.throwIfAborted()
   await new Promise<void>((resolve, reject) => {
@@ -185,15 +200,14 @@ export class ModelClient {
         attempt.failure = error instanceof ModelCallError && error.failure ? error.failure : { rawOutput: output }
         if (attempt.finish === 'pending') attempt.finish = callSignal?.aborted ? 'aborted' : 'error'
         signal?.throwIfAborted()
-        const serviceFailure = error instanceof ModelCallError && (error.status === 429 || error.status !== undefined && error.status >= 500 && error.status < 600)
-        const retryable = error instanceof ModelTransportError || serviceFailure && (callOptions.operation !== undefined || this.library.models.providerProfiles?.[route.provider] !== undefined)
-          || error instanceof ModelCallError && hostTransientCodes.has(error.code) && (callOptions.operation !== undefined || this.library.models.providerProfiles?.[route.provider] !== undefined)
+        const transportFailure = isModelTransportError(error)
+        const retryable = transportFailure && (error instanceof ModelTransportError || callOptions.operation !== undefined || this.library.models.providerProfiles?.[route.provider] !== undefined)
         if (retryable && !callSignal?.aborted && retry < profile.retryLimit) {
           gate.penalize(profile.backoffMs * 2 ** retry)
           await retryDelay(profile.backoffMs * 2 ** retry, signal)
           continue
         }
-        const transient = retryable || serviceFailure || timeoutSignal?.aborted || error instanceof ModelCallError && (hostTransientCodes.has(error.code) || error.code === 'image-unsupported')
+        const transient = transportFailure || timeoutSignal?.aborted || error instanceof ModelCallError && error.code === 'image-unsupported'
         if (!transient || index === routes.length - 1) throw error
         break
       } finally {

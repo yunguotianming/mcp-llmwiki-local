@@ -5,10 +5,11 @@ import { readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { setImmediate } from 'node:timers/promises'
 import { afterEach, expect, it, vi } from 'vitest'
-import { layeredSettings } from '../src/domain/config.js'
-import { ModelCallError } from '../src/llm/client.js'
+import { defaultProviderProfile, layeredSettings } from '../src/domain/config.js'
+import { isModelTransportError, ModelCallError, ModelOutputValidationError, ModelTransportError } from '../src/llm/client.js'
 import { buildLayeredLibrary, readLayeredPage } from '../src/layered/index.js'
-import { extractSource } from '../src/layered/extraction.js'
+import { extractSource, retryableExtractionGap } from '../src/layered/extraction.js'
+import { pinVersion } from '../src/layered/retention.js'
 import { readLocalSource } from '../src/layered/snapshot.js'
 import type { Extraction, Processing } from '../src/layered/schema.js'
 import { cleanupLayeredFixtures, layeredFixture, layeredTopicFixture, modelOutput, snapshotManifest } from './layered-fixture.js'
@@ -219,4 +220,234 @@ it('缩段中预算暂停后复用成功叶段与拆分树，恢复不重跑父�
   const result = await saved(f.root)
   expect(result.segments.map(segment => segment.points.length)).toEqual([1, 1, 1, 1])
   expect(result.segments.every(segment => segment.points[0]!.point_id.endsWith(':01'))).toBe(true)
+})
+
+it('传输缺口：连接、429、503、超时和上游流中断用尽重试仍发布，非法内容记永久缺口', async () => {
+  const f = await layeredFixture()
+  f.library.models.providerProfiles.mock = { ...defaultProviderProfile, backoffMs: 0 }
+  const failures = [new Error('Connection error.'), new ModelCallError('限流', 'http', 429),
+    new ModelCallError('服务暂不可用', 'http', 503), new ModelCallError('Request timed out.', 'TIMEOUT'),
+    new Error('Upstream response stream was interrupted')]
+  await Promise.all(Array.from({ length: 6 }, (_, index) => writeFile(path.join(f.knowledgeRoot, `${index}.md`), `第${index}篇原文证据。`)))
+  const counts = new Map<string, number>()
+  f.runtime.stream = async function* (options) {
+    const input = JSON.parse((options.messages[0]!.content[0] as { text: string }).text) as ExtractionInput
+    if (input.paragraphs) {
+      counts.set(input.source_id, (counts.get(input.source_id) ?? 0) + 1)
+      const failure = failures[Number(input.source_id.slice(2)) - 1]
+      if (failure) throw failure
+      // 模型正常结束但输出包含连接错误字样，仍是内容解析失败。
+      yield { type: 'text-delta', index: 0, text: 'Connection error.' }
+    } else yield { type: 'text-delta', index: 0, text: modelOutput(input) }
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  }
+  expect(await buildLayeredLibrary(f.options)).toMatchObject({ version: 'v000001' })
+  const manifest = await snapshotManifest(f.root)
+  expect(manifest.sources).toHaveLength(6)
+  const results = await Promise.all(manifest.sources.map(entry => readFile(path.join(f.root, entry.extract.path), 'utf8').then(text => JSON.parse(text) as Extraction)))
+  expect(results.map(result => result.gaps?.filter(gap => gap.kind === 'group').map(gap => gap.retryable)))
+    .toEqual([[true], [true], [true], [true], [true], [false]])
+  expect(manifest.sources.map(entry => counts.get(entry.source_id))).toEqual([
+    defaultProviderProfile.retryLimit + 1, defaultProviderProfile.retryLimit + 1,
+    defaultProviderProfile.retryLimit + 1, defaultProviderProfile.retryLimit + 1, defaultProviderProfile.retryLimit + 1, 1,
+  ])
+  expect(await readLayeredPage(f.knowledgeRoot, 'sources/S-0001.md')).toContain('可重试，下次建库自动重提')
+  expect(await readLayeredPage(f.knowledgeRoot, 'sources/S-0005.md')).toContain('可重试，下次建库自动重提')
+  expect(await readLayeredPage(f.knowledgeRoot, 'sources/S-0006.md')).not.toContain('可重试，下次建库自动重提')
+})
+
+it('分类回归：含 timeout 的 400 不重试或切备用，记永久缺口并计入协议失败', async () => {
+  const f = await layeredFixture(), message = 'Invalid request: timeout must be a positive integer'
+  f.library.models.providerProfiles.mock = { ...defaultProviderProfile, backoffMs: 0 }
+  f.library.models.fallbacks = [{ provider: 'mock', model: 'backup' }]
+  await writeFile(path.join(f.knowledgeRoot, 'a.md'), '请求被拒绝的原文证据。')
+  const routes: string[] = []
+  f.runtime.stream = async function* (options) {
+    const input = JSON.parse((options.messages[0]!.content[0] as { text: string }).text) as ExtractionInput
+    if (input.paragraphs) {
+      routes.push(options.model)
+      if (options.model === 'extractor') throw new ModelCallError(message, 'TIMEOUT', 400)
+    }
+    yield { type: 'text-delta', index: 0, text: modelOutput(input) }
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  }
+  await expect(buildLayeredLibrary(f.options)).rejects.toThrow(
+    `提取调用因结构化输出协议或服务端拒绝而中止（失败 1，成功 0）。首个服务端错误：${message}`)
+  expect(routes).toEqual(['extractor'])
+  expect(f.client.attempts.filter(attempt => attempt.structuredSchemaKind === 'extraction'))
+    .toMatchObject([{ status: 400, error: message, route: { provider: 'mock', model: 'extractor' } }])
+  const pending = JSON.parse(await readFile(path.join(f.root, 'work/pending.json'), 'utf8')) as {
+    manifest: { sources: { extract: { path: string } }[] }
+  }
+  const extraction: Extraction = JSON.parse(await readFile(path.join(f.root, pending.manifest.sources[0]!.extract.path), 'utf8'))
+  expect(extraction.gaps?.filter(gap => gap.kind === 'group'))
+    .toMatchObject([{ retryable: false, reasons: [{ rule: 'extract-group', actual: message }] }])
+  expect(extraction.gaps?.some(retryableExtractionGap)).toBe(false)
+})
+
+async function transportGapFixture(fail: (chapters: number[]) => void) {
+  const f = await layeredFixture(), requests: number[][] = []
+  f.options.maxInputBytes = 6500
+  await writeFile(path.join(f.knowledgeRoot, 'book.md'), '# 合成长书\n\n' + Array.from({ length: 9 }, (_, index) =>
+    `## 第${index + 1}章\n\n第${index + 1}章结论成立。\n${'正文事实与条件。'.repeat(88)}\n`).join('\n'))
+  f.call.mockImplementation(async (_task, _system, raw) => {
+    const input = JSON.parse(raw) as ExtractionInput
+    const support = mockSupportReview(input)
+    if (support) return support
+    if ('new_tags' in input || input.summary_id) return modelOutput(input)
+    const text = (part: ExtractionInput['paragraphs'][number]) => part.text ?? input.evidence_dictionary![part.evidence_ref!]!.quote
+    const parts = input.paragraphs.filter(part => !/^#{1,6}\s/.test(text(part)))
+    const chapters = parts.flatMap(part => [...text(part).matchAll(/第(\d+)章结论/g)].map(match => Number(match[1])))
+    requests.push(chapters); fail(chapters)
+    const points = Array.from({ length: parts.length ? input.point_limit : 0 }, (_, index) => {
+      const part = parts[index % parts.length]!, quote = text(part).split('\n')[0]!, line = part.locator.split('-')[0]!
+      return { paragraph_id: part.paragraph_id, text: quote + index, section: '主要发现', evidence: [{ locator: `${line}-${line}`, quote }] }
+    })
+    return JSON.stringify({ tags: ['研究方法', '研究对象', '核心主题'], credibility: 'low', credibility_reason: '离线夹具', points, terms: [],
+      summary_point_indices: points.slice(0, input.summary_point_limit ?? 8).map((_, index) => index) })
+  })
+  return { ...f, requests }
+}
+
+it('传输缺口：普通建库只重提传输组并重算点缺口，显式重试可恢复永久组', async () => {
+  let failing = true
+  const f = await transportGapFixture(chapters => {
+    if (failing && chapters.includes(2)) throw new Error('Connection error.')
+    if (failing && chapters.includes(3)) throw new ModelOutputValidationError(new Error('提取结构校验失败'))
+  })
+  await buildLayeredLibrary(f.options)
+  const before = await saved(f.root), entry = (await snapshotManifest(f.root)).sources[0]!
+  const oldBytes = await readFile(path.join(f.root, entry.extract.path), 'utf8'), pinned = await pinVersion(f.root)
+  const chapter2 = before.chapters!.find(chapter => chapter.title === '第2章')!
+  const gapInChapter = (result: Extraction) => result.gaps?.some(gap => (gap.item as { chapter_id?: string } | null)?.chapter_id === chapter2.id)
+  expect(before.gaps?.filter(gap => gap.kind === 'group').map(gap => gap.retryable).sort()).toEqual([false, true])
+  expect(gapInChapter(before)).toBe(true)
+  // 模拟提取结束、核对检查点已写出后中断；旧核对结果不得覆盖新提取。
+  const reviewPath = path.join(f.root, entry.extract.path.replace('objects/snapshots/', 'work/extractions/').replace(/-quality-[^.]+\.json$/, '-review.json'))
+  await filesystem.mkdir(path.dirname(reviewPath), { recursive: true })
+  await writeFile(reviewPath, oldBytes)
+  try {
+    failing = false; f.requests.length = 0
+    await buildLayeredLibrary(f.options)
+    const retried = await saved(f.root)
+    expect(f.requests).toEqual([[2]])
+    expect(retried.gaps?.filter(gap => gap.kind === 'group')).toMatchObject([{ retryable: false }])
+    expect(gapInChapter(retried)).toBe(false)
+    expect(retried.segments.flatMap(segment => segment.points).some(point => point.text.includes('第2章'))).toBe(true)
+    expect(await readFile(path.join(f.root, entry.extract.path), 'utf8')).toBe(oldBytes)
+    f.requests.length = 0
+    expect(await buildLayeredLibrary(f.options)).toMatchObject({ unchanged: true, modelCalls: 0 })
+    expect(f.requests).toEqual([])
+    await writeFile(reviewPath, JSON.stringify(retried))
+    await buildLayeredLibrary({ ...f.options, retryGaps: true })
+    expect(f.requests).toEqual([[3]])
+    expect((await saved(f.root)).gaps).toEqual([])
+  } finally { pinned.release() }
+})
+
+it('传输缺口：中断检查点续跑重提传输组，永久组和成功组不重提', async () => {
+  let interrupted = true
+  const abort = new AbortController()
+  const f = await transportGapFixture(chapters => {
+    if (!interrupted) return
+    if (chapters.includes(2)) throw new Error('Connection error.')
+    if (chapters.includes(3)) throw new ModelOutputValidationError(new Error('提取结构校验失败'))
+    if (chapters.includes(4)) { abort.abort(new Error('用户取消')); abort.signal.throwIfAborted() }
+  })
+  await expect(buildLayeredLibrary({ ...f.options, signal: abort.signal })).rejects.toThrow('用户取消')
+  const files = await filesystem.readdir(path.join(f.root, 'work/extractions'), { recursive: true })
+  const progress = JSON.parse(await readFile(path.join(f.root, 'work/extractions', files.find(file => file.endsWith('-progress.json'))!), 'utf8')) as Extraction
+  expect(progress.in_progress).toBe(true)
+  expect(progress.gaps?.filter(gap => gap.kind === 'group').map(gap => gap.retryable).sort()).toEqual([false, true])
+  interrupted = false; f.requests.length = 0
+  expect(await buildLayeredLibrary(f.options)).toMatchObject({ version: 'v000001' })
+  expect(f.requests.flat()).toContain(2)
+  expect(f.requests.flat()).not.toContain(1)
+  expect(f.requests.flat()).not.toContain(3)
+  const result = await saved(f.root)
+  expect(result.gaps?.filter(gap => gap.kind === 'group')).toMatchObject([{ retryable: false }])
+  expect(result.segments.flatMap(segment => segment.points).some(point => point.text.includes('第2章'))).toBe(true)
+})
+
+it('传输缺口：未标记的旧连接、超时和上游流中断缺口自动恢复，旧版本字节不变', async () => {
+  const f = await layeredFixture()
+  const reasons = ['Connection error.', 'Request timed out.', 'Upstream response stream was interrupted']
+  await Promise.all(reasons.map((_, index) => writeFile(path.join(f.knowledgeRoot, `${index}.md`), `第${index}篇旧库原文证据。`)))
+  f.call.mockImplementation(async (_task, _system, raw) => {
+    const input = JSON.parse(raw) as ExtractionInput
+    if (input.paragraphs) throw new Error(reasons[Number(input.source_id.slice(2)) - 1]!)
+    return modelOutput(input)
+  })
+  await buildLayeredLibrary(f.options)
+  const entries = (await snapshotManifest(f.root)).sources
+  expect(entries).toHaveLength(3)
+  const legacy = await Promise.all(entries.map(async entry => {
+    const file = path.join(f.root, entry.extract.path), extraction: Extraction = JSON.parse(await readFile(file, 'utf8'))
+    for (const gap of extraction.gaps ?? []) {
+      delete gap.retryable
+      if (gap.kind === 'group') delete (gap.item as { chunk_key?: string }).chunk_key
+    }
+    // 仅在临时夹具中还原升级前的数据；产品读取旧库不迁移文件。
+    const oldBytes = JSON.stringify(extraction)
+    await writeFile(file, oldBytes)
+    return { entry, file, extraction, oldBytes }
+  }))
+  const pinned = await pinVersion(f.root)
+  try {
+    expect(legacy.map(item => item.extraction.gaps?.some(retryableExtractionGap))).toEqual([true, true, true])
+    f.call.mockImplementation(async (_task, _system, input) => modelOutput(JSON.parse(input)))
+    f.call.mockClear()
+    await buildLayeredLibrary(f.options)
+    expect(f.call.mock.calls.filter(args => args[5]?.structuredSchemaKind === 'extraction')).toHaveLength(3)
+    const current = await snapshotManifest(f.root)
+    for (const [index, item] of legacy.entries()) {
+      expect((await saved(f.root, index)).gaps).toEqual([])
+      expect(await readFile(item.file, 'utf8')).toBe(item.oldBytes)
+      expect(current.sources[index]!.extract.path).not.toBe(item.entry.extract.path)
+    }
+    expect(await buildLayeredLibrary(f.options)).toMatchObject({ unchanged: true, modelCalls: 0 })
+  } finally { pinned.release() }
+})
+
+it('传输缺口：同段切片按组重试，内容诊断和显式永久标记优先', async () => {
+  expect(['Connection error.', 'fetch failed', 'ECONNRESET', 'ETIMEDOUT', 'socket hang up', 'HTTP 429', 'HTTP 503', '请求超时'].every(isModelTransportError)).toBe(true)
+  expect(isModelTransportError(new DOMException('请求超时', 'TimeoutError'))).toBe(true)
+  expect(isModelTransportError(new SyntaxError('Connection error.'))).toBe(false)
+  expect(isModelTransportError(new ModelOutputValidationError(new Error('HTTP 503')))).toBe(false)
+  expect(isModelTransportError('Unexpected token C, "Connection error." is not valid JSON')).toBe(false)
+  expect(isModelTransportError(new ModelCallError('请求结构错误', 'http', 400))).toBe(false)
+  expect(isModelTransportError('Invalid request: timeout must be a positive integer')).toBe(false)
+  expect(isModelTransportError(new ModelCallError('Request timed out.', 'TIMEOUT', 400))).toBe(false)
+  expect(isModelTransportError(new ModelTransportError('Connection error.', 'TRANSPORT', 400))).toBe(false)
+  expect(isModelTransportError(Object.assign(new Error('Request timed out.'), { name: 'TimeoutError', status: 408 }))).toBe(false)
+  expect(isModelTransportError(new ModelCallError('Upstream response stream was interrupted', 'NETWORK_ERROR', 403))).toBe(false)
+  const gap = { kind: 'group' as const, segment_hashes: ['旧段落'], item: null,
+    reasons: [{ rule: 'extract-group', expected: '该组完成提取', actual: 'Connection error.' }] }
+  expect(retryableExtractionGap(gap)).toBe(true)
+  expect(retryableExtractionGap({ ...gap, retryable: false })).toBe(false)
+  expect(retryableExtractionGap({ ...gap, kind: 'point' })).toBe(false)
+  const f = await layeredFixture(), file = path.join(f.knowledgeRoot, 'a.md')
+  const fragments = ['永久内容。', '传输内容。']
+  await writeFile(file, fragments.join(''))
+  const source = await readLocalSource(file, 'Markdown')
+  expect(source.segments).toHaveLength(1)
+  const segment = source.segments[0]!
+  const plan = fragments.map(text => [{ paragraph_id: 0, locator: segment.locator, text_hash: segment.text_hash, text }])
+  let failing = true
+  f.call.mockImplementation(async (_task, _system, input) => {
+    const data = JSON.parse(input) as ExtractionInput
+    if (failing) {
+      if (data.paragraphs[0]!.text === fragments[0]) throw new ModelOutputValidationError(new Error('校验未通过'))
+      throw new Error('Connection error.')
+    }
+    return output(data)
+  })
+  const before = await extractSource(f.root, 'S-0001', source, processing, f.options, 32000, undefined, [], undefined, plan)
+  expect(before.gaps?.filter(gap => gap.kind === 'group')).toHaveLength(2)
+  failing = false; f.call.mockClear()
+  const result = await extractSource(f.root, 'S-0001', source, processing, f.options, 32000, before, [], undefined, plan)
+  expect(f.call).toHaveBeenCalledTimes(1)
+  expect(JSON.parse(f.call.mock.calls[0]![2]).paragraphs[0].text).toBe(fragments[1])
+  expect(result.gaps?.filter(gap => gap.kind === 'group')).toMatchObject([{ retryable: false }])
+  expect(result.segments[0]!.points).toHaveLength(1)
 })

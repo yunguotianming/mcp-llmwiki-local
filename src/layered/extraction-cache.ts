@@ -82,7 +82,7 @@ const count = z.number().int().nonnegative()
 const models = z.array(z.object({ provider: z.string().min(1), model: z.string().min(1) }))
 const call = z.object({ input_bytes: count, input_limit: count })
 const part = z.object({ paragraph_id: count, locator: z.string(), text_hash: z.string(), text: z.string() })
-const gap = z.object({ kind: z.enum(['point', 'term', 'group', 'summary', 'unverified_claim']), segment_hashes: strings, item: z.unknown(),
+const gap = z.object({ kind: z.enum(['point', 'term', 'group', 'summary', 'unverified_claim']), retryable: z.boolean().optional(), segment_hashes: strings, item: z.unknown(),
   reasons: z.array(z.object({ rule: z.string(), expected: z.string(), actual: z.string() })) })
 const summary = z.object({ models: models.optional(), id: z.string(), point_ids: strings, missing: strings, level: count, children: strings, fingerprint: z.string() })
 const record = <T extends z.ZodType>(schema: T) => z.record(z.string(), schema)
