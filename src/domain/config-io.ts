@@ -1,0 +1,32 @@
+import { z } from 'zod'
+import { emptyRegistry,newLibrary,parseRegistry } from './config.js'
+import type { LayeredSettings, Registry } from './config.js'
+import type { QueryUnderstandingSettings } from './query-settings.js'
+import { MAX_QUERY_OUTPUT_TOKENS } from './query-settings.js'
+import { routesSchema } from './route-schema.js'
+const layered=z.strictObject({embeddingMode:z.enum(['auto','ollama','cloud','none']),pointLabelsOnBuild:z.boolean(),embeddingUnavailable:z.enum(['pause','continue']),embeddingChangeToken:z.string().uuid().optional(),sourceMatchThreshold:z.number().min(0).max(1),sourcePackRatio:z.number().min(0).max(1),sourceLongChapterChars:z.number().int().nonnegative(),extractionReview:z.enum(['off','key','all']),topicReview:z.boolean(),contradictionReview:z.boolean(),sourceOverviewChineseChars:z.number().int().nonnegative(),sourceOverviewEnglishWords:z.number().int().nonnegative(),searchRelevanceThreshold:z.number().min(0).max(1),tagLimit:z.number().int().min(1).max(8),tagVocabularyOnly:z.boolean(),extractMaxSplitDepth:z.number().int().min(0).max(10),extractTargetRatio:z.number().min(0.01).max(1),extractCeilingRatio:z.number().min(0.01).max(1),sourceSummaryFanout:z.number().int().min(2).max(10),sourceSummaryMaxPoints:z.number().int().positive(),sourcePointBaseChars:z.number().int().positive(),sourcePointMaxMultiplier:z.number().int().positive(),sourceChapterMinPoints:z.number().int().nonnegative(),extractMaxInputBytes:z.number().int().positive(),localEmbeddingUrl:z.string(),localEmbeddingModel:z.string(),cloudEmbeddingUrl:z.string(),cloudEmbeddingModel:z.string(),cloudEmbeddingKeyEnv:z.string(),vectorPrecision:z.enum(['float32','float16']),writerTakeoverToken:z.string().uuid().optional(),embeddingBatchSize:z.number().int().positive(),embeddingBatchBytes:z.number().int().positive(),embeddingTimeoutMs:z.number().int().positive(),lexicalTopicSimilarityThreshold:z.number().min(0).max(1),lexicalTopicAttachThreshold:z.number().min(0).max(1),topicSimilarityThreshold:z.number(),topicAttachThreshold:z.number().min(0).max(1),topicMaxPoints:z.number().int().positive(),topicClusterBlockSize:z.number().int().positive().max(2000),topicNeighborCount:z.number().int().positive(),topicReviewInputBudget:z.number().int().nonnegative(),leafInputBudget:z.number().int().nonnegative(),topicMaxChars:z.number(),topicMaxSources:z.number(),termSimilarityThreshold:z.number(),parentInputBudget:z.number().int().nonnegative(),topicMaxChildren:z.number(),topicMaxDepth:z.number(),topicMergeMinSources:z.number(),topicRewriteAfter:z.number(),termInputBudget:z.number(),termIndexMaxPages:z.number(),termIndexPageSize:z.number(),termMaxSources:z.number(),termMaxChars:z.number(),termSectionQuota:z.number(),termThreshold50:z.number(),termThreshold75:z.number(),termThreshold100:z.number(),maxBuildCalls:z.number().int().positive().optional(),maxBuildTokens:z.number().int().positive().optional(),correctionMinCalls:z.number().int().positive(),extractionCorrectionRatio:z.number().positive(),topicCorrectionRatio:z.number().positive(),maxBatchItems:z.number().int().positive()}).partial().transform(value=>value as Partial<LayeredSettings>)
+const siyuan=z.strictObject({whalefallUrl:z.string(),credentialRef:z.string(),workspaceId:z.string(),workspacePath:z.string(),notebookIds:z.array(z.string()),excludeAttribute:z.string().optional(),admissionTimeoutMs:z.number().int().positive().optional(),pollWaitMs:z.number().int().positive().optional(),pollIntervalMs:z.number().int().positive().optional()})
+const queryUnderstanding=z.strictObject({enabled:z.boolean(),model:z.strictObject({provider:z.string(),model:z.string()}),timeoutMs:z.number().int().min(1).max(30000),inputTokens:z.number().int().min(1).max(1500),outputTokens:z.number().int().min(1).max(MAX_QUERY_OUTPUT_TOKENS),maxVariants:z.number().int().min(1).max(3)}).partial().transform(value=>value as Partial<QueryUnderstandingSettings>)
+const library=z.strictObject({id:z.string(),name:z.string(),description:z.string(),kind:z.enum(['local','siyuan','obsidian','whalefall']),mode:z.enum(['readonly','managed','shared']),enabled:z.boolean(),sourceRoots:z.array(z.string()),wikiPath:z.string(),vaultPath:z.string(),kbId:z.string(),catalogId:z.string().default(''),location:z.string().default(''),models:routesSchema,queryUnderstanding:queryUnderstanding.optional(),layered:layered.optional(),siyuan:siyuan.optional()}).transform(({layered,siyuan,queryUnderstanding,...value})=>({...value,...queryUnderstanding?{queryUnderstanding}:{},...layered?{layered}:{},...siyuan?{siyuan}: {}}))
+const registrySchema=z.strictObject({language:z.enum(['zh','en']),activeLibraryId:z.string(),libraries:z.array(library),readMaxChars:z.number().int().min(200).max(100000)})
+const portable=z.strictObject({format:z.literal('dsh-llmwiki'),version:z.literal(1),registry:registrySchema})
+const legacy=z.strictObject({wikis:z.array(z.strictObject({name:z.string(),path:z.string(),description:z.string().default(''),enabled:z.boolean().default(true)})),readMaxChars:z.number().int().min(200).max(100000).default(12000),workspacePath:z.string().optional(),refreshFromShared:z.boolean().optional()})
+export function exportConfig(value:Registry):string {
+  return JSON.stringify(portable.parse({format:'dsh-llmwiki',version:1,registry:parseRegistry(structuredClone(value))}),null,2)
+}
+export function importConfig(text:string,current:Registry,mode:'append'|'replace'):Registry {
+  const value:unknown=JSON.parse(text)
+  let imported:Registry
+  if(value&&typeof value==='object'&&'wikis' in value){
+    const old=legacy.parse(value);imported=emptyRegistry();imported.readMaxChars=old.readMaxChars
+    imported.libraries=old.wikis.map(entry=>{
+      if(!/^(?:[a-zA-Z]:[\\/]|\\\\|\/)/.test(entry.path))throw new Error('旧配置包含相对 Wiki 路径，请先改为准确的绝对路径：'+entry.name)
+      const item=newLibrary(crypto.randomUUID());Object.assign(item,{kind:'obsidian',mode:'readonly',name:entry.name,wikiPath:entry.path,description:entry.description,enabled:entry.enabled});return item
+    });imported.activeLibraryId=imported.libraries[0]?.id??''
+  }else imported=portable.parse(value).registry
+  imported=parseRegistry(imported)
+  if(mode==='replace')return structuredClone(imported)
+  const merged=structuredClone(current);merged.libraries.push(...imported.libraries)
+  if(!merged.activeLibraryId)merged.activeLibraryId=imported.activeLibraryId
+  return parseRegistry(merged)
+}

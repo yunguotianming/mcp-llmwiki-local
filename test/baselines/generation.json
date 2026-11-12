@@ -1,0 +1,35 @@
+{
+  "status": "preview",
+  "sources": [2, 2],
+  "changes": [
+    { "path": ".llmwiki/knowledge/catalog.json", "operation": "create" },
+    { "path": ".llmwiki/sources/catalog.json", "operation": "update" },
+    { "path": "concepts/legacy.md", "operation": "delete" },
+    { "path": "concepts/青松初检流程-9b29451e1f.md", "operation": "create" },
+    { "path": "index.md", "operation": "update" },
+    { "path": "sources/source-a.md", "operation": "create" },
+    { "path": "sources/source-b.md", "operation": "create" },
+    { "path": "welcome.md", "operation": "create" }
+  ],
+  "knowledge": [
+    {
+      "path": "concepts/青松初检流程-9b29451e1f.md",
+      "type": "concept",
+      "title": "青松初检流程",
+      "identity": "青松初检流程",
+      "aliases": ["青松"],
+      "tags": [],
+      "claims": [
+        { "text": "青松流程初检为18/20。", "source": "a.md", "quote": "青松流程初检为18/20。", "line": 3 },
+        { "text": "青松流程初检为17/20。", "source": "b.md", "quote": "青松流程初检为17/20。", "line": 3 }
+      ],
+      "conflicts": [["青松流程初检为17/20。", "青松流程初检为18/20。"]],
+      "body": "## 综合知识\n\n- 青松流程初检为18/20。 **（存在来源分歧）** [依据](../sources/source-a.md#chunk-a)\n- 青松流程初检为17/20。 **（存在来源分歧）** [依据](../sources/source-b.md#chunk-b)\n\n## 来源分歧\n\n### 分歧 1\n\n- 青松流程初检为18/20。 [依据](../sources/source-a.md#chunk-a)\n- 青松流程初检为17/20。 [依据](../sources/source-b.md#chunk-b)\n\n## 逐条出处\n\n- 青松流程初检为18/20。 — 来源 source-a，版本 version-a，第 3 行。\n- 青松流程初检为17/20。 — 来源 source-b，版本 version-b，第 3 行。"
+    }
+  ],
+  "sourceQuotes": [
+    { "path": "a.md", "quotes": ["> 青松流程初检为18/20。"] },
+    { "path": "b.md", "quotes": ["> 青松流程初检为17/20。"] }
+  ],
+  "images": ["![流程图](<data:image/png;base64,AQID>)"]
+}

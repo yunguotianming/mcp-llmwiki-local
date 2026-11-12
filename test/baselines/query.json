@@ -1,0 +1,26 @@
+{
+  "catalog": [
+    { "name": "研究资料", "description": "", "pageCount": 2, "mode": "readonly" }
+  ],
+  "search": {
+    "query": "青松",
+    "total": 2,
+    "results": [
+      { "library": "研究资料", "path": "concepts/design.md", "type": "concept", "title": "抽样流程", "aliases": ["青松"], "summary": "抽样流程 相互独立的样本。[[sources/note]]" },
+      { "library": "研究资料", "path": "sources/note.md", "type": "source", "title": "资料说明", "aliases": [], "summary": "资料说明 来源原文。" }
+    ],
+    "searchedLibraries": ["研究资料"]
+  },
+  "filtered": {
+    "query": "青松",
+    "total": 1,
+    "results": [
+      { "library": "研究资料", "path": "sources/note.md", "type": "source", "title": "资料说明", "aliases": [], "summary": "资料说明 来源原文。" }
+    ],
+    "searchedLibraries": ["研究资料"]
+  },
+  "read": {
+    "library": "研究资料", "path": "concepts/design.md", "type": "concept", "title": "抽样流程", "aliases": ["青松"], "tags": ["方法"],
+    "content": "# 抽样流程\n\n相互独立的样本。[[sources/note]]", "truncated": false
+  }
+}

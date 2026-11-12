@@ -1,0 +1,15 @@
+{
+  "issues": [
+    { "path": "concepts/a.md", "kind": "format", "message": "缺少一级标题。", "repairable": true },
+    { "path": "concepts/a.md", "kind": "broken-link", "message": "链接目标不存在：待补概念", "repairable": true },
+    { "path": "concepts/a.md", "kind": "orphan", "message": "没有其他知识页链接到此页，可通过索引和检索访问。", "repairable": false }
+  ],
+  "repair": [
+    { "path": "concepts/a.md", "operation": "update", "after": "---\ntitle: 抽样流程\n---\n# 抽样流程\n\n正文 [[待补概念]]。\n" },
+    { "path": "concepts/待补概念.md", "operation": "create", "after": "---\ntitle: 待补概念\ntype: concept\nllmwikiNoActiveEvidence: true\n---\n\n# 待补概念\n\n<!-- llmwiki:begin v1 -->\n待补充的链接目标，尚无来源支持的知识。\n<!-- llmwiki:end v1 -->\n" }
+  ],
+  "index": [
+    { "path": "index.md", "operation": "update", "body": "- [抽样流程](concepts/a.md) — concept" },
+    { "path": "log.md", "operation": "create", "body": "- <时间> · 程序检查修复 · 2 项变更 · 批次 <批次>" }
+  ]
+}
