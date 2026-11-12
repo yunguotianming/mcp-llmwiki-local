@@ -2,7 +2,7 @@ import { copyWithEmbedding } from '../src/layered/query-vectors.js'
 // 20 来源用不同标题区分身份，相同要点仍检验向量去重；同路径新版保留标题满足相似度。
 import { readFile, writeFile, readdir, rm, mkdir } from 'node:fs/promises'
 import path from 'node:path'
-import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import { buildLayeredLibrary, readLayeredPage } from '../src/layered/index.js'
 import { readVersion, putPage, pageObjectPath } from '../src/layered/objects.js'
 import { collectGarbage, pinVersion } from '../src/layered/retention.js'
@@ -38,7 +38,10 @@ beforeAll(async () => {
   f.embed.mockImplementation(async texts => texts.map(() => normalized([0.87654, 0.12345])))
   await Promise.all(Array.from({ length: 20 }, (_, i) => writeFile(path.join(f.knowledgeRoot, `${String(i).padStart(2, '0')}.md`), `# 来源${i}\n\n甲组完全相同的结论。`)))
   await buildLayeredLibrary(f.options)
-})
+}, 60_000)
+afterAll(async () => {
+  if (f) await rm(f.knowledgeRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+}, 60_000)
 it('20 来源只存不同输入的二进制向量，float16 检索聚类稳定且 SQLite 可删除重建', async () => {
   const memberships: string[][] = [], rankings: string[][] = []
   for (const precision of ['float32', 'float16'] as const) {
@@ -72,12 +75,12 @@ it('20 来源只存不同输入的二进制向量，float16 检索聚类稳定�
       expect(await readFile(path.join(f.root, folder, name), 'utf8')).not.toMatch(/"(?:vector|centroid)"\s*:\s*\[/)
     }
     const before = await readFile(path.join(f.root, 'wiki/sources/S-0001.md'), 'utf8')
-    await rm(path.join(f.root, 'cache'), { recursive: true, force: true })
+    await rm(path.join(f.root, 'cache'), { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
     expect(await readLayeredPage(f.knowledgeRoot, 'S-0001')).toBe(before)
     expect((await query.search(settings, layered, '相同')).value.map(page => page.path)).toEqual(rankings.at(-1))
   }
   expect(memberships[0]).toEqual(memberships[1]); expect(rankings[0]).toEqual(rankings[1])
-})
+}, 60_000)
 })
 
 it('三次增量后仅留当前和上版，页面共用并保护进程内读者与未完成作业', async () => {

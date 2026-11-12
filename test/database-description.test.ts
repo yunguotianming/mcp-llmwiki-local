@@ -70,7 +70,8 @@ it('拒绝过期登记键和 whalefall 数据库', async () => {
   const runtime = { resolveModelInfo: async () => ({}), stream: async function* () {} } as unknown as ModelRuntime
   try {
     await expect(generateDatabaseDescription(f.store, f.library.id, 'stale', runtime, new AbortController().signal)).rejects.toThrow('数据库登记已变化')
-    Object.assign(f.library, { kind: 'whalefall', mode: 'readonly', wikiPath: '' })
+    // f0f9856 起远端登记必须有稳定库身份，先满足登记校验再验证简介禁用。
+    Object.assign(f.library, { kind: 'whalefall', mode: 'readonly', wikiPath: '', kbId: 'remote-wiki' })
     await expect(generateDatabaseDescription(f.store, f.library.id, JSON.stringify(f.library), runtime, new AbortController().signal)).rejects.toThrow('whalefall 数据库')
   } finally { await f.cleanup() }
 })

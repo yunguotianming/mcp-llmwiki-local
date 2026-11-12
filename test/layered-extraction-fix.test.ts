@@ -55,8 +55,10 @@ function delayed(f: Awaited<ReturnType<typeof layeredFixture>>, delay: (id: stri
   return { completed, reviews, get active() { return active }, get peak() { return peak } }
 }
 
-it('20 来源经供应商闸门并发 8，成果逐字节等于串行且成本无重计', async () => {
+it('20 来源经供应商闸门并发 8，成果逐字节等于串行且成本无重计', async ({ onTestFinished }) => {
   const fixtures = [await layeredFixture(), await layeredFixture()]
+  // 本用例两轮完整建库产生较多文件；单独清理并重试 Windows 临时占用。
+  for (const f of fixtures) onTestFinished(() => filesystem.rm(f.knowledgeRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }), 30_000)
   for (const f of fixtures) await Promise.all(Array.from({ length: 20 }, (_, index) => writeFile(path.join(f.knowledgeRoot, `${String(index).padStart(2, '0')}.md`), `---\ndate: 2026-11-08\n---\n\n来源 ${index} 的证据。`)))
   const bytes: string[][] = []
   const publishedAt: string[] = []
@@ -82,7 +84,7 @@ it('20 来源经供应商闸门并发 8，成果逐字节等于串行且成本�
   }
   // 首次发布时间随调度完成时间变化；只对齐新增 created 字段，其余字节继续严格比较。
   expect(bytes[0]).toEqual(bytes[1]!.map(value => value.replace(/^created: .*$/m, 'created: ' + publishedAt[0])))
-})
+}, 60_000) // 虚拟时钟不加速真实文件 IO；给全量负载下的两轮建库留出时间。
 
 it('同篇跨组并发，取消等待在途退出后保存，续跑复用成功来源与配额', async () => {
   const f = await layeredFixture(), abort = new AbortController()

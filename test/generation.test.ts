@@ -17,6 +17,7 @@ import { EXTRACT_PROMPT } from '../src/ingest/extraction.js'
 import { signature } from '../src/storage/files.js'
 import { temporaryWorkspace } from './temp.js'
 import { groupingResponse } from './synthesis-fixture.js'
+import type { KnowledgeCatalog } from '../src/wiki/documents.js'
 import { mockFixtureSync, restoreFixture, snapshotFixture, type FixtureSnapshot } from './layered-fixture.js'
 
 vi.mock('node:fs/promises', async original => ({ ...await original<typeof import('node:fs/promises')>() }))
@@ -436,7 +437,9 @@ describe('提取与跨文档综合',()=>{
       await expect(generateWiki(f.store,f.library.id,model.runtime,new AbortController().signal)).rejects.toThrow('模拟请求中断')
       const old=(await listGenerateJobs(f.store,f.library.id))[0]!,before=await f.store.policy(f.library.id)
       const next=await f.store.savePolicy(f.library.id,{...before.policy,analysisConcurrency:30,pageGenerationConcurrency:30},before.revision)
-      await f.store.savePolicy(f.library.id,{...next.policy,wikiLanguage:'zh-CN'},next.revision)
+      // D-45（f0f9856）已将默认语言改为中文；切换到不同语言才能验证拒绝混用。
+      const changedLanguage=next.policy.wikiLanguage==='en'?'zh-CN':'en'
+      await f.store.savePolicy(f.library.id,{...next.policy,wikiLanguage:changedLanguage},next.revision)
       await expect(generateWiki(f.store,f.library.id,model.runtime,new AbortController().signal,old.id)).rejects.toThrow('资料或处理配置已变化')
       expect(model.extractionCalls).toBe(3)
       const changed=await f.store.policy(f.library.id)
@@ -585,8 +588,18 @@ describe('提取与跨文档综合',()=>{
           }else yield event
         }
       }}
-      await expect(generateWiki(f.store,f.library.id,reclassified,new AbortController().signal)).rejects.toThrow('既有页面类型')
-      expect(await readFile(path.join(f.wiki,preview.pages.find(page=>page.path.startsWith('concepts/'))!.path),'utf8')).toContain('青松初检流程')
+      const concept=preview.pages.find(page=>page.path.startsWith('concepts/'))!,file=path.join(f.wiki,concept.path),before=await readFile(file,'utf8')
+      // D-48（ede12bb）将比较输出失败隔离为缺口，仍须拒绝改写已登记的类型。
+      const job=await generateWiki(f.store,f.library.id,reclassified,new AbortController().signal)
+      expect(job).toMatchObject({status:'preview',partial:true})
+      expect(job.diagnostics).toEqual(expect.arrayContaining([expect.objectContaining({kind:'schema',scope:'comparison',phase:'identity-comparison',message:expect.stringContaining('既有页面类型')})]))
+      const result=await f.changes.preview(f.library.id,job.batchId!)
+      const catalog=JSON.parse(result.pages.find(page=>page.path==='.llmwiki/knowledge/catalog.json')!.after!) as KnowledgeCatalog
+      expect(catalog.pages.find(page=>page.path===concept.path)).toMatchObject({type:'concept'})
+      expect(catalog.pages.some(page=>page.type==='entity')).toBe(false)
+      expect(result.pages.some(page=>page.path.startsWith('entities/'))).toBe(false)
+      expect(await readFile(file,'utf8')).toBe(before)
+      expect(before).toContain('青松初检流程')
     }finally{await f.cleanup()}
   })
   it('增量来源未影响的页面保持原字节和身份，不接受综合措辞漂移',async()=>{

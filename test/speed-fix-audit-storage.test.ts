@@ -17,8 +17,9 @@ afterEach(async () => {
   }
 })
 
-it('A33 真实30路状态与检查点写入期间持续读JSON，无丢更新和半截文件', async () => {
-  const root = await fixture()
+it('A33 真实30路状态与检查点写入期间持续读JSON，无丢更新和半截文件', async ({ onTestFinished }) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'speed-fix-audit-'))
+  onTestFinished(() => rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }), 60_000)
   // 每轮重新置空后施加相同的 30 路竞争，持续读窗口不缩短。
   for (let round = 0; round < 3; round++) {
   const state = { values: [] as number[] }
@@ -49,7 +50,7 @@ it('A33 真实30路状态与检查点写入期间持续读JSON，无丢更新和
   expect(reads).toBeGreaterThan(0)
   expect((await readdir(root, { recursive: true })).filter(file => file.endsWith('.tmp'))).toEqual([])
   }
-})
+}, 60_000)
 
 it('A34 真实第二进程被写者锁拒绝，释放后可重新获得锁', async () => {
   const root = await fixture(), cache = path.join(root, 'compile'); await mkdir(cache)
