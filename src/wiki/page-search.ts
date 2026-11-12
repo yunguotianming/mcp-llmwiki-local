@@ -66,7 +66,20 @@ const structural = [
   { section: /术语清单|key\s*words/i, point: /^(?:原文列出的)?关键词/, intent: /术语|定义|关键词|含义|意思|keywords|definition/i },
   { section: /^方法$|\bmethods?\b|\bdesign\b|data collection|data analysis/i, point: /^(?:本|该)?研究(?:采用|使用|设计为|开展了)/, intent: /方法|设计|访谈|收集|分析|编码|核验|核实|验证|确认|校验|分歧|抽样|样本|招募|招收|纳入|排除|\bmethods?\b|interview|sampling|coding|analysis/i },
 ]
-export function pageParagraphs(content: string, queries: string[], pointMatches: PointMatch[] = []) {
+type Paragraph = ReturnType<typeof computeParagraphs>[number]
+// 一次查询里同一页先取短片段、再取摘录，切块与打分输入完全相同；最近结果按输入复用。
+// 只缓存最近几项且按内容与参数全文比较，页面变化或查询变化必然重新计算；调用方拿到的是浅拷贝数组，块对象不被修改。
+const paragraphCache: { content: string; key: string; value: Paragraph[] }[] = []
+export function pageParagraphs(content: string, queries: string[], pointMatches: PointMatch[] = []): Paragraph[] {
+  const key = JSON.stringify([queries, pointMatches])
+  const hit = paragraphCache.find(entry => entry.content === content && entry.key === key)
+  if (hit) return hit.value.map(block => ({ ...block, refs: [...block.refs], matched: [...block.matched] }))
+  const value = computeParagraphs(content, queries, pointMatches)
+  paragraphCache.unshift({ content, key, value: value.map(block => ({ ...block, refs: [...block.refs], matched: [...block.matched] })) })
+  paragraphCache.length = Math.min(paragraphCache.length, 8)
+  return value
+}
+function computeParagraphs(content: string, queries: string[], pointMatches: PointMatch[]) {
   const needles = passageTerms(queries), question = passageQueries(queries).join('\n'), lines = content.split('\n')
   const blocks: { content: string; anchor: string; locator: string; score: number; line: number; pointScore: number; evidence: boolean; refs: string[]; matched: string[]; penalty: number; section: string }[] = []
   const attached = new Map<number, string>()
@@ -199,19 +212,31 @@ export function excerpts(page: { library: string; path: string; title: string; c
   const selected: { block: typeof blocks[number]; content: string; line: number; last: number }[] = []
   const totalBudget = budget
   const locations = (block: typeof blocks[number]) => block.refs.map(ref => citations.get(ref)?.split(']')[0]).filter((value): value is string => !!value)
+  // 展开文本、长度与原文定位在选择过程中不变，每块只算一次；排序比较器里反复计算会让大页面的查询变慢数倍。
+  const fixed = new Map(pending.map(block => {
+    const expanded = expand(block.content)
+    return [block, { expanded, root: Math.sqrt(tokenCost(expanded)), locations: locations(block) }] as const
+  }))
   const selectedLocations = new Set<string>()
+  // 首条按相关度；后续优先增加尚未覆盖的词项，最后按页内顺序合并，每条保留自己的引用。
+  const gain = (block: typeof blocks[number]) => block.matched.reduce((sum, term) => sum + (covered.has(term) ? 0 : needles.get(term) ?? 0), 0) * block.penalty
+  // 同一原文段拆出的相关要点优先相邻补齐，避免主张措辞不同却被已覆盖词项挡掉。
+  const related = (block: typeof blocks[number]) => block.score > 0 && block.penalty === 1 && fixed.get(block)!.locations.some(location => selectedLocations.has(location))
+  const distance = (block: typeof blocks[number]) => Math.min(...selected.map(item => Math.abs(item.block.line - block.line)))
   while (pending.length) {
-    // 首条按相关度；后续优先增加尚未覆盖的词项，最后按页内顺序合并，每条保留自己的引用。
-    const gain = (block: typeof blocks[number]) => block.matched.reduce((sum, term) => sum + (covered.has(term) ? 0 : needles.get(term) ?? 0), 0) * block.penalty
-    // 同一原文段拆出的相关要点优先相邻补齐，避免主张措辞不同却被已覆盖词项挡掉。
-    const related = (block: typeof blocks[number]) => block.score > 0 && block.penalty === 1 && locations(block).some(location => selectedLocations.has(location))
-    const distance = (block: typeof blocks[number]) => Math.min(...selected.map(item => Math.abs(item.block.line - block.line)))
-    pending.sort((a, b) => Number(related(b)) - Number(related(a)) || (related(a) && related(b) ? distance(a) - distance(b) || a.line - b.line : 0)
-      || (selected.length ? (b.score + gain(b)) / Math.sqrt(tokenCost(expand(b.content))) - (a.score + gain(a)) / Math.sqrt(tokenCost(expand(a.content))) : 0)
-      || b.score - a.score || b.pointScore - a.pointScore || a.line - b.line)
+    // 覆盖词项与已选位置只在选中一条后变化：每轮先为每块算一次排序键，比较器只读取键值，排序结果与逐次计算相同。
+    const keys = new Map(pending.map(block => {
+      const isRelated = related(block)
+      return [block, { related: isRelated, distance: isRelated ? distance(block) : 0, ratio: selected.length ? (block.score + gain(block)) / fixed.get(block)!.root : 0 }] as const
+    }))
+    pending.sort((a, b) => {
+      const ka = keys.get(a)!, kb = keys.get(b)!
+      return Number(kb.related) - Number(ka.related) || (ka.related && kb.related ? ka.distance - kb.distance || a.line - b.line : 0)
+        || kb.ratio - ka.ratio || b.score - a.score || b.pointScore - a.pointScore || a.line - b.line
+    })
     const block = pending.shift()!
-    if (selected.length && !gain(block) && !related(block) && block.score < selected[0]!.block.score / 2) continue
-    const expanded = expand(block.content), available = budget - (selected.length ? 1 : 0)
+    if (selected.length && !gain(block) && !keys.get(block)!.related && block.score < selected[0]!.block.score / 2) continue
+    const expanded = fixed.get(block)!.expanded, available = budget - (selected.length ? 1 : 0)
     // 预算先按要点边界截断；只有单条自身超过整页预算才取完整句子，不能把余量塞成半个要点。
     if (tokenCost(expanded) > available && tokenCost(expanded) <= totalBudget) continue
     const window = passageWindow(expanded, queries, available)
@@ -255,16 +280,32 @@ function passageWindow(content: string, queries: string[], budget: number): { co
   const suffix = /\s*(?:[；;]?\[[^\]]+\]\([^)]*\)\s*)+$/.exec(content)?.[0] ?? ''
   const body = content.slice(0, content.length - suffix.length), needles = passageTerms(queries)
   const ends = [...body.matchAll(/[。！？!?](?:[”’"')）]+)?|\.(?=\s|$)(?:[”’"')）]+)?/g)].map(match => match.index! + match[0].length)
+  // 窗口词项＝窗口内各句词项之并：每句只取一次词项；跨句词（无空格中文的二元组）可能横跨句界，
+  // 所以只对句界两侧不是汉字或字母数字的情况用并集，否则回退到对整段窗口取词，结果与逐窗口取词完全一致。
+  const suffixCost = tokenCost(suffix), weights = [...needles]
+  const starts = ends.map((_, index) => {
+    const start = index ? ends[index - 1]! : 0, tail = body.slice(start)
+    return start + tail.length - tail.trimStart().length
+  })
+  const sentence = ends.map((end, index) => passageVocabulary(plainPoint(body.slice(starts[index]!, end))))
+  const cost = ends.map((end, index) => tokenCost(body.slice(starts[index]!, end)))
+  const joinable = ends.map((end, index) => index + 1 >= ends.length
+    || !/[\p{L}\p{N}]/u.test(body[end - 1] ?? '') || !/[\p{L}\p{N}]/u.test(body.slice(end, starts[index + 1]).trim()[0] ?? body[starts[index + 1]!] ?? ''))
   let best = { content: '', offset: 0, score: -1 }
-  for (let index = 0; index <= ends.length; index++) {
-    const start = index ? ends[index - 1]! : 0
-    const tail = body.slice(start), offset = start + tail.length - tail.trimStart().length
+  for (let index = 0; index < ends.length; index++) {
+    const offset = starts[index]!
+    let words = new Set<string>(), used = suffixCost, exact = true
     for (let next = index; next < ends.length; next++) {
       const end = ends[next]!
       if (end <= offset) continue
+      // 句与句之间的空白也计入原文长度，因此按窗口实际文本计费，不累加句子成本。
+      used = next === index ? cost[index]! + suffixCost : tokenCost(body.slice(offset, end)) + suffixCost
+      if (used > budget) break
+      if (next > index && !joinable[next - 1]) exact = false
       const text = body.slice(offset, end) + suffix
-      if (tokenCost(text) > budget) break
-      const vocabulary = passageVocabulary(plainPoint(text)), score = [...needles].reduce((sum, [needle, weight]) => sum + (vocabulary.has(needle) ? weight : 0), 0)
+      if (exact) for (const word of sentence[next]!) words.add(word)
+      const vocabulary = exact ? words : passageVocabulary(plainPoint(text))
+      const score = weights.reduce((sum, [needle, weight]) => sum + (vocabulary.has(needle) ? weight : 0), 0)
       if (score > best.score || score === best.score && text.length > best.content.length) best = { content: text, offset, score }
     }
   }
