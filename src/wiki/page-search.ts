@@ -71,6 +71,8 @@ type Paragraph = ReturnType<typeof computeParagraphs>[number]
 // 只缓存最近几项且按内容与参数全文比较，页面变化或查询变化必然重新计算；调用方拿到的是浅拷贝数组，块对象不被修改。
 const paragraphCache: { content: string; key: string; value: Paragraph[] }[] = []
 export function pageParagraphs(content: string, queries: string[], pointMatches: PointMatch[] = []): Paragraph[] {
+  // JSON 把 NaN、Infinity 都写成 null，非有限分数会撞键；这种输入不走缓存，直接计算。
+  if (pointMatches.some(point => !Number.isFinite(point.score))) return computeParagraphs(content, queries, pointMatches)
   const key = JSON.stringify([queries, pointMatches])
   const hit = paragraphCache.find(entry => entry.content === content && entry.key === key)
   if (hit) return hit.value.map(block => ({ ...block, refs: [...block.refs], matched: [...block.matched] }))
@@ -294,6 +296,8 @@ function passageWindow(content: string, queries: string[], budget: number): { co
   const cost = ends.map((end, index) => tokenCost(body.slice(starts[index]!, end)))
   // 句与句之间的空白也属于窗口文本，所以按到下一句结尾为止的原文判断，不只看句子本身。
   const bracket = ends.map((end, index) => /[[\]]/.test(body.slice(index ? ends[index - 1]! : 0, end)))
+  // 含方括号的窗口要整段取词；同一段文字（如重复句式）的窗口文本常常相同，按文本复用得分，结果不变。
+  const windowScores = new Map<string, number>()
   let best = { content: '', offset: 0, score: -1 }
   for (let index = 0; index < ends.length; index++) {
     const offset = starts[index]!
@@ -307,8 +311,12 @@ function passageWindow(content: string, queries: string[], budget: number): { co
       if (bracket[next]) exact = false
       const text = body.slice(offset, end) + suffix
       if (exact) for (const word of sentence[next]!) words.add(word)
-      const vocabulary = exact ? words : passageVocabulary(plainPoint(text))
-      const score = weights.reduce((sum, [needle, weight]) => sum + (vocabulary.has(needle) ? weight : 0), 0)
+      let score = exact ? weights.reduce((sum, [needle, weight]) => sum + (words.has(needle) ? weight : 0), 0) : windowScores.get(text)
+      if (score === undefined) {
+        const vocabulary = passageVocabulary(plainPoint(text))
+        score = weights.reduce((sum, [needle, weight]) => sum + (vocabulary.has(needle) ? weight : 0), 0)
+        windowScores.set(text, score)
+      }
       if (score > best.score || score === best.score && text.length > best.content.length) best = { content: text, offset, score }
     }
   }
