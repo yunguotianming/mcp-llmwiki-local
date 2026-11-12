@@ -280,8 +280,11 @@ function passageWindow(content: string, queries: string[], budget: number): { co
   const suffix = /\s*(?:[；;]?\[[^\]]+\]\([^)]*\)\s*)+$/.exec(content)?.[0] ?? ''
   const body = content.slice(0, content.length - suffix.length), needles = passageTerms(queries)
   const ends = [...body.matchAll(/[。！？!?](?:[”’"')）]+)?|\.(?=\s|$)(?:[”’"')）]+)?/g)].map(match => match.index! + match[0].length)
-  // 窗口词项＝窗口内各句词项之并：每句只取一次词项；跨句词（无空格中文的二元组）可能横跨句界，
-  // 所以只对句界两侧不是汉字或字母数字的情况用并集，否则回退到对整段窗口取词，结果与逐窗口取词完全一致。
+  // 窗口词项＝窗口内各句词项之并：每句只取一次词项，避免对每个句窗重新取词（平方级）。
+  // 并集只在窗口内没有任何方括号时与整段取词相同：plainPoint 按正则去掉链接，方括号会跨句与别的片段组成链接——
+  // 链接文字里的问号、句号会把链接切成两句（英文标题“What do nurses think? A study”），
+  // 窗口末尾未闭合的“[”还会与尾部证据链接拼成一个链接被整体去掉。所以窗口只要含方括号，就对整段窗口取词。
+  // 其余情况不会跨句成词：句界总在标点处，取词先把非字母数字替换为空格，中文二元组也不会跨过标点。
   const suffixCost = tokenCost(suffix), weights = [...needles]
   const starts = ends.map((_, index) => {
     const start = index ? ends[index - 1]! : 0, tail = body.slice(start)
@@ -289,8 +292,8 @@ function passageWindow(content: string, queries: string[], budget: number): { co
   })
   const sentence = ends.map((end, index) => passageVocabulary(plainPoint(body.slice(starts[index]!, end))))
   const cost = ends.map((end, index) => tokenCost(body.slice(starts[index]!, end)))
-  const joinable = ends.map((end, index) => index + 1 >= ends.length
-    || !/[\p{L}\p{N}]/u.test(body[end - 1] ?? '') || !/[\p{L}\p{N}]/u.test(body.slice(end, starts[index + 1]).trim()[0] ?? body[starts[index + 1]!] ?? ''))
+  // 句与句之间的空白也属于窗口文本，所以按到下一句结尾为止的原文判断，不只看句子本身。
+  const bracket = ends.map((end, index) => /[[\]]/.test(body.slice(index ? ends[index - 1]! : 0, end)))
   let best = { content: '', offset: 0, score: -1 }
   for (let index = 0; index < ends.length; index++) {
     const offset = starts[index]!
@@ -301,7 +304,7 @@ function passageWindow(content: string, queries: string[], budget: number): { co
       // 句与句之间的空白也计入原文长度，因此按窗口实际文本计费，不累加句子成本。
       used = next === index ? cost[index]! + suffixCost : tokenCost(body.slice(offset, end)) + suffixCost
       if (used > budget) break
-      if (next > index && !joinable[next - 1]) exact = false
+      if (bracket[next]) exact = false
       const text = body.slice(offset, end) + suffix
       if (exact) for (const word of sentence[next]!) words.add(word)
       const vocabulary = exact ? words : passageVocabulary(plainPoint(text))
