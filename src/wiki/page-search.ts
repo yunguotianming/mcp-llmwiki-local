@@ -84,6 +84,7 @@ export function pageParagraphs(content: string, queries: string[], pointMatches:
 // 独立块 ID 行归属哪几行只由页面正文决定，与查询无关；整页 Markdown 解析是查询里最重的一步，按正文复用。
 // 按正文全文比较（不按路径），页面一改就重新解析；调用方只读不改，返回同一个只读映射。
 const attachedCache = new Map<string, ReadonlyMap<number, string>>()
+const attachedLimit = 32 * 1024 * 1024
 let attachedBytes = 0
 function attachedBlockIds(content: string): ReadonlyMap<number, string> {
   const hit = attachedCache.get(content)
@@ -98,12 +99,15 @@ function attachedBlockIds(content: string): ReadonlyMap<number, string> {
       if (id && previous?.position) for (let line = previous.position.start.line - 1; line < previous.position.end.line; line++) attached.set(line, id)
     })
   }
-  // 上限按正文字节计，最多约 32MB；超出时淘汰最久未用的页面。
-  while (attachedCache.size && attachedBytes + content.length > 32 * 1024 * 1024) {
+  // 按 UTF-8 编码后的正文字节计量，避免中文被字符串 length 低估；此预算不包含映射与对象开销。
+  const bytes = Buffer.byteLength(content, 'utf8')
+  // 单篇超过 32MiB 时直接返回计算结果，不挤掉已有缓存；其余条目保留 LRU 淘汰。
+  if (bytes > attachedLimit) return attached
+  while (attachedCache.size && attachedBytes + bytes > attachedLimit) {
     const oldest = attachedCache.keys().next().value!
-    attachedBytes -= oldest.length; attachedCache.delete(oldest)
+    attachedBytes -= Buffer.byteLength(oldest, 'utf8'); attachedCache.delete(oldest)
   }
-  attachedCache.set(content, attached); attachedBytes += content.length
+  attachedCache.set(content, attached); attachedBytes += bytes
   return attached
 }
 function computeParagraphs(content: string, queries: string[], pointMatches: PointMatch[]) {
