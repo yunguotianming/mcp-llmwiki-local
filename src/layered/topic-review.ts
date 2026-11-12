@@ -28,6 +28,8 @@ const mergePrompt = '你是主题核对结论合并器。输入为逐句的完�
 // 在既有核对 Schema 上扩展最终句的主张保持判定，不改变提取核对协议及已发布提取缓存。
 const finalReviewOutput = reviewOutput.extend({ items: z.array(reviewOutput.shape.items.element.extend({ claim_preserved: z.boolean() })) })
 const finalBlockOutput = blockReviewOutput.extend({ items: z.array(blockReviewOutput.shape.items.element.extend({ claim_preserved: z.boolean() })) })
+schemaJSON(finalReviewOutput, 'layered_topic_final_review')
+schemaJSON(finalBlockOutput, 'layered_topic_final_block_review')
 const finalRule = '本次核对实际准备保留的改后句。逐句独立判断：support 只据该句 point_ids 指定成员的引文完整支撑全部事实及关系，不得借其他成员补证；要点与引文矛盾不能用要点覆盖引文，source_id 与 source_title 只证明来源身份，标题词不是事实证据。另以 original_text 比较主张，claim_preserved 必须明确返回布尔值。数量、轮次、实体角色、归属、谓词方向、模态强弱、条件、时间、比较基准、例外、因果或结论层次改变均为 false；一般改个案、补完整列举也是改变。只有措辞等价、补证或删除保留部分不依赖的独立无据断言才为 true；主语改称须有可靠语义等价依据。标题和范围可按既有元数据修复例外重新描述成员覆盖范围，该例外不得用于正文。missing 仍只说明证据缺失，完整支撑填 null。分块合并不得推翻任一块发现的主张改变。'
 // 此版本继续进入主题生成、配置和页输入指纹，不改变共用提取提示词及其缓存。
 export const topicReviewVersion = hash(JSON.stringify(['topic-review-v5', 'topic-correction-facts-v2', 'rules-before-topic-v1', topicEvidenceContextVersion, finalRule,

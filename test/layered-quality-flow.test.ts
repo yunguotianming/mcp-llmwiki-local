@@ -115,12 +115,17 @@ it('主题逐句核对、纠正失败删句留痕，正文与成员未变零核�
   expect(a!.content).not.toContain('错误结论'); expect(a!.review?.removed).toHaveLength(1)
   expect((await reviewTopicContent('T1', a!.content, members, config, a!.review)).calls).toBe(0)
   expect((await reviewTopicContent('T1', a!.content, [...members, point('p2', '新结果', '新结果')], config, a!.review)).calls).toBe(1)
+  const repairRequests: any[] = []
   const repaired = await reviewTopicContent('T3', body.replace('错误结论', '有效结论'), members, options(async (_task, _system, raw) => {
     const data = JSON.parse(raw)
+    repairRequests.push(data)
+    if (data.review_stage === 'topic' && data.sentences.some((sentence: any) => sentence.original_text !== undefined)) return JSON.stringify({ items: data.sentences.map((sentence: any) => ({ id: sentence.id, support: '完整支撑', missing: null, claim_preserved: true })) })
     if (data.review_stage === 'topic') return JSON.stringify({ items: data.sentences.map((sentence: any) => ({ id: sentence.id, support: sentence.text.includes('有效结论') ? '部分支撑' : '完整支撑', missing: sentence.text.includes('有效结论') ? '补充证据编号' : '' })) })
     return JSON.stringify({ sentences: data.validationFeedback.map((item: any) => ({ id: item.id, text: '有效结论。[证据](../sources/S-0001.md#^a)', point_ids: [data.members[0].point_id], support: '完整支撑', missing: '' })) })
   }))
-  expect(repaired.calls).toBe(2); expect(repaired.review?.removed).toEqual([])
+  expect(repaired.calls).toBe(3); expect(repaired.review?.removed).toEqual([])
+  expect(repairRequests.map(request => request.review_stage)).toEqual(['topic', 'topic-correction', 'topic'])
+  expect(repairRequests[2].sentences).toEqual([expect.objectContaining({ original_text: '有效结论。[证据](../sources/S-0001.md#^a)', text: '有效结论。[证据](../sources/S-0001.md#^a)', point_ids: [repairRequests[1].members[0].point_id] })])
   expect(repaired.content).toContain('有效结论。'); expect(repaired.content).not.toContain('错误结论')
 })
 
