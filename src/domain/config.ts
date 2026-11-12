@@ -53,6 +53,7 @@ export interface LayeredSettings {
   lexicalTopicSimilarityThreshold: number; lexicalTopicAttachThreshold: number
   topicAttachThreshold: number; topicMaxPoints: number; topicClusterBlockSize: number; topicNeighborCount: number
   embeddingBatchSize: number; embeddingBatchBytes: number; embeddingTimeoutMs: number
+  queryEmbeddingTimeoutMs: number; queryEmbeddingColdTimeoutMs: number
   vectorPrecision: 'float32' | 'float16'; writerTakeoverToken?: string | undefined
   leafInputBudget: number; topicReviewInputBudget: number; topicMaxChars: number; topicMaxSources: number
   parentInputBudget: number; topicMaxChildren: number; topicMaxDepth: number; topicMergeMinSources: number; topicRewriteAfter: number
@@ -79,6 +80,7 @@ export const defaultLayeredSettings: LayeredSettings = {
   localEmbeddingUrl: 'http://127.0.0.1:11434', localEmbeddingModel: 'qwen3-embedding:0.6b',
   cloudEmbeddingUrl: 'https://api.openai.com/v1', cloudEmbeddingModel: 'text-embedding-3-small', cloudEmbeddingKeyEnv: 'LLMWIKI_EMBEDDING_API_KEY',
   embeddingBatchSize: 32, embeddingBatchBytes: 32768, embeddingTimeoutMs: 120000,
+  queryEmbeddingTimeoutMs: 2000, queryEmbeddingColdTimeoutMs: 10000,
   vectorPrecision: 'float32',
   topicSimilarityThreshold: 0.65, topicAttachThreshold: 0.60, topicMaxPoints: 40, topicClusterBlockSize: 2000, topicNeighborCount: 64,
   // r3 已发布库：2652 要点、无补标；0.01 网格最大 F1，成对合并 0.11、留一质心并入 0.22。
@@ -133,6 +135,9 @@ export function layeredSettings(value: Partial<LayeredSettings> = {}, tier = 50)
   if (!['http:', 'https:'].includes(url.protocol) || !settings.localEmbeddingModel.trim()) throw new Error('本地向量模型地址或模型名无效。')
   for (const key of ['embeddingBatchSize', 'embeddingBatchBytes', 'embeddingTimeoutMs'] as const) if (!Number.isSafeInteger(settings[key]) || settings[key] <= 0) throw new Error('嵌入批次上限和超时必须为正整数。')
   if (settings.embeddingTimeoutMs > 2147483647) throw new Error('嵌入超时超出计时器范围。')
+  for (const key of ['queryEmbeddingTimeoutMs', 'queryEmbeddingColdTimeoutMs'] as const)
+    if (!Number.isSafeInteger(settings[key]) || settings[key] < 1 || settings[key] > 2147483647) throw new Error('查询向量时限必须为 1～2147483647 毫秒的整数。')
+  if (settings.queryEmbeddingColdTimeoutMs < settings.queryEmbeddingTimeoutMs) throw new Error('查询向量冷态时限不能短于就绪时限。')
   if (!Number.isFinite(settings.topicSimilarityThreshold) || settings.topicSimilarityThreshold < 0 || settings.topicSimilarityThreshold > 1) throw new Error('主题相似度阈值必须在 0～1 之间。')
   for (const key of ['lexicalTopicSimilarityThreshold', 'lexicalTopicAttachThreshold'] as const) {
     if (!Number.isFinite(settings[key]) || settings[key] < 0 || settings[key] > 1) throw new Error('词项主题阈值必须在 0～1 之间。')

@@ -5,6 +5,7 @@ import { hash } from './files.js'
 export function buildConfiguration(settings: LayeredSettings): string {
   const runtime = new Set(['embeddingMode', 'embeddingUnavailable', 'embeddingChangeToken', 'localEmbeddingUrl', 'localEmbeddingModel',
     'cloudEmbeddingUrl', 'cloudEmbeddingModel', 'cloudEmbeddingKeyEnv', 'embeddingBatchSize', 'embeddingBatchBytes', 'embeddingTimeoutMs',
+    'queryEmbeddingTimeoutMs', 'queryEmbeddingColdTimeoutMs',
     'vectorPrecision', 'writerTakeoverToken', 'maxBuildCalls', 'maxBuildTokens', 'maxBatchItems'])
   return hash(JSON.stringify(Object.entries(settings).filter(([key]) => !runtime.has(key)).sort(([a], [b]) => a.localeCompare(b))))
 }

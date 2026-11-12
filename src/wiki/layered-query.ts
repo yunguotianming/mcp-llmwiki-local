@@ -10,6 +10,7 @@ import { layeredIndex } from '../storage/jobs.js'
 import type { IndexRow } from '../storage/jobs.js'
 import { centroid, normalized, similarity } from '../layered/embedding.js'
 import { createEmbeddingClient } from '../layered/cloud-embedding.js'
+import { embeddingReadiness, embeddingTimedOut, type EmbeddingReadiness } from '../layered/embedding-readiness.js'
 import type { EmbeddingClient, LibraryCard, EmbeddingIdentity } from '../layered/schema.js'
 import { validSourceId, withLayeredRead } from '../layered/revocations.js'
 import { SiyuanAdapter, validateSiyuanRoot, WikiExportClient } from '../layered/siyuan.js'
@@ -40,13 +41,13 @@ function storedPage(page: IndexedPage): StoredPage {
   const { path: relative, hash, title, type, aliases, id, vectorIds, pointVectorIds } = page
   return { path: relative, hash, title, type, aliases, id, vectorIds, pointVectorIds, topic_path: relative.startsWith('topics/') ? relative : '' }
 }
-function embeddingFailure(error: unknown): string {
+function embeddingFailure(error: unknown, timeoutMs: number): string {
   const seen = new Set<unknown>(), messages: string[] = []
   while (error instanceof Error && !seen.has(error)) {
     seen.add(error); messages.push(error.name + ' ' + error.message); error = error.cause
   }
   const message = messages.join(' ')
-  if (/TimeoutError|ETIMEDOUT|超时/i.test(message)) return '向量请求超时（查询最多等待 2 秒）'
+  if (/TimeoutError|ETIMEDOUT|超时/i.test(message)) return `向量请求超时（查询最多等待 ${timeoutMs / 1000} 秒）`
   if (/HTTP 404|模型缺失/i.test(message)) return '嵌入模型缺失（HTTP 404）'
   if (/身份|权重|前处理/.test(message)) return '本机向量身份与本库不符或缺失'
   if (/TypeError|ECONN|fetch failed|连接|不可达/i.test(message)) return '向量服务连接失败'
@@ -84,7 +85,7 @@ async function admission(library: LibraryRegistration, layered: LayeredLibrary, 
   await new SiyuanAdapter(new WikiExportClient(library.id, library.siyuan)).checkAdmission(layered.root, signal)
 }
 export class LayeredQuery {
-  constructor(private readonly embeddingClient?: EmbeddingClient) {}
+  constructor(private readonly embeddingClient?: EmbeddingClient, private readonly readiness: EmbeddingReadiness = embeddingReadiness) {}
   async browse(library: LibraryRegistration, layered: LayeredLibrary, ref: string, options: BrowseOptions, signal?: AbortSignal) {
     return run(layered.root, { signal, checkAdmission: () => admission(library, layered, signal) }, view => browsePages(view, library.name, ref, options))
   }
@@ -105,13 +106,16 @@ export class LayeredQuery {
     const settings = layeredSettings(library.layered)
     let client: EmbeddingClient | undefined, locked: EmbeddingIdentity | undefined, failureKey = '', vectorEnabled = false
     const timeout = new AbortController(), callSignal = signal ? AbortSignal.any([signal, timeout.signal]) : timeout.signal
-    let timer: ReturnType<typeof setTimeout> | undefined, degradation: SearchDegradation | undefined, remainingMs = 2000
+    let timer: ReturnType<typeof setTimeout> | undefined, degradation: SearchDegradation | undefined
+    let budgetMs = settings.queryEmbeddingColdTimeoutMs, remainingMs = budgetMs
     const degrade = (cause: unknown) => {
       signal?.throwIfAborted()
       if (degradation) return
-      const reason = embeddingFailure(cause)
+      const timedOut = embeddingTimedOut(cause), reason = embeddingFailure(cause, budgetMs)
       degradation = { library: library.name, stage: 'embedding', retrieval: 'fts', reason, message: '已降级为关键词检索：' + reason }
-      if (failureKey) {
+      if (locked) this.readiness.failed(settings, cause)
+      if (timedOut && locked?.provider === 'ollama') void this.readiness.warm(settings, this.embeddingClient, true)
+      if (failureKey && !timedOut) {
         if (embeddingFailures.size >= 64) embeddingFailures.delete(embeddingFailures.keys().next().value!)
         embeddingFailures.set(failureKey, { until: Date.now() + 60000, reason })
       }
@@ -119,7 +123,7 @@ export class LayeredQuery {
     }
     const timed = async <T,>(action: () => Promise<T>): Promise<T> => {
       const started = performance.now()
-      // 两秒只累计服务请求，读取页面和缺失向量不消耗服务期限。
+      // 冷态或就绪期限只累计服务请求，读取页面和缺失向量不消耗服务期限。
       if (remainingMs <= 0) timeout.abort(new DOMException('嵌入查询超时', 'TimeoutError'))
       timer = setTimeout(() => timeout.abort(new DOMException('嵌入查询超时', 'TimeoutError')), Math.max(0, Math.ceil(remainingMs)))
       let cancelled: (() => void) | undefined
@@ -142,7 +146,9 @@ export class LayeredQuery {
       try {
         const vectors = await timed(() => client!.embed(input.map(value => queryInput(value, locked!)), callSignal))
         if (vectors.length !== input.length || vectors.some(vector => vector.length !== locked!.dimensions)) throw new Error('嵌入结果数量或身份维度不匹配。')
-        return vectors.map(normalized)
+        const result = vectors.map(normalized)
+        this.readiness.ready(settings)
+        return result
       } catch (cause) { degrade(cause); return [] }
     }
     try {
@@ -158,7 +164,13 @@ export class LayeredQuery {
         if (cached && cached.until > Date.now()) degradation = { library: library.name, stage: 'embedding', retrieval: 'fts', reason: cached.reason, message: '已降级为关键词检索：' + cached.reason }
         else try {
           lockedEmbeddingSettings(settings, locked)
-          client = this.embeddingClient ?? createEmbeddingClient(settings, fetch, 0)
+          const readiness = this.readiness.state(settings)
+          budgetMs = remainingMs = readiness.status === 'ready' ? settings.queryEmbeddingTimeoutMs : settings.queryEmbeddingColdTimeoutMs
+          client = this.embeddingClient ?? createEmbeddingClient({ ...settings, embeddingTimeoutMs: budgetMs }, fetch, 0)
+          if (readiness.status === 'warming') {
+            const warmed = await timed(() => readiness.result)
+            if (warmed.status === 'failed') throw warmed.cause
+          }
           if (await timed(() => client!.identity?.(callSignal) ?? Promise.resolve(undefined)) !== locked.revision) throw new Error('向量权重身份不符。')
           queryInput('', locked); vectorEnabled = true
         } catch (error) { degrade(error) }

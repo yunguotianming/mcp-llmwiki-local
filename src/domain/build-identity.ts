@@ -6,6 +6,7 @@ import { signature } from '../storage/files.js'
 export function buildRegistrationKey(library: LibraryRegistration): string {
   const { models: _models, layered, ...registration } = library
   const { embeddingTimeoutMs: _timeout, embeddingBatchSize: _batch, embeddingBatchBytes: _bytes,
+    queryEmbeddingTimeoutMs: _queryTimeout, queryEmbeddingColdTimeoutMs: _queryColdTimeout,
     maxBuildCalls: _calls, maxBuildTokens: _tokens, writerTakeoverToken: _writer, ...content } = layered ?? {}
   return JSON.stringify({ ...registration, layered: content })
 }

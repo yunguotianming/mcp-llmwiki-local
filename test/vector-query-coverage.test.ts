@@ -7,11 +7,13 @@ import { buildLayeredLibrary } from '../src/layered/index.js'
 import { updateVectorCoverage } from '../src/layered/vector-build.js'
 import { readExtraction } from '../src/layered/publication.js'
 import { LayeredQuery } from '../src/wiki/layered-query.js'
+import { embeddingReadiness } from '../src/layered/embedding-readiness.js'
+import { layeredSettings } from '../src/domain/config.js'
 import { cleanupLayeredFixtures, layeredTopicFixture, snapshotManifest } from './layered-fixture.js'
 import type { PendingBuild } from '../src/layered/schema.js'
 
 vi.mock('node:fs/promises', async original => ({ ...await original<typeof import('node:fs/promises')>() }))
-afterEach(() => { vi.useRealTimers(); cleanupLayeredFixtures() })
+afterEach(() => { embeddingReadiness.cancel(); vi.useRealTimers(); cleanupLayeredFixtures() })
 
 it('少量未核实要点缺向量时保留混合检索，冷暖查询均只嵌入查询词', async () => {
   const f = await layeredTopicFixture(), original = f.call.getMockImplementation()!
@@ -48,6 +50,7 @@ it('本地向量读盘超过两秒不消耗服务期限，缺件覆盖按实际�
   await unlink(path.join(f.root, vectors.vectorPath(first.vector_id!)))
   const read = vectors.readVectorRecord
   let delayed = false
+  embeddingReadiness.ready(layeredSettings(f.library.layered))
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
   vi.spyOn(vectors, 'readVectorRecord').mockImplementation(async (...args) => {
     if (!delayed) { delayed = true; await vi.advanceTimersByTimeAsync(2100) }
@@ -87,6 +90,7 @@ it('身份检测与查询嵌入共享两秒服务预算，不因分段计时延�
   await writeFile(path.join(f.knowledgeRoot, 'a.md'), '甲组的研究结果。')
   await buildLayeredLibrary(f.options)
   const manifest = await snapshotManifest(f.root)
+  embeddingReadiness.ready(layeredSettings(f.library.layered))
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] })
   const identity = vi.fn(async () => { await new Promise(resolve => setTimeout(resolve, 1200)); return 'fixture-weights-v1' })
   const embed = vi.fn(async () => new Promise<number[][]>(() => {}))

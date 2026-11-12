@@ -36,7 +36,7 @@ node dist/cli.js mcp
 
 首次生成后随库策略在 `data/state/policy.json`（旧布局路径保持原样）；停止任务后可调整 `pageGenerationConcurrency` 和 `concurrencyLimit`，范围均为 1～1000，实际生成并发默认 3，不能超过上限；嵌入供应商闸门保持 50。模型路由和供应商重试、速率设置沿用核心配置校验。
 
-云端向量需显式选择 cloud，并设置 `cloudEmbeddingUrl`、`cloudEmbeddingModel`、`cloudEmbeddingKeyEnv`；最后一项填写环境变量名。已有库的向量身份绑定在库内，更换模型使用复制工具。纯全文库仍可生成来源与索引，不调用嵌入；主题组织行为沿用上游全文模式。
+云端向量需显式选择 cloud，并设置 `cloudEmbeddingUrl`、`cloudEmbeddingModel`、`cloudEmbeddingKeyEnv`；最后一项填写环境变量名。查询向量默认冷态等待 10 秒、就绪后等待 2 秒，可在登记的 layered 配置中设置 `queryEmbeddingColdTimeoutMs` 和 `queryEmbeddingTimeoutMs`；超时降级不写入一分钟失败缓存，Ollama 查询超时可触发共享后台预热。已有库的向量身份绑定在库内，更换模型使用复制工具。纯全文库仍可生成来源与索引，不调用嵌入；主题组织行为沿用上游全文模式。
 
 | 可用内存 | Ollama 模型建议 |
 | --- | --- |
