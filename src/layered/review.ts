@@ -83,16 +83,16 @@ const fatal = (error: unknown, options: BuildLayeredOptions) => {
 
 // 每篇先合并为一批；仅在核对输入超出实际上下文预算时分批，原文只传各引文前后两行。
 export async function reviewExtraction(extraction: Extraction, source: LocalSource, options: BuildLayeredOptions, inputLimit: number, checkpoint: () => Promise<void> = async () => {}): Promise<number> {
-  const before = extraction.calls
   let executed = false
+  // 回执会回填整份对象，元数据和摘要等非段落内容也必须参与身份。
   const receipt = await validatedTask(options, 'extract', { stage: 'support-review', protocol: reviewPromptHash(), source,
-    segments: extraction.segments, inputLimit }, async signal => {
+    extraction_hash: hash(JSON.stringify(extraction, null, 2) + '\n'), inputLimit }, async signal => {
     executed = true
     const calls = await reviewExtractionOnce(extraction, source, { ...options, signal }, inputLimit, checkpoint)
     return { extraction, calls }
   }, value => value.extraction.segments.every(segment => segment.points.every(point => point.verification?.status === 'verified')))
   // 在途合并也要回填每个订阅者；执行者保留原要点引用，等待者取得独立副本。
-  if (!executed) { Object.assign(extraction, structuredClone(receipt.value.extraction)); extraction.calls = before; await checkpoint() }
+  if (!executed) { Object.assign(extraction, structuredClone(receipt.value.extraction)); await checkpoint() }
   return executed ? receipt.value.calls : 0
 }
 

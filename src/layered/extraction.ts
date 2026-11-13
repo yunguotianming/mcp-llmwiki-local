@@ -451,6 +451,11 @@ function planExtractionAtBudget(sourceId: string, source: LocalSource, processin
   return chunks
 }
 export async function extractSource(...args: Parameters<typeof extractSourceOnce>): Promise<Extraction> {
+  const receipt = await extractSourceReceipt(...args)
+  // 兼容旧调用方的本轮计数视图，不能修改回执中用于封存和哈希的成果。
+  return receipt.reused ? { ...receipt.value, calls: [] } : receipt.value
+}
+export async function extractSourceReceipt(...args: Parameters<typeof extractSourceOnce>): Promise<{ value: Extraction; reused: boolean }> {
   const [root, sourceId, source, requestedProcessing, options, inputLimit, , resources, , planned] = args
   const processing = extractionProcessing(requestedProcessing)
   const key = JSON.stringify([path.resolve(root), sourceId, source.contentHash, source.sourceVersion, processingFingerprint(processing), inputLimit, resources, planned,
@@ -460,8 +465,8 @@ export async function extractSource(...args: Parameters<typeof extractSourceOnce
       previous: args[6], imagePolicy: options.imagePolicy }, signal =>
         extractSourceOnce(root, sourceId, source, processing, { ...options, signal }, inputLimit, args[6], resources, args[8], planned),
       value => reusableExtraction(value) && !value.in_progress && !value.gaps?.length)
-    if (receipt.reused) receipt.value.calls = []
-    return receipt.value
+    // 回执保留封存成果的原始调用记录；本轮调用数由编排层单独统计。
+    return receipt
   }
   // 非持久化入口仍共用在途任务；磁盘入口由完整回执身份合并，避免重复复制整篇成果。
   return path.isAbsolute(options.knowledgeRoot) ? execute(options.signal ?? new AbortController().signal) : shareExtraction(key, options.signal, execute)

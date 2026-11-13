@@ -20,7 +20,7 @@ import { directory, safePath } from '../storage/paths.js'
 import { resolveLibraryRoot } from '../storage/library-root.js'
 import { readOptional } from '../storage/files.js'
 import { advanceStorageGeneration, atomicWrite, hash, hashName, immutableWrite, withBuildLock, withStorageGeneration, writeJson } from './files.js'
-import { extractSource, extractionFingerprint, extractionNeedsRetry, groupingFingerprint, planExtraction, resultFingerprint, reusableExtraction, extractionPromptHash, sameProcessing, reusableExtractionPlan, publishedExtractionUnchanged } from './extraction.js'
+import { extractSourceReceipt, extractionFingerprint, extractionNeedsRetry, groupingFingerprint, planExtraction, resultFingerprint, reusableExtraction, extractionPromptHash, sameProcessing, reusableExtractionPlan, publishedExtractionUnchanged } from './extraction.js'
 import { finishPublication, initializeLibrary, publishLibrary, readCurrent, readExtraction, readManifest } from './publication.js'
 import { readLocalSource, segmentResources, snapshotSource } from './snapshot.js'
 import { formatVersion } from './schema.js'
@@ -250,8 +250,8 @@ export async function buildLayeredLibrary(options: BuildLayeredOptions): Promise
       }
       const resources = [...new Set(files.assets.map(asset => asset.hash))].sort()
       const segmentAssets = processing.image_policy ? segmentResources(source, files) : source.segments.map(() => [])
-      const readCache = async (relative: string) => {
-        try { return await readOptional<Extraction>(await safePath(root, relative)) }
+      const readCache = async <T = Extraction>(relative: string) => {
+        try { return await readOptional<T>(await safePath(root, relative)) }
         catch (error) { if (error instanceof SyntaxError) return undefined; throw error }
       }
       const previousResult = previous ? await readCache(previous.extract.path) : undefined
@@ -302,9 +302,10 @@ export async function buildLayeredLibrary(options: BuildLayeredOptions): Promise
       const expectedPath = `objects/snapshots/${sourceId}/${hashName(source.contentHash)}/extract/${hashName(fingerprint)}${versionSuffix}.json`
       let extractPath = expectedPath
       const progressPath = expectedPath.replace('objects/snapshots/', 'work/extractions/').replace(/\.json$/, '-progress.json')
+      const reviewPath = progressPath.replace('-progress.json', '-review.json')
       if (force && !pending.reextract!.started.includes(sourceId)) {
         // 新的显式重提不继承之前的半成品；本次开始后保留检查点供跨模型续做。
-        for (const file of [progressPath, progressPath.replace('-progress.json', '-review.json')]) {
+        for (const file of [progressPath, reviewPath]) {
           await unlink(await safePath(root, file)).catch(error => { if (error.code !== 'ENOENT') throw error })
         }
         pending.reextract!.started.push(sourceId); pending.reextract!.started.sort()
@@ -312,13 +313,32 @@ export async function buildLayeredLibrary(options: BuildLayeredOptions): Promise
       }
       const latestFailure = previous?.content_hash === source.contentHash && previous.extract.processing_fingerprint === fingerprint
         && reusableExtraction(previousResult) && extractionNeedsRetry(previousResult) ? previousResult : undefined
-      let extraction = await readCache(progressPath) ?? (force ? undefined : latestFailure ?? (previous?.extract.processing_fingerprint === fingerprint && reusableExtraction(previousResult) ? previousResult : undefined) ?? await readCache(expectedPath))
+      // 先定位本作业封存的完整成果；强制重提的续跑也使用这份原始字节。
+      let checkpoint = await readCache<{ input_path?: string; input_hash?: string; extraction?: Extraction }>(reviewPath)
+      let inputBytes: Buffer | undefined
+      if (checkpoint?.input_path) {
+        const boundBytes = checkpoint.input_hash ? await readFile(await safePath(root, checkpoint.input_path))
+          .catch(error => { if (error.code === 'ENOENT') return undefined; throw error }) : undefined
+        if (boundBytes && hash(boundBytes) === checkpoint.input_hash) inputBytes = boundBytes
+        // 无效绑定连同核对成果一起丢弃，回退后按实际输入重新核对。
+        else checkpoint = undefined
+      }
+      const cachedPrevious = force ? undefined : latestFailure ?? (previous?.extract.processing_fingerprint === fingerprint && reusableExtraction(previousResult) ? previousResult : undefined)
+      let extraction: Extraction | undefined = inputBytes ? JSON.parse(inputBytes.toString('utf8'))
+        : await readCache(progressPath) ?? cachedPrevious ?? (force ? undefined : await readCache(expectedPath))
+      if (inputBytes) extractPath = checkpoint!.input_path!
+      else if (extraction && extraction === cachedPrevious) extractPath = previous!.extract.path
       const reusable = reusableExtraction(extraction)
       if (extraction && reusable && (extraction.source_id !== sourceId || extraction.source_hash !== source.contentHash || !sameProcessing(extraction.processing, processing))) throw new Error('已保存提取结果的身份或处理指纹不匹配。')
       if (!extraction || !reusable || extraction.in_progress || extractionNeedsRetry(extraction)) {
-        const savedCalls = reusable && extraction?.in_progress ? extraction.calls.length : 0
+        let addedCalls = 0
         const oldExtraction = extraction ?? (force ? undefined : previousResult)
-        extraction = await extractSource(root, sourceId, source, processing, { ...measured, signal,
+        const receipt = await extractSourceReceipt(root, sourceId, source, processing, { ...measured, signal,
+          client: { info: measured.client.info.bind(measured.client),
+            ...(measured.client.inputBudget ? { inputBudget: measured.client.inputBudget.bind(measured.client) } : {}),
+            ...(measured.client.concurrency ? { concurrency: measured.client.concurrency.bind(measured.client) } : {}),
+            ...(measured.client.attempts ? { attempts: measured.client.attempts } : {}),
+            call: async (...args) => { addedCalls++; return measured.client.call(...args) } },
           taskModelIdentity: force ? { context: measured.taskModelIdentity, reextractJob: pending.started_at } : measured.taskModelIdentity }, inputLimit, oldExtraction, segmentAssets,
           async indices => {
             const hashes = new Set(indices.flatMap(index => segmentAssets[index]!))
@@ -329,6 +349,7 @@ export async function buildLayeredLibrary(options: BuildLayeredOptions): Promise
               return await options.loadImage!(await readFile(await safePath(root, asset.path)), path.basename(asset.original_path), options.signal)
             }))
           }, plan)
+        extraction = receipt.value
         if (planningFailure) extraction.gaps!.push({ kind: 'group', segment_hashes: source.segments.map(segment => segment.text_hash), item: null,
           reasons: [{ rule: 'extract-plan', expected: '来源可按输入上限分组', actual: String(planningFailure) }] })
         const actualFingerprint = resultFingerprint(extraction)
@@ -336,19 +357,22 @@ export async function buildLayeredLibrary(options: BuildLayeredOptions): Promise
         const partial = await readCache(actualPath)
         if (reusableExtraction(partial) && partial.in_progress && partial.source_id === sourceId && partial.source_hash === source.contentHash) await writeJson(root, actualPath, extraction)
         else {
-          // 重试发布独立成果，旧版本引用的失败留痕仍保持不可变。
-          if (await readFile(await safePath(root, actualPath)).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error })
-            && (!reusableExtraction(partial) || extractionNeedsRetry(partial) || force)) actualPath = actualPath.replace(/\.json$/, '-' + hashName(hash(JSON.stringify(extraction))) + '.json')
-          await immutableWrite(root, actualPath, Buffer.from(JSON.stringify(extraction, null, 2) + '\n'))
+          // 同身份的已完成对象按字节复用；产出不同则分址，保留旧版本引用。
+          const bytes = Buffer.from(JSON.stringify(extraction, null, 2) + '\n')
+          const existing = await readFile(await safePath(root, actualPath)).catch(error => { if (error.code === 'ENOENT') return undefined; throw error })
+          if (existing && !existing.equals(bytes)) actualPath = actualPath.replace(/\.json$/, '-' + hashName(hash(bytes)) + '.json')
+          await immutableWrite(root, actualPath, bytes)
         }
         extractPath = actualPath
+        // 完整成果写入后先保存路径，再移除半成品，避免分址结果在中断后失联。
+        await writeJson(root, reviewPath, { input_path: extractPath, input_hash: hash(await readFile(await safePath(root, extractPath))) })
         await unlink(await safePath(root, progressPath)).catch(error => { if (error.code !== 'ENOENT') throw error })
-        const addedCalls = extraction.calls.length - savedCalls
-        modelCalls += addedCalls; pending.model_calls += extraction.calls.length
+        modelCalls += addedCalls; pending.model_calls += addedCalls
       }
       // 核对与概览独立于提取缓存；改变这些开关不重发原文提取。
-      const reviewPath = progressPath.replace('-progress.json', '-review.json')
-      const savedReview = await readCache(reviewPath)
+      // 检查点回填整份对象，必须绑定核对前的成果；无绑定的旧检查点不复用。
+      const reviewInputHash = hash(await readFile(await safePath(root, extractPath)))
+      const savedReview = checkpoint?.input_hash === reviewInputHash ? checkpoint.extraction : undefined
       extraction = structuredClone(reusableExtraction(savedReview) && !extractionNeedsRetry(savedReview, !options.retryGaps) && savedReview.source_hash === source.contentHash
         && savedReview.source_id === sourceId && resultFingerprint(savedReview) === resultFingerprint(extraction) ? savedReview : extraction)
       const priorReviews = new Map((!force && reusableExtraction(previousResult) ? previousResult : undefined)?.segments.flatMap(segment => segment.points).filter(point => point.verification)
@@ -358,7 +382,7 @@ export async function buildLayeredLibrary(options: BuildLayeredOptions): Promise
         if (prior && !point.verification) point.verification = structuredClone(prior)
       }
       const reviewCalls = await reviewExtraction(extraction, source, { ...measured, signal }, inputLimit,
-        async () => { signal.throwIfAborted(); await writeJson(root, reviewPath, extraction) })
+        async () => { signal.throwIfAborted(); await writeJson(root, reviewPath, { input_path: extractPath, input_hash: reviewInputHash, extraction }) })
       signal.throwIfAborted()
       modelCalls += reviewCalls; pending.model_calls += reviewCalls
       const reviewedPath = expectedPath.replace(/\.json$/, '-quality-' + hashName(hash(JSON.stringify(extraction))) + '.json')
