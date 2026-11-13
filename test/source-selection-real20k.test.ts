@@ -1,10 +1,11 @@
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { expect, it } from 'vitest'
 import { ordinaryPointLimit } from '../src/domain/granularity.js'
 import { selectSourcePoints } from '../src/layered/extraction.js'
 import type { Point } from '../src/layered/schema.js'
 
-const cases = JSON.parse(readFileSync(new URL('./fixtures/real20k/source-selection.json', import.meta.url), 'utf8')) as {
+const hasFixture = existsSync(new URL('./fixtures/real20k/source-selection.json', import.meta.url))
+const cases = (hasFixture ? JSON.parse(readFileSync(new URL('./fixtures/real20k/source-selection.json', import.meta.url), 'utf8')) : [{"id": "S-0012", "question": "S-0012"}, {"id": "S-0014", "question": "S-0014"}, {"id": "S-0019", "question": "S-0019"}, {"id": "S-0001", "question": "S-0001"}, {"id": "S-0003", "question": "S-0003"}, {"id": "S-0017", "question": "S-0017"}]) as {
   id: string; question: string; chars: number; source: string; points: Point[]; chapters: { ids: string[]; minimum: number }[]
 }[]
 const facts: Record<string, string[]> = {
@@ -15,7 +16,7 @@ const facts: Record<string, string[]> = {
   'C-002': ['虚构样例C-002的条件1', '虚构样例C-002的条件2'],
   'C-038': ['虚构样例C-038的条件1', '虚构样例C-038的条件2'],
 }
-it.each(cases)('$question 首提事实经扩额选点保留，关键引文仍逐字成立', fixture => {
+it.skipIf(!hasFixture).each(cases)('$question 首提事实经扩额选点保留，关键引文仍逐字成立（夹具含第三方论文原文，未随公开仓库发布）', fixture => {
   const limit = ordinaryPointLimit(fixture.chars, 100, 'fine')
   const selected = selectSourcePoints(fixture.points, limit, fixture.chapters.map(chapter => ({ ...chapter, ids: new Set(chapter.ids) })))
   const kept = fixture.points.filter(point => selected.has(point.point_id))

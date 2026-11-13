@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { expect, it } from 'vitest'
 import { excerpts, pageParagraphs, tokenCost } from '../src/wiki/page-search.js'
 import type { PointMatch } from '../src/wiki/page-search.js'
@@ -12,7 +12,8 @@ interface Case {
   pointMatches: PointMatch[]
 }
 // 原始响应与发布页来自只读 real20k；向量分数由同库 qwen3-embedding:8b 重放原查询得到。
-const fixtures = JSON.parse(readFileSync(new URL('./fixtures/real20k/query-excerpts.json', import.meta.url), 'utf8')) as Case[]
+const hasFixture = existsSync(new URL('./fixtures/real20k/query-excerpts.json', import.meta.url))
+const fixtures = (hasFixture ? JSON.parse(readFileSync(new URL('./fixtures/real20k/query-excerpts.json', import.meta.url), 'utf8')) : [{"id": "Q-003", "question": "Q-003"}, {"id": "Q-005", "question": "Q-005"}, {"id": "Q-006", "question": "Q-006"}, {"id": "Q-007", "question": "Q-007"}, {"id": "Q-008", "question": "Q-008"}, {"id": "Q-009", "question": "Q-009"}, {"id": "Q-010", "question": "Q-010"}]) as Case[]
 const facts: Record<string, string[]> = {
   'Q-003': ['虚构样例Q-003的条件1', '虚构样例Q-003的条件2', '虚构样例Q-003的条件3', '虚构样例Q-003的条件4', '虚构样例Q-003的条件5'],
   'Q-005': ['虚构样例Q-005的条件1', '虚构样例Q-005的条件2', '虚构样例Q-005的条件3'],
@@ -22,7 +23,7 @@ const facts: Record<string, string[]> = {
   'Q-009': ['虚构样例Q-009的条件1', '虚构样例Q-009的条件2', '虚构样例Q-009的条件3'],
   'Q-010': ['虚构样例Q-010的条件1', '虚构样例Q-010的条件2'],
 }
-it.each(fixtures)('$id 现场原响应对应的答案事实进入连续摘录', item => {
+it.skipIf(!hasFixture).each(fixtures)('$id 现场原响应对应的答案事实进入连续摘录（夹具含第三方论文原文，未随公开仓库发布）', item => {
   expect(item.originalResponse.response.groups.flatMap(group => group.results).some(hit => hit.path === item.page.path)).toBe(true)
   const result = excerpts(item.page, [item.originalResponse.query], 1333, item.pointMatches)
   const content = result.map(quote => quote.content).join('\n')

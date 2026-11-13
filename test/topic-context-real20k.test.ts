@@ -1,8 +1,8 @@
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { expect, it } from 'vitest'
 import { topicEvidenceContext } from '../src/layered/topic-metadata.js'
 
-it('T-0053-01 现场 L227 的 them 保留前句 families，原引文与逐字校验不变', () => {
+it.skipIf(!(existsSync(new URL('./fixtures/real20k/topic-evidence-context.json', import.meta.url))))('T-0053-01 现场 L227 的 them 保留前句 families，原引文与逐字校验不变（夹具含第三方论文原文，未随公开仓库发布）', () => {
   const fixture = JSON.parse(readFileSync(new URL('./fixtures/real20k/topic-evidence-context.json', import.meta.url), 'utf8'))
   const original = fixture.member.evidence.find((evidence: { locator: string }) => evidence.locator === 'L227-L227')
   const evidence = { ...original, source_version: fixture.source.source_version }

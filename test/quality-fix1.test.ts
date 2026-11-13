@@ -15,7 +15,7 @@ import { stripBlockIds } from '../src/wiki/page-search.js'
 import type { LayeredReadView } from '../src/layered/revocations.js'
 import { cleanupLayeredFixtures, layeredFixture, layeredIncrementalFixture, layeredTopicFixture, snapshotManifest } from './layered-fixture.js'
 import { fixture as queryFixture } from './query-pages-audit-fixture.js'
-import regression from './fixtures/quality-fix1-dev.json'
+import { existsSync } from 'node:fs'
 
 vi.mock('node:fs/promises', async original => ({ ...await original<typeof import('node:fs/promises')>() }))
 afterEach(cleanupLayeredFixtures)
@@ -92,7 +92,8 @@ it('移出成员保留原主张和状态，增量排除直到内容变化，来�
   expect((await snapshotManifest(f.root)).topic_gaps?.some(gap => gap.message.includes('来源数不足'))).toBe(true)
 })
 
-it('置信度使用高级设置的绝对门槛；开发集固定夹具与空结果回归', async () => {
+it.skipIf(!(existsSync(new URL('./fixtures/quality-fix1-dev.json', import.meta.url))))('置信度使用高级设置的绝对门槛；开发集固定夹具与空结果回归（夹具含第三方论文原文，未随公开仓库发布）', async () => {
+  const regression = JSON.parse(await readFile(new URL('./fixtures/quality-fix1-dev.json', import.meta.url), 'utf8'))
   const threshold = layeredSettings().searchRelevanceThreshold
   expect(threshold).toBe(0.2)
   expect(regression.split).toBe('开发')

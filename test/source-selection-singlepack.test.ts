@@ -3,7 +3,7 @@ import { cleanupLayeredFixtures } from './layered-fixture.js'
 import { extractionFixture, output } from './quality-fix2-audit-fixture.js'
 import { selectSourcePoints } from '../src/layered/extraction.js'
 import type { Point } from '../src/layered/schema.js'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 
 vi.mock('node:fs/promises', async original => ({ ...await original<typeof import('node:fs/promises')>() }))
 afterEach(cleanupLayeredFixtures)
@@ -36,7 +36,7 @@ it('对象与条件中的样本优先保留，背景及一般条件不能占掉�
   expect([...selectSourcePoints(points, 4, [])]).toEqual(['e', 'c', 'f', 'd'])
 })
 
-it('S14扩额首提237条仍超200时，C036的其他视角及家庭研究局限完整保留', () => {
+it.skipIf(!(existsSync(new URL('./fixtures/real20k/source-selection-expanded-s14.json', import.meta.url))))('S14扩额首提237条仍超200时，C036的其他视角及家庭研究局限完整保留（夹具含第三方论文原文，未随公开仓库发布）', () => {
   const { points } = JSON.parse(readFileSync(new URL('./fixtures/real20k/source-selection-expanded-s14.json', import.meta.url), 'utf8')) as { points: Point[] }
   const selected = selectSourcePoints(points, 200, [])
   expect(selected.size).toBe(200)

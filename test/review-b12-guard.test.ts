@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { preservesClaimFacts } from '../src/layered/corrections.js'
 import { reviewTopicContent } from '../src/layered/topic-review.js'
@@ -8,7 +8,8 @@ import { point, reviewFixture } from './quality-fix2-audit-fixture.js'
 vi.mock('node:fs/promises', async original => ({ ...await original<typeof import('node:fs/promises')>() }))
 beforeEach(() => vi.stubGlobal('fetch', () => { throw new Error('离线护栏测试禁止联网') }))
 afterEach(() => { cleanupLayeredFixtures(); vi.unstubAllGlobals() })
-const samples = JSON.parse(readFileSync(new URL('./fixtures/topic-guard-review.json', import.meta.url), 'utf8'))
+const hasFixture = existsSync(new URL('./fixtures/topic-guard-review.json', import.meta.url))
+const samples = hasFixture ? JSON.parse(readFileSync(new URL('./fixtures/topic-guard-review.json', import.meta.url), 'utf8')) : {"examples": [{"id": "C1"}, {"id": "C2"}, {"id": "C3"}, {"id": "C4"}, {"id": "C5"}, {"id": "C6"}, {"id": "C7"}, {"id": "C8"}, {"id": "C9"}, {"id": "C10"}], "accepted": [{"id": "431/S6"}, {"id": "459/S4"}, {"id": "521/S8"}, {"id": "521/S9"}]}
 const link = '[依据](../sources/S-0001.md#p)'
 const body = (text: string) => text.replace(/^[-*] /, '').replace(/\[[^\]]*\]\([^)]*\)/g, '').trim()
 
@@ -31,14 +32,14 @@ async function correct(originals: string[], changes: string[], verdict: { suppor
   return { ...result, requests: f.call.mock.calls.map(args => JSON.parse(args[2])) }
 }
 
-it.each(samples.examples)('B12 $id 反例拒收', async ({ id, original, corrected }: any) => {
+it.skipIf(!hasFixture).each(samples.examples)('B12 $id 反例拒收（夹具含第三方论文原文，未随公开仓库发布）', async ({ id, original, corrected }: any) => {
   // C9 的开放角色改写由最终等价性核对裁决，其余显式事实变化不能被模型通过推翻。
   const result = await correct([original], [corrected], { claim_preserved: id !== 'C9' })
   expect(result.content).not.toContain(corrected)
   expect(result.review!.removed).toHaveLength(1)
 })
 
-it.each(samples.accepted)('B12 $id 真实误拦修复后收下', async ({ original, corrected }: any) => {
+it.skipIf(!hasFixture).each(samples.accepted)('B12 $id 真实误拦修复后收下（夹具含第三方论文原文，未随公开仓库发布）', async ({ original, corrected }: any) => {
   const result = await correct([body(original)], [body(corrected)])
   expect(result.content).toContain(body(corrected))
   expect(result.review!.removed).toEqual([])
@@ -108,7 +109,7 @@ it('B12 来源标题按来源身份绑定，标题词不作事实锚点且不同
   expect(preservesClaimFacts('《Many Nurses Improve Outcomes》报告，CRN负责访谈。', '《Other Study》报告，CRN负责访谈。', sources)).toBe(false)
 })
 
-it('B12 主语换说法未获最终等价性确认仍拒收', async () => {
+it.skipIf(!hasFixture)('B12 主语换说法未获最终等价性确认仍拒收（夹具含第三方论文原文，未随公开仓库发布）', async () => {
   const sample = samples.accepted[0]
   const result = await correct([body(sample.original)], [body(sample.corrected)], { claim_preserved: false })
   expect(result.requests.some(d => d.sentences?.some((s: any) => s.original_text))).toBe(true)

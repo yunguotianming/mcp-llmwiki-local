@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs'
 import { readFile, readdir, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { afterEach, expect, it, vi } from 'vitest'
@@ -22,7 +23,7 @@ async function fixture(text: string) {
   return { ...f, source, run: (previous?: Extraction) => extractSource(f.root, 'S-0001', source, processing, f.options, 64000, previous) }
 }
 
-it('同源完整示例通过校验，真实20h请求与旧输出按新协议离线首提通过结构校验', async () => {
+it.skipIf(!(existsSync(new URL('./fixtures/correction-20h-request.json', import.meta.url)) && existsSync(new URL('./fixtures/correction-20h-output.txt', import.meta.url))))('同源完整示例通过校验，真实20h请求与旧输出按新协议离线首提通过结构校验（夹具含第三方论文原文，未随公开仓库发布）', async () => {
   const request = JSON.parse(await readFile(new URL('./fixtures/correction-20h-request.json', import.meta.url), 'utf8'))
   const captured = JSON.parse(await readFile(new URL('./fixtures/correction-20h-output.txt', import.meta.url), 'utf8'))
   const example = wireOutput.parse(schemaExample(wireOutput.toJSONSchema()))

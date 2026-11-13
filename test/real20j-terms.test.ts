@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs'
 import { afterEach, expect, it, vi } from 'vitest'
 import { readFile } from 'node:fs/promises'
 import { setImmediate } from 'node:timers/promises'
@@ -11,8 +12,9 @@ import type { TermRecord } from '../src/layered/schema.js'
 
 vi.mock('node:fs/promises', async original => ({ ...await original<typeof import('node:fs/promises')>() }))
 afterEach(cleanupLayeredFixtures)
-const input520 = JSON.parse(await readFile(new URL('./fixtures/real20j/520.input.json', import.meta.url), 'utf8'))
-const output520 = JSON.parse(await readFile(new URL('./fixtures/real20j/520.output.json', import.meta.url), 'utf8'))
+const hasFixtures = ['520.input.json', '520.output.json'].every(name => existsSync(new URL('./fixtures/real20j/' + name, import.meta.url)))
+const input520 = hasFixtures ? JSON.parse(await readFile(new URL('./fixtures/real20j/520.input.json', import.meta.url), 'utf8')) : undefined
+const output520 = hasFixtures ? JSON.parse(await readFile(new URL('./fixtures/real20j/520.output.json', import.meta.url), 'utf8')) : undefined
 const output = (keys: string[]) => ({ definition: [{ text: '可核对定义。', keys }], usage: [], findings: [], differences: [] })
 
 async function fixture() {
@@ -31,7 +33,7 @@ async function fixture() {
   return { ...f, record, run: () => prepareTerms(f.root, f.pending, f.committed, meteredOptions(f.root, f.pending, f.options)) }
 }
 
-it('20j 调用520：重复168的长键被拒，三条输入映射R1/R2/R3后正确回源并发布', async () => {
+it.skipIf(!hasFixtures)('20j 调用520：重复168的长键被拒，三条输入映射R1/R2/R3后正确回源并发布（夹具含第三方论文原文，未随公开仓库发布）', async () => {
   const f = await fixture(), allowed = input520.contributions.map((item: any) => item.key)
   expect(allowed).not.toContain(output520.usage[0].keys[0])
   expect(output520.usage[0].keys[0].replace('168168', '168')).toBe(allowed[2])
@@ -55,7 +57,7 @@ it('20j 调用520：重复168的长键被拒，三条输入映射R1/R2/R3后正�
   expect(f.call).not.toHaveBeenCalled()
 })
 
-it('未知短编号只纠正坏条目一次，正常定义逐字保留且纠正成本被记录', async () => {
+it.skipIf(!hasFixtures)('未知短编号只纠正坏条目一次，正常定义逐字保留且纠正成本被记录（夹具含第三方论文原文，未随公开仓库发布）', async () => {
   const f = await fixture(), corrections: any[] = []
   f.call.mockImplementation(async (_task, _system, raw) => {
     const d = JSON.parse(raw)
@@ -74,7 +76,7 @@ it('未知短编号只纠正坏条目一次，正常定义逐字保留且纠正�
   expect(f.pending.costs!.stages['术语']!.corrections).toBe(1)
 })
 
-it('未知短编号纠正仍错则隔离该条，其他术语、标签和发布继续', async () => {
+it.skipIf(!hasFixtures)('未知短编号纠正仍错则隔离该条，其他术语、标签和发布继续（夹具含第三方论文原文，未随公开仓库发布）', async () => {
   const f = await fixture()
   f.call.mockImplementation(async (...args) => {
     const d = JSON.parse(args[2])
@@ -93,7 +95,7 @@ it('未知短编号纠正仍错则隔离该条，其他术语、标签和发布�
   expect(manifest.tag_merges!.checked.length).toBeGreaterThan(0)
 })
 
-it('引用纠正改写主张拒收，整个坏分节留缺口且不取消另一在途术语', async () => {
+it.skipIf(!hasFixtures)('引用纠正改写主张拒收，整个坏分节留缺口且不取消另一在途术语（夹具含第三方论文原文，未随公开仓库发布）', async () => {
   const f = await fixture(), started = Promise.withResolvers<void>(), release = Promise.withResolvers<void>()
   let otherSignal: AbortSignal | undefined
   f.options.client.concurrency = () => 2
@@ -114,7 +116,7 @@ it('引用纠正改写主张拒收，整个坏分节留缺口且不取消另一�
   await publishLibrary(f.root, f.pending)
 })
 
-it('单术语传输异常不取消同批任务，下一次发布复用已封存成果', async () => {
+it.skipIf(!hasFixtures)('单术语传输异常不取消同批任务，下一次发布复用已封存成果（夹具含第三方论文原文，未随公开仓库发布）', async () => {
   const f = await fixture()
   f.call.mockImplementation(async (_task, _system, raw, signal) => {
     const d = JSON.parse(raw)
