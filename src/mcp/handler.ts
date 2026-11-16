@@ -20,7 +20,7 @@ export const localToolInputs = {
   wiki_status: z.strictObject({ libraryId: id, version: id.optional() }),
   wiki_pause: z.strictObject({ libraryId: id }),
   wiki_copy_with_embedding: z.strictObject({ libraryId: id, confirm: z.literal(true) }),
-  wiki_retry_topic_gaps: z.strictObject({ libraryId: id, topicIds: z.array(id).optional(), reasons: z.array(id).optional() }),
+  wiki_retry_topic_gaps: z.strictObject({ libraryId: id, topicIds: z.array(id).optional(), reasons: z.array(id).optional(), renewReviewWindow: z.boolean().optional(), requestId: id.optional() }),
 } as const
 
 /** 独立 MCP 复用宿主的查询、登记锁与发现服务。 */
@@ -74,7 +74,7 @@ export function createMcpHandler(host: LocalHost, notify?: (message: unknown) =>
         case 'wiki_pause': { const args = localToolInputs[name].parse(raw); value = host.stop(args.libraryId); break }
         case 'wiki_copy_with_embedding': { const args = localToolInputs[name].parse(raw); value = await host.copyEmbedding(args.libraryId, signal); break }
         case 'wiki_retry_topic_gaps': { const args = localToolInputs[name].parse(raw); value = await host.operations.retryTopicGaps(args.libraryId, signal, {
-          ...(args.topicIds ? { topicIds: args.topicIds } : {}), ...(args.reasons ? { reasons: args.reasons } : {}),
+          ...(args.topicIds ? { topicIds: args.topicIds } : {}), ...(args.reasons ? { reasons: args.reasons } : {}), ...(args.renewReviewWindow !== undefined ? { renewReviewWindow: args.renewReviewWindow } : {}), ...(args.requestId ? { requestId: args.requestId } : {}),
         }); break }
       }
       return result({ content: [{ type: 'text', text: JSON.stringify(host.sanitize(value, name === 'wiki_list_libraries' ? 'catalog' : name)) }] })

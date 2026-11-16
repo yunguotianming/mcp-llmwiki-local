@@ -40,7 +40,7 @@ it.each(['dsh-host', 'dsh-manual', 'dsh-completions', 'local-plain', 'local-env'
     if (stopping && text.includes('待续跑资料')) { stopping.abort(new Error('用户暂停')); stopping = undefined; throw new Error(key) }
     const input = JSON.parse(text)
     if (input.tiers) return JSON.stringify(Object.fromEntries(input.tiers.map((tier: string) => [tier, '研究方法资料'])))
-    if (input.question) return JSON.stringify({ answer: '资料支持研究方法。[1]', citations: [1] })
+    if (input.question) return JSON.stringify({ units: [{ block: 'paragraph', text: '资料支持研究方法。', citationIds: [1] }] })
     const value = JSON.parse(modelOutput(input)); if (value.terms) value.terms = []
     return JSON.stringify(value)
   }

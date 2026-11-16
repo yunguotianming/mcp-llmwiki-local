@@ -17,7 +17,8 @@ afterEach(cleanupLayeredFixtures)
 
 it('新核实但无旧依赖/嵌入的点保留pending与向量缺口，不启动旧主题池', async () => {
   const f = await sourceRecoveryFixture(), before = await sourceRecoveryExtraction(f.root, f.manifest, 'S-0001')
-  const point = before.segments.flatMap(segment => segment.points)[0]!, pointId = point.point_id
+  // 取夹具中“待补核对”的点；“保留已接受”的点仍被基线主题页引用，补缺发布继承基线页时会校验引用（07bfd2b）。
+  const point = before.segments.flatMap(segment => segment.points).find(item => item.text.includes('待补核对'))!, pointId = point.point_id
   point.verification = { status: 'unverified', missing: '核对未完成：测试中断', fingerprint: point.verification!.fingerprint }
   before.correction_batches = { ...before.correction_batches, semantic: 0 }
   const entry = f.manifest.sources[0]!, state = f.manifest.vector_state!, textHash = hash(point.text)

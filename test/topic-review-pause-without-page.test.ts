@@ -1,6 +1,7 @@
 import { afterEach, expect, it, vi } from 'vitest'
 import { prepareTopics } from '../src/layered/topics.js'
 import { topicPath } from '../src/layered/schema.js'
+import { consumeTopicReviewWindow, registerTopicReviewWindowRequest, validateTopicRecoveryRequest } from '../src/layered/topic-recovery.js'
 import { cleanupLayeredFixtures, hydratedState } from './layered-fixture.js'
 import { pendingFixture } from './pipeline-audit-fixture.js'
 import type { PendingBuild } from '../src/layered/schema.js'
@@ -60,4 +61,65 @@ it('无旧页修复稿遇到协议缺项时保留当前稿与证据，不转失�
   expect(f.pending.topic_scope!.completed).not.toContain(f.child.id)
   expect(f.pending.topics!.repairs![f.child.id]).toMatchObject({ content: before.content, evidence: before.evidence, deadline: before.deadline, run_id: before.run_id })
   expect(f.pending.topics!.gaps).toContainEqual(expect.objectContaining({ topic_id: f.child.id, stage: 'review', effect: '整页阻塞' }))
+})
+
+it('普通续跑不消费过期窗口，明确授时从首次实际续核起算且重复恢复沿用截止时刻', () => {
+  const f = { topics: { repairs: { T: { protocol: 'p', input: 'i', evidence: 'e', content: '# T', member_ids: ['P'], stage: 'review', run_id: 'r', rounds: 1, total_rounds: 1, max_rounds: 6, deadline: 1000 } } } } as any
+  const pending = { topic_scope: { targets: ['T'], completed: [], review_inputs: {} }, topics: f.topics } as any
+  expect(registerTopicReviewWindowRequest(pending, { topicIds: ['T'] }, 2000).granted).toEqual([])
+  const granted = registerTopicReviewWindowRequest(pending, { topicIds: ['T'], renewReviewWindow: true, requestId: 'req' }, 2000)
+  expect(granted.granted[0]).toMatchObject({ topicId: 'T', originalDeadline: 1000, rounds: 1, totalRounds: 1, maxRounds: 6, regenerations: 0 })
+  const first = consumeTopicReviewWindow(pending, 'T', { input: 'i', evidence: 'e', memberIds: ['P'] }, 3000)
+  expect(first?.deadline).toBe(1203000)
+  expect(consumeTopicReviewWindow(pending, 'T', { input: 'i', evidence: 'e', memberIds: ['P'] }, 4000)?.deadline).toBe(1203000)
+})
+
+it('授时请求重复登记只消费一次，轮次已满或绑定变化拒绝消费', () => {
+  const make = (rounds = 1) => ({ topic_scope: { targets: ['T'], completed: [], review_inputs: {} }, topics: { repairs: { T: { protocol: 'p', input: 'i', evidence: 'e', content: '# T', member_ids: ['P'], stage: 'review', run_id: 'r', rounds, total_rounds: rounds, max_rounds: 6, deadline: 1000 } } } } as any)
+  const pending = make(); registerTopicReviewWindowRequest(pending, { topicIds: ['T'], renewReviewWindow: true, requestId: 'req' }, 2000); registerTopicReviewWindowRequest(pending, { topicIds: ['T'], renewReviewWindow: true, requestId: 'req' }, 2000)
+  expect(Object.keys(pending.topic_scope.review_windows)).toHaveLength(1)
+  expect(consumeTopicReviewWindow(pending, 'T', { input: 'changed', evidence: 'e', memberIds: ['P'] }, 3000)).toBeUndefined()
+  const full = make(6); registerTopicReviewWindowRequest(full, { topicIds: ['T'], renewReviewWindow: true, requestId: 'full' }, 2000)
+  expect(consumeTopicReviewWindow(full, 'T', { input: 'i', evidence: 'e', memberIds: ['P'] }, 3000)).toBeUndefined()
+})
+
+it('授时意图要求非空 topicIds，且不影响未选中目标', () => {
+  expect(() => validateTopicRecoveryRequest({ renewReviewWindow: true })).toThrow(/topicIds/)
+  const pending = { topic_scope: { targets: ['T'], completed: [], review_inputs: {} }, topics: { repairs: {} } } as any
+  const result = registerTopicReviewWindowRequest(pending, { topicIds: ['X'], renewReviewWindow: true, requestId: 'x' }, 2000)
+  expect(result.granted).toEqual([]); expect(result.skipped[0]?.reason).toContain('未被当前恢复范围选中')
+})
+
+it('授时结果在消费后返回固定起止时刻与保留计数', () => {
+  const pending = { topic_scope: { targets: ['T'], completed: [], review_inputs: {} }, topics: { repairs: { T: { protocol: 'p', input: 'i', evidence: 'e', content: '# T', member_ids: ['P'], stage: 'review', run_id: 'r', rounds: 2, total_rounds: 4, max_rounds: 6, deadline: 1000, regenerations: 3 } } } } as any
+  registerTopicReviewWindowRequest(pending, { topicIds: ['T'], renewReviewWindow: true, requestId: 'result' }, 2000)
+  consumeTopicReviewWindow(pending, 'T', { input: 'i', evidence: 'e', memberIds: ['P'] }, 3000)
+  const grant = pending.topic_scope.review_windows.result.grants.T
+  expect(grant).toMatchObject({ original_deadline: 1000, started_at: 3000, deadline: 1203000, rounds: 2, total_rounds: 4, max_rounds: 6, regenerations: 3 })
+})
+
+it('输入、证据或成员绑定变化时拒绝消费且保留原期限', () => {
+  const pending = { topic_scope: { targets: ['T'], completed: [], review_inputs: {} }, topics: { repairs: { T: { protocol: 'p', input: 'i', evidence: 'e', content: '# T', member_ids: ['P'], stage: 'review', run_id: 'r', rounds: 1, total_rounds: 1, max_rounds: 6, deadline: 1000 } } } } as any
+  registerTopicReviewWindowRequest(pending, { topicIds: ['T'], renewReviewWindow: true, requestId: 'binding' }, 2000)
+  expect(consumeTopicReviewWindow(pending, 'T', { input: 'i', evidence: 'changed', memberIds: ['P'] }, 3000)).toBeUndefined()
+  expect(pending.topics.repairs.T.deadline).toBe(1000)
+  expect(pending.topic_scope.review_windows.binding.grants.T.reason).toContain('绑定已变化')
+})
+
+it('明确授时后过期修复稿在新窗口内续核：派发核对、保留计数且消费即落盘', async () => {
+  const f = await interrupted(), repair = f.pending.topics!.repairs![f.child.id]!
+  repair.deadline = 0
+  const before = structuredClone(repair)
+  registerTopicReviewWindowRequest(f.pending, { topicIds: [f.child.id], renewReviewWindow: true, requestId: '续时' })
+  f.call.mockImplementation(f.original); f.call.mockClear(); f.topicRequests.splice(0)
+  const started = Date.now()
+  // 主题范围已持久；授时登记后按原范围续跑（与上方期限耗尽用例相同的入口）。
+  await prepareTopics(f.root, f.pending, f.committed, f.options, undefined)
+  const grant = f.pending.topic_scope!.review_windows!['续时']!.grants[f.child.id]!
+  expect(grant).toMatchObject({ status: 'consumed', original_deadline: 0, rounds: before.rounds, total_rounds: before.total_rounds, max_rounds: before.max_rounds })
+  expect(grant.started_at!).toBeGreaterThanOrEqual(started)
+  expect(grant.deadline! - grant.started_at!).toBe(20 * 60 * 1000)
+  expect(f.call.mock.calls.some(call => { const input = JSON.parse(call[2]); return input.topic_id === f.child.id && input.review_stage })).toBe(true)
+  const saved = await hydratedState<PendingBuild>(f.root, 'work/pending.json')
+  expect(saved.topic_scope!.review_windows!['续时']!.grants[f.child.id]).toMatchObject({ status: 'consumed', deadline: grant.deadline })
 })

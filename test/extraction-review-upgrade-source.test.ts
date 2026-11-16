@@ -33,12 +33,17 @@ async function fixture(kind: string) {
     source_version: sourceVersion, resource_version: [], segments: f.source.segments, metadata: f.source.metadata, files: { source: sourceFile, assets: [] },
     extract: { path: extractionFile, processing: f.extraction.processing, processing_fingerprint: '固定提取身份' },
     ...(siyuan ? { siyuan: { input: inputFile, objects: [{ path: inputFile, hash: hash(f.source.text) }] } } : {}) }
-  const manifest = { format_version: 2, version: 'v000001', sources: [source] }
+  const manifest = { format_version: 2, version: 'v000001', sources: [source], pages: {}, deps: { pages: {}, reverse: {} } }
   await writeJson(storage.root, 'versions/v000001.json', { manifest, checksum: hash(storageJson(manifest)) })
+  // 已发布旧库必有当前发布指针；缺少指针的物理版本会被升级根校验拒绝（77b084f）。
+  await writeJson(storage.root, 'state/current.json', { version: 'v000001', revocation_generation: 0, history: [] })
   const recovery = recoveryFixture(storage.root, f.options.client)
   const runner = upgradeReviewRunner(() => recovery.bindings, f.options)
   const step = { id: '提取核对补齐', kind: 'review' as const, stage: 'extractionReview' as const, unitIds: [extractionFile], inputDigest: hash(f.source.text), estimatedInputTokens: 100, maxOutputTokens: 20 }
-  const context = { root: storage.root, runId: '固定升级轮次', hooks: {} as ExecutionHooks, replayOnly: false }
+  // 生产调用方总会提供逐对象结算的保存回调（355e781），这里按同一约定只在内存保留。
+  const settlements: unknown[] = []
+  const context = { root: storage.root, runId: '固定升级轮次', hooks: {} as ExecutionHooks, replayOnly: false,
+    saveReviewSettlement: async (value: unknown) => { settlements.push(structuredClone(value)) } }
   return { ...f, ...storage, source, sourceVersion, sourceId, sourceFile, inputFile, extractionFile, runner, step, context, reviewCall: f.call }
 }
 
@@ -63,7 +68,7 @@ it.each(['摘要错误', '缺少对象身份', '文件丢失'])('思源提取投
   else if (kind === '文件丢失') await unlink(path.join(f.root, f.inputFile))
   else {
     f.source.siyuan!.objects = []
-    const manifest = { format_version: 2, version: 'v000001', sources: [f.source] }
+    const manifest = { format_version: 2, version: 'v000001', sources: [f.source], pages: {}, deps: { pages: {}, reverse: {} } }
     await writeJson(f.root, 'versions/v000001.json', { manifest, checksum: hash(storageJson(manifest)) })
   }
   if (kind === '文件丢失') await expect(f.runner(f.step, f.context)).rejects.toMatchObject({ code: 'ENOENT' })

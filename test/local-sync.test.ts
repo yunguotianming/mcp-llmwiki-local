@@ -16,14 +16,15 @@ import { temporaryWorkspace } from './temp.js'
 vi.mock('node:fs/promises', async original => ({ ...await original<typeof import('node:fs/promises')>() }))
 afterEach(cleanupLayeredFixtures)
 
-it('独立配置保留旧外层及运行参数，兼容接口只接受环境变量密钥', () => {
+it('独立配置保留旧外层及运行参数，兼容接口接受明文或环境变量密钥', () => {
   const registry = emptyRegistry()
   registry.compatibleProviders = { 'compatible:local': { baseUrl: 'https://offline.invalid/v1', api: 'openai-responses', model: 'fake', apiKeyEnv: 'LOCAL_SYNC_KEY' } }
   const runtime = { codexExecutable: 'custom.exe', codexContextWindowTokens: 64000, deepseekBaseUrl: 'https://offline.invalid/v1' }
   expect(parseLocalConfig({ registry, runtime })).toMatchObject({ registry: { compatibleProviders: registry.compatibleProviders }, runtime })
-  registry.compatibleProviders['compatible:local'] = { ...registry.compatibleProviders['compatible:local']!, apiKey: '禁止持久化' }
+  // FR-39：MCP 配置可写明文 key 或环境变量名（c935b4c 起放开）；明文由 LocalConfigStore.secrets 纳入日志脱敏。
+  registry.compatibleProviders['compatible:local'] = { ...registry.compatibleProviders['compatible:local']!, apiKey: '离线明文密钥' }
   delete registry.compatibleProviders['compatible:local']!.apiKeyEnv
-  expect(() => parseLocalConfig({ registry, runtime })).toThrow('apiKeyEnv')
+  expect(parseLocalConfig({ registry, runtime }).registry.compatibleProviders?.['compatible:local']).toMatchObject({ apiKey: '离线明文密钥' })
 })
 
 it('SDK 库卡片资源、订阅和修订写入共用持久配置，旧修订拒绝覆盖', async () => {

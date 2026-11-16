@@ -9,7 +9,7 @@ import { resumeReadingCopy } from './reading-copy.js'
 import { collectGarbage } from './retention.js'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { requestTopicRecovery, selectTopicGaps } from './topic-recovery.js'
+import { registerTopicReviewWindowRequest, requestTopicRecovery, selectTopicGaps, validateTopicRecoveryRequest } from './topic-recovery.js'
 import { checkSourceRecovery, checkSourceRecoveryFiles, recoveredPointCoverage, sourceRecoveryInput, sourceRetryRequest } from './source-recovery.js'
 export { recoverTopicIdentities, selectTopicGaps, topicGapDiagnostics } from './topic-recovery.js'
 import { mapConcurrent } from '../llm/scheduler.js'
@@ -25,7 +25,7 @@ import { directory, safePath, validateRoots } from '../storage/paths.js'
 import { resolveLibraryRoot } from '../storage/library-root.js'
 import { readOptional } from '../storage/files.js'
 import { advanceStorageGeneration, atomicWrite, hash, hashName, immutableWrite, withBuildLock, withStorageGeneration, writeJson } from './files.js'
-import { extractSourceReceipt, extractionFingerprint, extractionNeedsRetry, groupingFingerprint, planExtraction, resultFingerprint, reusableExtraction, extractionPromptHash, sameProcessing, reusableExtractionPlan, publishedExtractionUnchanged } from './extraction.js'
+import { extractSourceReceipt, extractionFingerprint, extractionNeedsRetry, groupingFingerprint, planExtraction, resultFingerprint, reusableExtraction, extractionProcessing, extractionPromptHash, sameProcessing, reusableExtractionPlan, publishedExtractionUnchanged } from './extraction.js'
 import { finishPublication, initializeLibrary, publishLibrary, readCurrent, readExtraction, readManifest } from './publication.js'
 import { readLocalSource, segmentResources, snapshotSource } from './snapshot.js'
 import { formatVersion } from './schema.js'
@@ -78,8 +78,9 @@ export async function layeredInputBudget(options: Pick<BuildLayeredOptions, 'cli
   if (inputLimit === undefined || !Number.isFinite(inputLimit) || inputLimit <= 0) throw new Error('模型未声明可用上下文或预算不足。请配置 buildLayeredLibrary.maxInputBytes（UTF-8 字节）；对照入口配置 compareWikiFlows.layered.maxInputBytes，或库设置的上下文上限 contextWindowTokens（对照入口 policy.contextWindowTokens，扣除输出预算）。')
   return inputLimit
 }
-export async function buildLayeredLibrary(options: RecoveryBuildOptions): Promise<{ version: string; added: string[]; modelCalls: number; unchanged: boolean }> {
+export async function buildLayeredLibrary(options: RecoveryBuildOptions): Promise<{ version: string; added: string[]; modelCalls: number; unchanged: boolean; reviewWindow?: ReturnType<typeof registerTopicReviewWindowRequest> }> {
   sourceRetryRequest(options)
+  validateTopicRecoveryRequest(options.retryTopics)
   layeredSettings(options.topics || {}, options.tier)
   const startedAt = new Date().toISOString()
   const knowledgeRoot = await directory(options.knowledgeRoot), tier = options.tier ?? 50
@@ -107,7 +108,7 @@ export async function buildLayeredLibrary(options: RecoveryBuildOptions): Promis
       && requested && new Set(requested).size === scope.targets.length && requested.every(id => scope.targets.includes(id))
       && !options.retryTopics.reasons?.length
     finishingTopicRecovery = Boolean(finishing)
-    if (!finishing && !selectTopicGaps(saved?.manifest ?? manifest, saved?.topics, options.retryTopics).length)
+    if (!finishing && !selectTopicGaps(saved?.manifest ?? manifest, saved?.topics, options.retryTopics).length && !options.retryTopics.renewReviewWindow)
       return { version: current?.version ?? '', added: [], modelCalls: 0, unchanged: true }
   }
   if (!options.recovery && options.client instanceof ModelClient && await readOptional(await safePath(existingRoot, '.llmwiki/policy.json'))) {
@@ -149,6 +150,7 @@ export async function buildLayeredLibrary(options: RecoveryBuildOptions): Promis
       added: [], model_calls: 0, started_at: startedAt }
     if (options.retrySources) pending.source_scope ??= { request: options.retrySources, completed: [], source_input: sourceRecoveryInput(committed), affected_topics: [], changed_points: [] }
     if (!options.recovery && (!options.automaticRecovery || !pending.runId)) pending.runId = randomUUID()
+    let reviewWindow: ReturnType<typeof registerTopicReviewWindowRequest> | undefined
     return withRecovery(root, pending, options, async activeOptions => {
     options = { ...options, ...activeOptions }
     if (options.previewContext) {
@@ -165,9 +167,27 @@ export async function buildLayeredLibrary(options: RecoveryBuildOptions): Promis
     }
     // 旧布尔值保留作业意图，但已登记的失败不代表尚未尝试；新版用持久队列接续剩余重试。
     pending.retry_units ??= []
+    // 只核对的来源补缺：已完成来源若换成了没有接受引用的新提取（旧版本把未被接受的核对结果写成了成果），
+    // 恢复上一版条目并移出完成集合，按当前预算重新核对；仍无接受结果时按延后登记。
+    if (pending.source_scope && pending.source_scope.request.kinds.length === 1 && pending.source_scope.request.kinds[0] === 'review') {
+      const scope = pending.source_scope
+      for (const sourceId of [...scope.completed]) {
+        const entry = pending.manifest.sources.find(item => item.source_id === sourceId), base = committed.sources.find(item => item.source_id === sourceId)
+        if (!entry || !base || entry.acceptedRef || entry.extract.path === base.extract.path) continue
+        pending.manifest.sources = pending.manifest.sources.map(item => item.source_id === sourceId ? structuredClone(base) : item)
+        scope.completed = scope.completed.filter(id => id !== sourceId)
+      }
+    }
     if (pending.source_scope) pending.retry_units = pending.source_scope.request.sourceIds.filter(id => !pending.source_scope!.completed.includes(id)).map(id => 'source:' + id)
-    if (options.retryTopics) pending.retry_units = [...new Set([...pending.retry_units,
-      ...requestTopicRecovery(pending, options.retryTopics).filter(id => !pending.topic_scope!.completed.includes(id)).map(id => 'topic:' + id)])]
+    if (options.retryTopics) {
+      const selected = requestTopicRecovery(pending, options.retryTopics)
+      pending.retry_units = [...new Set([...pending.retry_units,
+        ...selected.filter(id => !pending.topic_scope!.completed.includes(id)).map(id => 'topic:' + id)])]
+      if (options.retryTopics.renewReviewWindow) {
+        reviewWindow = registerTopicReviewWindowRequest(pending, options.retryTopics)
+        await writeJson(root, 'work/pending.json', pending)
+      }
+    }
     if (pending.topic_scope) pending.topic_scope.source_input ??= JSON.stringify(pending.manifest.sources.map(source => [source.source_id, source.source_version, source.content_hash]).sort())
     options = { ...options, retryGaps: false }
     const finishRetry = async (unit: string) => {
@@ -280,7 +300,8 @@ export async function buildLayeredLibrary(options: RecoveryBuildOptions): Promis
       if (JSON.stringify(expected) !== JSON.stringify(actual) || currentInput !== pending.topic_scope.source_input || remoteChanged)
         throw Object.assign(new Error('定向恢复范围外的资料或来源版本已变化；请先完成普通增量，再重新选择主题。'), { stagePause: true, stage: 'topic', code: 'TOPIC_SCOPE_INPUT_CHANGED' })
     }
-    const processing: Processing = { tier, ...(options.granularity ? { granularity: options.granularity } : {}), prompt_version: options.promptVersion ?? 'layered-extract-v5', prompt_hash: extractionPromptHash(), ...(options.imagePolicy === 'images' ? { image_policy: 'images' as const } : {}) }
+    // 与提取内部同一规范化：自定义档位使用独立提示身份，否则来源级指纹与已存成果永不相等，未变来源每次重提。
+    const processing: Processing = extractionProcessing({ tier, ...(options.granularity ? { granularity: options.granularity } : {}), prompt_version: options.promptVersion ?? 'layered-extract-v5', prompt_hash: extractionPromptHash(), ...(options.imagePolicy === 'images' ? { image_policy: 'images' as const } : {}) })
     const settings = layeredSettings(vectorTopics || options.topics || {}, options.tier)
     if (!pending.source_scope) pending.manifest.tag_policy = { limit: settings.tagLimit, only: settings.tagVocabularyOnly, vocabulary: options.tagVocabulary ?? [] }
     measured.vocabulary = canonicalVocabulary([...(options.tagVocabulary ?? []), ...committed.sources.flatMap(source => source.tags ?? [])],
@@ -509,10 +530,19 @@ export async function buildLayeredLibrary(options: RecoveryBuildOptions): Promis
         dependencies: acceptedRef ? [acceptedRef] : [],
       })
       extraction = reviewed.value.extraction
-      acceptedRef = reviewed.acceptedRef ?? acceptedRef
       const reviewCalls = reviewed.reused ? 0 : reviewed.value.calls
       signal.throwIfAborted()
       modelCalls += reviewCalls; pending.model_calls += reviewCalls
+      // 来源补缺的核对未形成可接受结果（预算、传输或协议未完成）时，不把未被接受的判定写成新成果：
+      // 保留上一版提取与原判定，登记延后原因，其余来源继续。
+      if (pending.source_scope && recoveryContext() && !reviewed.reused && !reviewed.acceptedRef) {
+        const reason = extraction.segments.flatMap(segment => segment.points).map(point => point.verification?.missing ?? '')
+          .find(missing => /^(核对未完成|核对协议缺口|核对证据无效)：/.test(missing)) ?? '核对结果未通过接受校验。'
+        ;(pending.source_scope.deferred ??= []).push({ source_id: sourceId, reason: reason.slice(0, 300) })
+        change('补缺延后', sourceId)
+        pending.source_scope.completed.push(sourceId); await finishRetry('source:' + sourceId); await writeJson(root, 'work/pending.json', pending); return
+      }
+      acceptedRef = reviewed.acceptedRef ?? acceptedRef
       if (pending.source_scope && JSON.stringify(extraction) === JSON.stringify(previousResult)) {
         pending.source_scope.completed.push(sourceId); await finishRetry('source:' + sourceId); await writeJson(root, 'work/pending.json', pending); return
       }
@@ -613,7 +643,8 @@ export async function buildLayeredLibrary(options: RecoveryBuildOptions): Promis
       && (options.topics === false || !pending.manifest.vector_state?.coverage.missing.length && !pending.manifest.vector_state?.pending_points.length)) {
       await checkGeneration(root, pending.manifest.revocation_generation)
       await unlink(await safePath(root, 'work/pending.json'))
-      return { version: current.version, added: [], modelCalls: 0, unchanged: true }
+      return { version: current.version, added: [], modelCalls: 0, unchanged: true,
+        ...(reviewWindow && options.retryTopics ? { reviewWindow: registerTopicReviewWindowRequest(pending, options.retryTopics) } : {}) }
     }
     if (!pending.topic_scope) pending.manifest.build_configuration = configuration
     // 词项主题依赖补标；语义模式保持原有阶段并行及预算顺序。
@@ -666,11 +697,13 @@ export async function buildLayeredLibrary(options: RecoveryBuildOptions): Promis
       const log = await readFile(await safePath(root, 'logs/build.md'), 'utf8')
       await atomicWrite(root, 'logs/build.md', log + `\n### 无变化运行 ${pending.started_at}\n\n${costMarkdown(pending.costs!)}`)
       await unlink(await safePath(root, 'work/pending.json')).catch(error => { if (error.code !== 'ENOENT') throw error })
-      return { version: current.version, added: [], modelCalls: 0, unchanged: true }
+      return { version: current.version, added: [], modelCalls: 0, unchanged: true,
+        ...(reviewWindow && options.retryTopics ? { reviewWindow: registerTopicReviewWindowRequest(pending, options.retryTopics) } : {}) }
     }
     if (options.siyuan) await options.siyuan.checkAdmission(root, options.signal)
     const version = await publishLibrary(root, pending, options.signal, options.publish !== false, measured)
-    return { version, added: pending.added, modelCalls, unchanged: false }
+    return { version, added: pending.added, modelCalls, unchanged: false,
+      ...(reviewWindow && options.retryTopics ? { reviewWindow: registerTopicReviewWindowRequest(pending, options.retryTopics) } : {}) }
     })
     })
   }, Boolean(layeredSettings(options.topics || {}, options.tier).writerTakeoverToken))

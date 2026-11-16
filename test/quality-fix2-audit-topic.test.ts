@@ -23,7 +23,8 @@ it('A17 主题纠正失败删句留痕且成员不可变', async () => {
 it('A18 单主题调用异常不抛出且保留失败记录', async () => {
   const f = reviewFixture(); f.call.mockRejectedValue(new Error('模拟主题失败'))
   const result = await reviewTopicContent('T1', body, [point()], f.options)
-  expect(result.calls).toBe(2); expect(result.failure!.length).toBeGreaterThan(0)
+  // 核对调用失败即为核对未完成，不再派发注定失败的纠正（43415e2），只计初轮 1 次。
+  expect(result.calls).toBe(1); expect(result.incomplete).toBe(true); expect(result.failure!.length).toBeGreaterThan(0)
   expect(result.failure).toContain('模拟主题失败')
   expect(result.content).toBe(body)
   expect(result.review?.removed).toEqual([])

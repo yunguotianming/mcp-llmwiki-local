@@ -2,7 +2,7 @@
 
 llmwiki-local 是独立运行的本地 stdio MCP 服务，让 Codex 等客户端查询 Markdown 知识库、生成预览、确认发布，以及复制已有库并更换向量模型。无需安装 dsh。
 
-代码最初复制自 dsh-llmwiki 的 `ff44903`，共享建库、存储和查询代码按固定提交同步，独立安装、独立维护。当前预览版本为 **[0.3.0-preview.9](https://github.com/yunguotianming/mcp-llmwiki-local/releases/tag/0.3.0-preview.9)**，通过本仓 GitHub Release 独立分发。本版让保留的旧 Wiki 页以待核实状态参与搜索和证据组织，向回答模型传递旧页的核对状态；升级或主题核对尚未完成时继续暂停，续跑复用已保存的核对结果，并核对父页有效依赖和当前根。既有引文换行兼容、父页结构核对、旧页导航保留和历史要点向量缓存恢复继续保留。更新包后重启 MCP 服务以加载新构建。正式 0.3.0、三库补建与 AC27 查询质量验收仍未完成，预览包验证不替代这些验收。适配层负责配置、模型调用与 MCP；package.json 的 repository 记录本仓发布地址，source 记录同源插件的同步依据。许可与第三方声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+代码最初复制自 dsh-llmwiki 的 `ff44903`，共享建库、存储和查询代码按固定提交同步，独立安装、独立维护。当前预览版本为 **[0.3.0-preview.10](https://github.com/yunguotianming/mcp-llmwiki-local/releases/tag/0.3.0-preview.10)**，通过本仓 GitHub Release 独立分发。本版让来源定向补缺在牵涉主题时沿用原主题嵌入成果继续执行；补缺核对未形成可接受结果时保留上一版提取与原判定，在构建日志登记“补缺延后”，续跑时把旧版本留下的无接受来源补缺成果恢复后重新核对；自定义提取档位的未变来源续建时不再重复提取。主题定向恢复新增显式选项 `renewReviewWindow`，可为核对期限已过的选中主题再授予一次 20 分钟核对窗口，从首次实际续核起算并固定保存，不增加轮次，保留已有修复稿、接受成果与费用记录。更新包后重启 MCP 服务以加载新构建。正式 0.3.0、三库补建与 AC27 查询质量验收另行记录，预览包验证不替代这些验收。适配层负责配置、模型调用与 MCP；package.json 的 repository 记录本仓发布地址，source 记录同源插件的同步依据。许可与第三方声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 ## 1. 安装与启动
 

@@ -3,7 +3,7 @@ import { jsonProtocol, schemaJSON } from '../llm/protocol.js'
 import { reviewTopicContent, topicReviewFingerprint, topicReviewVersion, topicSentences } from './topic-review.js'
 import { validatedTask } from './extraction-cache.js'
 import { citedTopicPoints, synchronizeTopicMetadata, topicAliases, topicClaimText, topicEvidenceContext } from './topic-metadata.js'
-import { persistTopicRecovery, recoverTopicIdentities, requestTopicRecovery, restoreLegacyTopicMembers, restoreMissingTopics, selectTopicGaps, topicGapDiagnostics } from './topic-recovery.js'
+import { consumeTopicReviewWindow, persistTopicRecovery, recoverTopicIdentities, requestTopicRecovery, restoreLegacyTopicMembers, restoreMissingTopics, selectTopicGaps, topicGapDiagnostics } from './topic-recovery.js'
 import type { TopicEvidenceSource } from './topic-metadata.js'
 import { parseModelJson } from '../llm/json.js'
 import { memberContentHash } from './membership.js'
@@ -227,8 +227,10 @@ export async function preserveRecoveryEmbedding(root: string, pending: PendingBu
   if (pending.base_version !== committed.version || !locked || !sameIdentity(original.identity, locked)
     || original.model !== locked.model || (original.precision ?? 'float32') !== locked.precision
     || !sameIdentity(pending.manifest.vector_state?.identity, locked)) return reject()
+  // 来源补缺只更新所列来源的提取对象，正文身份不变；其余来源连同提取都须与基线一致。
+  const recovering = new Set(pending.source_scope?.request.sourceIds ?? [])
   const sourceIdentity = (manifest: SnapshotManifest) => JSON.stringify(manifest.sources.map(source =>
-    [source.source_id, source.source_version, source.content_hash, source.extract]).sort(([a], [b]) => String(a).localeCompare(String(b))))
+    [source.source_id, source.source_version, source.content_hash, recovering.has(source.source_id) ? null : source.extract]).sort(([a], [b]) => String(a).localeCompare(String(b))))
   if (sourceIdentity(pending.manifest) !== sourceIdentity(committed)) return reject()
   const embeddings = [pending.topics?.state.embedding, pending.manifest.topics?.embedding].filter(item => item !== undefined)
   for (const embedding of embeddings) {
@@ -716,6 +718,17 @@ export async function prepareTopics(root: string, pending: PendingBuild, committ
           ...(generation ? { acceptedRef: generation } : {}),
         } }); await checkpoint()
       } }
+    if (scope && build.repairs?.[topic.id] && pending.topic_scope?.review_windows) {
+      const windows = JSON.stringify(pending.topic_scope.review_windows)
+      consumeTopicReviewWindow(pending, topic.id, {
+        input: topicReviewFingerprint(content, members, true, contexts),
+        evidence: topicReviewFingerprint('', members, true, contexts),
+        memberIds: members.map(member => member.point_id),
+        content,
+      })
+      // 授时一经消费立即落盘；中断重入沿用已保存的截止时刻，不再顺延。
+      if (JSON.stringify(pending.topic_scope.review_windows) !== windows) await checkpoint()
+    }
     if (!recoveryContext()) {
       const result = await reviewTopicContent(topic.id, content, members, reviewOptions, previous, false, contexts, continuation)
       return result

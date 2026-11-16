@@ -5,6 +5,8 @@ import { buildLayeredLibrary } from '../src/layered/index.js'
 import { createBuildModelClient } from '../src/host/models.js'
 import { createExecutionLedger, pruneModelLogs, readVersionCosts } from '../src/layered/costs.js'
 import { readProvenance, protocolDigest, writeProtocol } from '../src/layered/models.js'
+import { atomicWrite, hash } from '../src/layered/files.js'
+import { storageJson } from '../src/layered/vectors.js'
 import { safePath } from '../src/storage/paths.js'
 import { readCurrent } from '../src/layered/publication.js'
 import { cleanupLayeredFixtures, layeredFixture, layeredTopicFixture, snapshotManifest } from './layered-fixture.js'
@@ -164,6 +166,11 @@ it('AC-31 升级上限进入预检、实际尝试预占和续跑累计预算', a
     terms: [], points: [{ point_id: 'S-0001:P1', text_hash: source.content_hash, source_version: source.source_version, locator: 'L1-L1',
       text: 'S-0001 的已发布证据。', section: '主要发现', evidence: [{ source_id: source.source_id, source_version: source.source_version, locator: 'L1-L1', quote: 'S-0001 的已发布证据。' }] }] }]
   await writeFile(file, JSON.stringify(extraction))
+  // 0.2.x 旧库清单的来源条目带原文分段（v0.2.0 建库写入 source.segments）；夹具默认空分段，补齐后升级核对才能定位引文（1603d72）。
+  const text = await readFile(await safePath(old.root, source.files.source), 'utf8')
+  source.segments = [{ locator: 'L1-L1', text_hash: hash(text), start: 0, end: text.length }]
+  const plain = JSON.parse(storageJson(old.manifest))
+  await atomicWrite(old.root, 'versions/v000001.json', storageJson({ checksum: hash(storageJson(plain)), manifest: plain }))
   f.library.wikiPath = old.root
   f.library.models.providerProfiles.offline = { concurrency: 3, retryLimit: 2, backoffMs: 0, cacheMode: 'none' }
   const original = f.stream.getMockImplementation()!

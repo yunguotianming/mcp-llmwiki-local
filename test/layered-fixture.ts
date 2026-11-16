@@ -130,8 +130,12 @@ export function mockSupportReview(input: unknown): string | undefined {
     const data = input as { points: { point_id: string }[] }
     return JSON.stringify({ items: data.points.map(point => ({ point_id: point.point_id, labels: ['研究方法'], keywords: ['研究对象'] })) })
   }
-  const data = input as { review_stage?: string; points?: { id: string }[]; sentences?: { id: string }[] }
+  const data = input as { review_stage?: string; points?: { id: string }[]; sentences?: { id: string; original_text?: string }[]; members?: { point_id: string }[] }
   if (data.review_stage === 'extraction' || data.review_stage === 'topic') return JSON.stringify({ items: (data.points ?? data.sentences ?? []).map(item => ({ id: item.id, support: '完整支撑', missing: '' })) })
+  // 主题核对超出单次预算时按句组与成员分块再合并；两步同样回答完整支撑，最终句附主张保持判定。
+  if (data.review_stage === 'topic-block' || data.review_stage === 'topic-merge') return JSON.stringify({ items: (data.sentences ?? []).map(item => ({ id: item.id, support: '完整支撑', missing: null,
+    ...(data.review_stage === 'topic-block' ? { findings: '引文完整支撑原句。', point_ids: (data.members ?? []).map(member => member.point_id) } : {}),
+    ...(item.original_text !== undefined ? { claim_preserved: true } : {}) })) })
   return undefined
 }
 export function modelOutput(input: ExtractionInput): string {

@@ -1,5 +1,6 @@
 import { topicPath } from './schema.js'
-import type { Extraction, PendingBuild, SnapshotManifest, Topic, TopicGap, TopicState } from './schema.js'
+import type { BuildLayeredOptions, Extraction, PendingBuild, SnapshotManifest, Topic, TopicGap, TopicRepairState, TopicReviewWindowGrant, TopicReviewWindowRequest, TopicState } from './schema.js'
+import { hash } from './files.js'
 
 const transient = /Connection error|timed? out|timeout|terminated|暂时不可用|连接中断|上游.*中断|核对协议缺口|JSON|核对未完成/i
 const parentFailure = (gap: TopicGap) => gap.message === '子主题均有生成缺口。'
@@ -60,6 +61,77 @@ export function selectTopicGaps(manifest: SnapshotManifest, pending?: PendingBui
     && (filter?.topicIds === undefined || filter.topicIds.includes(gap.topic_id))
     && (!filter?.reasons?.length || filter.reasons.some(reason => gap.message.includes(reason) || gap.reasons?.some(item => item.reason === reason)))
     && (filter !== undefined || gap.effect !== '质量审计通知'))
+}
+
+export function validateTopicRecoveryRequest(filter: BuildLayeredOptions['retryTopics'] | undefined): void {
+  if (!filter) return
+  if (filter.topicIds !== undefined && (!Array.isArray(filter.topicIds) || filter.topicIds.some(id => typeof id !== 'string' || !id.trim()))) throw new Error('主题恢复的 topicIds 必须是非空字符串数组。')
+  if (filter.topicIds && new Set(filter.topicIds).size !== filter.topicIds.length) throw new Error('主题恢复的 topicIds 不得重复。')
+  if (filter.reasons !== undefined && (!Array.isArray(filter.reasons) || filter.reasons.some(reason => typeof reason !== 'string' || !reason.trim()))) throw new Error('主题恢复的 reasons 必须是字符串数组。')
+  if (filter.renewReviewWindow && (!filter.topicIds?.length)) throw new Error('renewReviewWindow 必须同时指定非空 topicIds。')
+  if (filter.requestId !== undefined && (typeof filter.requestId !== 'string' || !filter.requestId.trim())) throw new Error('主题授时 requestId 不能为空。')
+}
+
+export interface TopicReviewWindowResult {
+  requestId?: string
+  granted: { topicId: string; originalDeadline: number; startedAt?: number; deadline?: number; rounds: number; totalRounds: number; maxRounds: number; regenerations: number }[]
+  skipped: { topicId: string; reason: string }[]
+}
+
+const windowMinutes = 20 * 60 * 1000
+const windowScope = (pending: PendingBuild) => pending.topic_scope ??= { targets: [], completed: [], review_inputs: {} }
+
+export function registerTopicReviewWindowRequest(pending: PendingBuild, filter: NonNullable<BuildLayeredOptions['retryTopics']>, now = Date.now()): TopicReviewWindowResult {
+  validateTopicRecoveryRequest(filter)
+  if (!filter.renewReviewWindow) return { granted: [], skipped: [] }
+  const ids = [...new Set(filter.topicIds!)]
+  const scope = windowScope(pending), requestId = filter.requestId ?? hash(JSON.stringify(['topic-review-window-v1', pending.runId ?? pending.started_at, ids.sort(), [...(filter.reasons ?? [])].sort()]))
+  const requests = scope.review_windows ??= {}, existing = requests[requestId]
+  if (existing) return { requestId, granted: Object.values(existing.grants).filter(grant => grant.status !== 'skipped').map(grant => ({ topicId: grant.topic_id, originalDeadline: grant.original_deadline, ...(grant.started_at === undefined ? {} : { startedAt: grant.started_at }), ...(grant.deadline === undefined ? {} : { deadline: grant.deadline }), rounds: grant.rounds, totalRounds: grant.total_rounds, maxRounds: grant.max_rounds, regenerations: grant.regenerations })), skipped: Object.values(existing.grants).filter(grant => grant.status === 'skipped').map(grant => ({ topicId: grant.topic_id, reason: grant.reason ?? '未满足授时条件' })) }
+  const request: TopicReviewWindowRequest = { request_id: requestId, targets: ids, created_at: now, grants: {} }
+  const result: TopicReviewWindowResult = { requestId, granted: [], skipped: [] }
+  for (const topicId of ids) {
+    if (!scope.targets.includes(topicId) || scope.completed.includes(topicId)) {
+      request.grants[topicId] = { topic_id: topicId, request_id: requestId, requested_at: now, input: '', evidence: '', member_ids: [], original_deadline: 0, status: 'skipped', reason: '目标未被当前恢复范围选中或已完成。', rounds: 0, total_rounds: 0, max_rounds: 0, regenerations: 0 }
+      result.skipped.push({ topicId, reason: '目标未被当前恢复范围选中或已完成。' })
+      continue
+    }
+    const repair = pending.topics?.repairs?.[topicId]
+    const base = repair ? { topic_id: topicId, request_id: requestId, requested_at: now, input: repair.input, evidence: repair.evidence, member_ids: [...repair.member_ids], original_deadline: repair.deadline,
+      rounds: repair.rounds, total_rounds: repair.total_rounds, max_rounds: repair.max_rounds, regenerations: repair.regenerations ?? 0 } : undefined
+    if (!base) { request.grants[topicId] = { topic_id: topicId, request_id: requestId, requested_at: now, input: '', evidence: '', member_ids: [], original_deadline: 0, status: 'skipped', reason: '没有可续接的核对修复状态。', rounds: 0, total_rounds: 0, max_rounds: 0, regenerations: 0 }; result.skipped.push({ topicId, reason: '没有可续接的核对修复状态。' }); continue }
+    if (base.original_deadline >= now) { request.grants[topicId] = { ...base, status: 'skipped', reason: '原核对期限尚未到期。' }; result.skipped.push({ topicId, reason: '原核对期限尚未到期。' }); continue }
+    if (base.rounds >= base.max_rounds) { request.grants[topicId] = { ...base, status: 'skipped', reason: '主题核对轮次已达上限。' }; result.skipped.push({ topicId, reason: '主题核对轮次已达上限。' }); continue }
+    const grant = { ...base, status: 'pending' as const }
+    request.grants[topicId] = grant
+    result.granted.push({ topicId, originalDeadline: grant.original_deadline, rounds: grant.rounds, totalRounds: grant.total_rounds, maxRounds: grant.max_rounds, regenerations: grant.regenerations })
+  }
+  requests[requestId] = request
+  return result
+}
+
+export function consumeTopicReviewWindow(pending: PendingBuild, topicId: string, binding: { input: string; evidence: string; memberIds: string[]; content?: string }, now = Date.now()): TopicReviewWindowGrant | undefined {
+  const requests = pending.topic_scope?.review_windows
+  if (!requests) return undefined
+  for (const request of Object.values(requests)) {
+    const grant = request.grants[topicId]
+    if (!grant) continue
+    if (grant.status === 'consumed') return grant
+    if (grant.status !== 'pending') continue
+    const repair = pending.topics?.repairs?.[topicId]
+    // 与核对续用修复稿的判定一致：证据须相同，输入摘要或修复稿正文二者之一相同。
+    if (!repair || repair.evidence !== binding.evidence || repair.input !== binding.input && (binding.content === undefined || repair.content !== binding.content)
+      || JSON.stringify([...repair.member_ids].sort()) !== JSON.stringify([...binding.memberIds].sort())) {
+      grant.status = 'skipped'; grant.reason = '主题来源或核对证据绑定已变化，拒绝消费授时。'; return undefined
+    }
+    if (repair.deadline >= now) { grant.status = 'skipped'; grant.reason = '原核对期限尚未到期。'; return undefined }
+    if (repair.rounds >= repair.max_rounds) { grant.status = 'skipped'; grant.reason = '主题核对轮次已达上限。'; return undefined }
+    const startedAt = now, deadline = now + windowMinutes
+    repair.deadline = deadline
+    grant.status = 'consumed'; grant.started_at = startedAt; grant.deadline = deadline
+    return grant
+  }
+  return undefined
 }
 
 /** 新请求只并入实际选中的目标，保留同次恢复已完成的尝试与阶段额度。 */

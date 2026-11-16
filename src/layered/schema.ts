@@ -160,6 +160,17 @@ export interface TopicRepairState {
   dependencies?: PageDependencies
   review?: PageDependencies['review']
 }
+export interface TopicReviewWindowGrant {
+  topic_id: string; request_id: string; requested_at: number
+  input: string; evidence: string; member_ids: string[]
+  original_deadline: number; started_at?: number; deadline?: number
+  status: 'pending' | 'consumed' | 'skipped'; reason?: string
+  rounds: number; total_rounds: number; max_rounds: number; regenerations: number
+}
+export interface TopicReviewWindowRequest {
+  request_id: string; targets: string[]; created_at: number
+  grants: Record<string, TopicReviewWindowGrant>
+}
 export interface TopicClaim { text: string; point_ids: string[]; child_ids?: string[] }
 export interface PageDependencies {
   acceptedRef?: AcceptedRef
@@ -229,9 +240,9 @@ export interface Revocation { source_id: string; current_path: string; alias_pat
 export interface Revocations { generation: number; sources: Revocation[] }
 export interface PendingBuild {
   /** 来源补缺固定同一选择器；续做不得扩展为普通增量或其他来源。 */
-  source_scope?: { request: SourceGapRetry; completed: string[]; source_input: string; affected_topics: string[]; changed_points: string[] }
+  source_scope?: { request: SourceGapRetry; completed: string[]; source_input: string; affected_topics: string[]; changed_points: string[]; deferred?: { source_id: string; reason: string }[] }
   /** 定向恢复的原目标与已完成尝试；队列出空后仍不能扩大为普通全树续跑。 */
-  topic_scope?: { targets: string[]; completed: string[]; review_inputs: Record<string, string>; source_input?: string; configuration?: string }
+  topic_scope?: { targets: string[]; completed: string[]; review_inputs: Record<string, string>; source_input?: string; configuration?: string; review_windows?: Record<string, TopicReviewWindowRequest> }
   runIds?: string[]
   retry_gaps?: boolean
   /** 显式重试尚未结束的单元；旧 retry_gaps 布尔值不重新入队已登记缺口。 */
@@ -382,7 +393,7 @@ export interface BuildLayeredOptions {
   /** 用户显式重试已发布的提取与补标缺口；传输错误产生的组级缺口在普通建库及续跑时也会自动重试。 */
   retryGaps?: boolean
   /** 按主题或原因定向复核已有页的删句记录。 */
-  retryTopics?: { topicIds?: string[]; reasons?: string[] }
+  retryTopics?: { topicIds?: string[]; reasons?: string[]; renewReviewWindow?: boolean; requestId?: string }
   /** 已在本次写入探针核对的身份；不参与来源提取指纹。 */
   vectorIdentity?: EmbeddingIdentity
   vectorDeferred?: boolean

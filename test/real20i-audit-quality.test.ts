@@ -71,6 +71,10 @@ it('Q5：主题核对漏一句不能把其他正常句整批送入纠正', async
     return '{"sentences":[]}'
   })
   const result = await reviewTopicContent('T1', body, [point()], f.options)
-  expect(actual).toEqual(expected)
+  // 漏答属于核对未完成，不能推出不支撑（43415e2）：不派发纠正，整页记未完成并保留原句。
+  expect(actual).toEqual([])
+  expect(result).toMatchObject({ incomplete: true })
+  expect(result.failure).toContain(expected[0]!)
   expect(result.content).toContain('正常结论。')
+  expect(result.content).toContain('待核对结论。')
 })

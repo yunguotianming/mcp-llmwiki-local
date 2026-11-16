@@ -119,7 +119,8 @@ it('承接复判的协议缺口不能当作不支撑删句，纠正仍禁止块�
     return noCorrection(input)
   })
   const result = await reviewTopicContent('T-0003-02-01', fixture.content, fixture.members, model.options)
-  expect(result.calls).toBe(4)
+  // 整批均为已有候选或已终止句时不再派发纠正（43415e2），其余判定与删句结果不变。
+  expect(result.calls).toBe(3)
   expect(result.failure).toContain('核对协议缺口：')
   expect(result.content).toContain(fixture.dependentText)
   expect(result.content).not.toContain('S-9999')
