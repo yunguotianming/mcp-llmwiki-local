@@ -1,6 +1,6 @@
 {
   "name": "llmwiki-local",
-  "version": "0.3.0-preview.7",
+  "version": "0.3.0-preview.8",
   "private": true,
   "license": "MIT",
   "repository": {
@@ -22,8 +22,8 @@
   },
   "source": {
     "repository": "https://github.com/yunguotianming/dsh-llmwiki",
-    "commit": "5f1cc5d81cecd27b2939c236781c19ff2220ccc3",
-    "localCommit": "886b5e6b6979b155b52b1a0215e96a34fedd942a"
+    "commit": "0e7a64d7359705272f63d06ef9b0430cd4ba1bee",
+    "localCommit": "12972a53398859e9e5632610b365e882f2751d49"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",

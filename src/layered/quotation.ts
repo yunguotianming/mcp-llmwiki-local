@@ -37,6 +37,12 @@ export function normalizeQuotation(text: string): string { return comparable(tex
 export function matchQuotation(text: string, quote: string): { start: number; end: number; quote: string } | undefined {
   const exact = quote.trim() ? text.indexOf(quote) : -1
   if (exact >= 0) return { start: exact, end: exact + quote.length, quote }
+  if (quote.trim() && quote.includes('\n')) {
+    // 先仅兼容 CRLF/LF，避免粗体内部截取的引文被后续成对标记归一化误判。
+    const pattern = quote.split(/\r?\n/).map(line => line.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('\\r?\\n')
+    const match = new RegExp(pattern).exec(text)
+    if (match) return { start: match.index, end: match.index + match[0].length, quote: match[0] }
+  }
   const needle = normalizeQuotation(quote)
   if (!needle) return undefined
   const normalized = comparable(text), index = normalized.value.indexOf(needle)

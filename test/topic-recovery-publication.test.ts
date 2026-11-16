@@ -103,3 +103,36 @@ it('主题整页真实改变却无新接受仍拒绝发布生产链', async () =
   await expect(publicationProvenance(f.root, f.pending, hash(storageJson(f.pending.manifest)), previous)).rejects.toMatchObject({ code: 'PROVENANCE_INCOMPLETE' })
   expect(f.call).not.toHaveBeenCalled()
 })
+
+it('定向恢复保留未重新产出的祖先旧页时同步保留其实体与导航', async () => {
+  const f = await recovery(), child = f.pending.topics!.state.topics[0]!
+  const parent = { ...structuredClone(child), id: 'T-0099', path: 'topics/T-0099.md', parent_id: null }
+  child.parent_id = parent.id
+  f.manifest.topics!.topics[0]!.parent_id = parent.id
+  f.manifest.topics!.topics.push(structuredClone(parent))
+  const content = f.pending.topics!.pages[child.path]!.content.replace(child.id, parent.id).replace('## 来源导航', '## 子主题导航')
+    + `\n- [${child.id}](${child.path.slice('topics/'.length)})\n`
+  f.manifest.pages![parent.path] = await putPage(f.root, content)
+  f.manifest.deps!.pages[parent.path] = { sources: [...parent.sources], points: [], children: [{ page: child.path, version: f.manifest.version! }] }
+  await saveManifest(f.root, f.manifest)
+  f.pending.topics!.gaps = [{ topic_id: parent.id, point_ids: parent.point_ids, message: '父页本轮未完成，保留旧成果' }]
+  const version = await publishLibrary(f.root, f.pending, undefined, false, f.options), next = await readVersion(f.root, version)
+  expect(next.pages![parent.path]).toBe(f.manifest.pages![parent.path])
+  expect(next.topics!.topics.find(topic => topic.id === parent.id)).toEqual(parent)
+  expect(next.topics!.topics.find(topic => topic.id === parent.id)?.point_ids).toEqual(parent.point_ids)
+  expect(next.topics!.topics.find(topic => topic.id === parent.id)?.sources).toEqual(parent.sources)
+  expect(await versionPage(f.root, next, 'index.md')).toContain(`](${parent.path})`)
+  expect(next.deps!.pages[parent.path]!.children).toEqual([{ page: child.path, version }])
+  expect(f.pending.topics!.gaps).toEqual([{ topic_id: parent.id, point_ids: parent.point_ids, message: '父页本轮未完成，保留旧成果' }])
+  const previousProof = await legacyProvenance(f.root, f.manifest, hash(storageJson(f.manifest)))
+  const proof = await publicationProvenance(f.root, f.pending, hash(storageJson(next)), previousProof)
+  const oldArtifact = Object.values(previousProof.artifacts).find(artifact => artifact.pagePath === parent.path)!
+  const inheritedArtifact = Object.values(proof.artifacts).find(artifact => artifact.pagePath === parent.path)!
+  expect(oldArtifact.legacyEvidence?.length).toBeGreaterThan(0)
+  expect(inheritedArtifact.status).toBe(oldArtifact.status)
+  expect(inheritedArtifact.productionIds).toEqual(oldArtifact.productionIds)
+  expect(inheritedArtifact.legacyEvidence).toEqual(oldArtifact.legacyEvidence)
+  const repeated = await publishLibrary(f.root, f.pending, undefined, false, f.options), repeatedManifest = await readVersion(f.root, repeated)
+  expect(repeatedManifest.topics!.topics.filter(topic => topic.id === parent.id)).toHaveLength(1)
+  expect(f.call).not.toHaveBeenCalled()
+})

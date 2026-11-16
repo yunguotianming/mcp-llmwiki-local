@@ -49,6 +49,22 @@ export const topicReviewVersion = hash(JSON.stringify(['topic-review-v6-bounded'
   jsonProtocol(blockPrompt, schemaJSON(blockReviewOutput)), jsonProtocol(mergePrompt, schemaJSON(topicReviewOutput)),
   schemaJSON(blockReviewOutput), schemaJSON(topicReviewOutput), schemaJSON(topicCorrectionOutput), schemaJSON(finalReviewOutput), schemaJSON(finalBlockOutput)]))
 
+/** 由库的版本、依赖及对象摘要验证后提供；页面文字只证明该页如此陈述。 */
+interface TopicStructurePage {
+  version: string | null; path: string; manifest_digest: string; object_digest: string; id: string; title: string; summary: string;
+  archived: boolean; direct_member_count: number; children: { path: string; version: string | null }[]; content: string
+}
+export interface TopicStructureEvidence {
+  roots: Omit<TopicStructurePage, 'title' | 'summary' | 'content'>[]
+  pages: TopicStructurePage[]
+}
+const structureRule = 'library_structure 是从依赖指定版本的真实 manifest 与页面对象摘要校验得到的库结构证据，不是待核页自行解析的 navigation。'
+  + '它只支持页身份、路径、父子归属、归档状态、当前直接成员数量，以及“子页标明/写明某内容”的归属转述；content 仅证明该页写了什么，不能证明所写研究结论为真。'
+  + '空成员只表示当前库页面的成员集合为空，不能推出原资料未提及、研究不存在或任何研究结论。标题、范围和正文中的研究实质仍只据 members 及原文；不得把结构证据当成成员证据或编造 point_ids。'
+export const topicStructureReviewVersion = hash(JSON.stringify(['topic-structure-review-v1', topicReviewVersion, structureRule]))
+const reviewProtocol = (structure?: TopicStructureEvidence) => structure ? topicStructureReviewVersion : topicReviewVersion
+const structurePrompt = (prompt: string, structure?: TopicStructureEvidence) => structure ? prompt + structureRule : prompt
+
 const sentencePrefix = (text: string) => /^(?:\s*(?:#{1,6}\s+(?:T-[\d.-]+\s+)?|(?:\d+(?:\.\d+)*[.)、]|[-+*])\s+|>\s*)|范围：)/.exec(text)?.[0] ?? ''
 
 interface TopicReviewSentence {
@@ -108,9 +124,9 @@ function topicSourceVersions(members: Point[]) {
 }
 
 export function topicReviewFingerprint(content: string, members: Point[], contradictionReview: boolean,
-  sourceContexts?: ReadonlyMap<string, TopicEvidenceSource>): string {
+  sourceContexts?: ReadonlyMap<string, TopicEvidenceSource>, structure?: TopicStructureEvidence): string {
   members = orderedMembers(members)
-  return hash(JSON.stringify([topicReviewVersion, contradictionReview,
+  const base = hash(JSON.stringify([topicReviewVersion, contradictionReview,
     topicSentences(content).map(item => [item.text.replace(/\[[^\]]*\]\([^)]*\)/g, ''), citedTopicPoints(item.text, members).map(point => point.point_id)]),
     topicNavigation(content), topicSourceVersions(members),
     members.map(point => [point.point_id, point.text, sourceContexts?.get(point.point_id.split(':')[0]!)?.title,
@@ -118,19 +134,20 @@ export function topicReviewFingerprint(content: string, members: Point[], contra
         const context = topicEvidenceContext(evidence, sourceContexts?.get(evidence.source_id))
         return [evidence.source_id, evidence.source_version, evidence.locator, evidence.quote, context === evidence.quote ? undefined : context]
       })])]))
+  return structure ? hash(JSON.stringify([topicStructureReviewVersion, base, structure])) : base
 }
 
 export async function reviewTopicContent(topicId: string, content: string, members: Point[], options: BuildLayeredOptions,
   previous?: PageDependencies['review'], metadataPass = false,
   sourceContexts?: ReadonlyMap<string, TopicEvidenceSource>, continuation?: {
     state?: TopicRepairState | undefined; runId: string; preserveBudget?: boolean; save(state: TopicRepairState): Promise<void>
-  }): Promise<{ content: string; review?: PageDependencies['review']; calls: number; failure?: string; incomplete?: boolean }> {
+  }, structure?: TopicStructureEvidence): Promise<{ content: string; review?: PageDependencies['review']; calls: number; failure?: string; incomplete?: boolean }> {
   if (!layeredSettings(options.topics || {}, options.tier).topicReview) return { content, calls: 0 }
-  const input = topicReviewFingerprint(content, members, true, sourceContexts)
-  const evidence = topicReviewFingerprint('', members, true, sourceContexts)
+  const input = topicReviewFingerprint(content, members, true, sourceContexts, structure)
+  const evidence = topicReviewFingerprint('', members, true, sourceContexts, structure), protocol = reviewProtocol(structure)
   let state = continuation?.state
-  if (!state || state.stage === 'generate' || state.protocol !== topicReviewVersion || state.evidence !== evidence || state.input !== input && state.content !== content) state = {
-    protocol: topicReviewVersion, input, evidence, content, member_ids: members.map(point => point.point_id), stage: metadataPass ? 'metadata' : 'review',
+  if (!state || state.stage === 'generate' || state.protocol !== protocol || state.evidence !== evidence || state.input !== input && state.content !== content) state = {
+    protocol, input, evidence, content, member_ids: members.map(point => point.point_id), stage: metadataPass ? 'metadata' : 'review',
     run_id: continuation?.runId ?? 'memory', rounds: 0, total_rounds: 0, max_rounds: 6, deadline: Date.now() + 1200000,
     regenerations: state?.regenerations ?? 0,
   }
@@ -149,7 +166,7 @@ export async function reviewTopicContent(topicId: string, content: string, membe
     await continuation?.save(state)
     const before = state.content
     let next: Awaited<ReturnType<typeof reviewTopicPass>>
-    try { next = await reviewTopicPass(topicId, before, selected, options, state.review ?? previous, state.stage === 'metadata', sourceContexts, state.regenerations ?? 0) }
+    try { next = await reviewTopicPass(topicId, before, selected, options, state.review ?? previous, state.stage === 'metadata', sourceContexts, state.regenerations ?? 0, structure) }
     catch (error) {
       state.reason = error instanceof Error ? error.message : String(error)
       await continuation?.save(state)
@@ -174,16 +191,16 @@ export async function reviewTopicContent(topicId: string, content: string, membe
 }
 
 async function reviewTopicPass(topicId: string, content: string, members: Point[], options: BuildLayeredOptions,
-  previous?: PageDependencies['review'], metadataPass = false, sourceContexts?: ReadonlyMap<string, TopicEvidenceSource>, regeneration = 0) {
-  const receipt = await validatedTask(options, 'topicReview', { stage: 'topic-review', protocol: topicReviewVersion, topicId, content, members,
-    previous, metadataPass, regeneration, sources: sourceContexts ? [...sourceContexts] : [] },
-    signal => reviewTopicContentOnce(topicId, content, members, { ...options, signal }, previous, metadataPass, sourceContexts),
+  previous?: PageDependencies['review'], metadataPass = false, sourceContexts?: ReadonlyMap<string, TopicEvidenceSource>, regeneration = 0, structure?: TopicStructureEvidence) {
+  const receipt = await validatedTask(options, 'topicReview', { stage: 'topic-review', protocol: reviewProtocol(structure), topicId, content, members,
+    previous, metadataPass, regeneration, sources: sourceContexts ? [...sourceContexts] : [], ...(structure ? { library_structure: structure } : {}) },
+    signal => reviewTopicContentOnce(topicId, content, members, { ...options, signal }, previous, metadataPass, sourceContexts, structure),
     value => !value.failure && !value.needsMetadata && Boolean(value.review) && !value.review!.removed.length)
   return { ...receipt.value, calls: receipt.reused ? 0 : receipt.value.calls }
 }
 
 function topicReviewInput(topicId: string, content: string, members: Point[], options: BuildLayeredOptions,
-  previous?: PageDependencies['review'], metadataPass = false, sourceContexts?: ReadonlyMap<string, TopicEvidenceSource>) {
+  previous?: PageDependencies['review'], metadataPass = false, sourceContexts?: ReadonlyMap<string, TopicEvidenceSource>, structure?: TopicStructureEvidence) {
   const settings = layeredSettings(options.topics || {}, options.tier)
   members = orderedMembers(members)
   const cited = citedTopicPoints(content, members)
@@ -198,7 +215,7 @@ function topicReviewInput(topicId: string, content: string, members: Point[], op
     return { source_id: evidence.source_id, source_version: evidence.source_version, locator: evidence.locator, quote: evidence.quote,
       context: context === evidence.quote ? undefined : context }
   })]))
-  const fingerprint = (body: string) => topicReviewFingerprint(body, members, settings.contradictionReview, sourceContexts)
+  const fingerprint = (body: string) => topicReviewFingerprint(body, members, settings.contradictionReview, sourceContexts, structure)
   const references = localReferences(members.map(point => point.point_id))
   const memberInput = (point: Point) => ({ point_id: references.alias(point.point_id), text: point.text,
     source_title: sourceContexts?.get(point.point_id.split(':')[0]!)?.title, evidence: memberEvidence.get(point.point_id)! })
@@ -206,7 +223,7 @@ function topicReviewInput(topicId: string, content: string, members: Point[], op
     point_ids: citedTopicPoints(text, members).map(point => references.alias(point.point_id)),
     ...(start >= 0 ? { previous_sentence: index ? { id: sentences[index - 1]!.id, text: sentences[index - 1]!.text } : null } : {}) })),
     navigation: topicNavigation(content), source_versions: topicSourceVersions(members),
-    members: members.map(memberInput) }
+    members: members.map(memberInput), ...(structure ? { library_structure: structure } : {}) }
   return { content, members, aliases, scopeRejected, sentences, fingerprint, refreshMetadata, references, memberInput, input }
 }
 
@@ -222,17 +239,19 @@ function topicReviewBatches(items: TopicReviewSentence[], selected: Point[], inp
     && (group.length === 1 || Buffer.byteLength(JSON.stringify(group)) <= limit * 0.25))
   return { value, blocks: sentenceGroups.map(sentences => {
     const requestFor = (group: Point[]) => ({ ...value, review_stage: 'topic-block', sentences, members: group.map(memberInput) })
-    return { sentences, groups: completeInputBlocks(ordered, group => fits(block, requestFor(group), blockSchema))
+    if (!ordered.length && input.library_structure && !fits(block, requestFor([]), blockSchema))
+      throw new Error('完整库结构证据及单句超过核对输入预算；保留原页，不截断证据。')
+    return { sentences, groups: (ordered.length || !input.library_structure ? completeInputBlocks(ordered, group => fits(block, requestFor(group), blockSchema)) : [[]])
       .map(group => ({ group, value: requestFor(group) })) }
   }) }
 }
 
 function topicReviewSubstepSpec(topicId: string, content: string, members: Point[], input: unknown, request: unknown,
-  prompt: string, schema: z.ZodType, previous?: PageDependencies['review'], metadataPass = false, dependencies: AcceptedRef[] = []): AcceptedTaskSpec {
+  prompt: string, schema: z.ZodType, previous?: PageDependencies['review'], metadataPass = false, dependencies: AcceptedRef[] = [], structure?: TopicStructureEvidence): AcceptedTaskSpec {
   return { unitId: `topic:${topicId}:review-call:${hash(JSON.stringify([prompt, request])).slice(7)}`, operation: 'reviewTopic',
     sourceRefs: members.flatMap(point => point.evidence.map(evidence => ({ sourceId: evidence.source_id, sourceVersion: evidence.source_version }))),
     input: JSON.parse(JSON.stringify({ content, input, previous, metadataPass, request })), prompt: jsonProtocol(prompt, schemaJSON(schema)), schema: schemaJSON(schema),
-    validatorVersion: 'topic-review-substep-v1', semanticVersion: topicReviewVersion, groupPlan: JSON.parse(JSON.stringify(request)), dependencies }
+    validatorVersion: 'topic-review-substep-v1', semanticVersion: reviewProtocol(structure), groupPlan: JSON.parse(JSON.stringify(request)), dependencies }
 }
 
 function topicBlockReport(raw: string, ids: string[], memberIds: string[], schema: typeof blockReviewOutput | typeof finalBlockOutput) {
@@ -256,23 +275,24 @@ interface TopicReviewRequest { system: string; input: string; acceptance?: { spe
 
 /** 仅列出可在派发前确定的初轮请求；分块后的合并依赖模型报告，另由账本累计。 */
 export function topicReviewRequests(topicId: string, content: string, members: Point[], options: BuildLayeredOptions,
-  limit: number, sourceContexts?: ReadonlyMap<string, TopicEvidenceSource>): TopicReviewRequest[] {
+  limit: number, sourceContexts?: ReadonlyMap<string, TopicEvidenceSource>, structure?: TopicStructureEvidence): TopicReviewRequest[] {
   if (!layeredSettings(options.topics || {}, options.tier).topicReview) return []
-  const plan = topicReviewInput(topicId, content, members, options, undefined, false, sourceContexts)
+  const plan = topicReviewInput(topicId, content, members, options, undefined, false, sourceContexts, structure)
   if (!plan.sentences.length) return []
-  const batches = topicReviewBatches(plan.input.sentences, plan.members, plan.input, plan.memberInput, limit, topicPrompt, topicReviewOutput, blockPrompt, blockReviewOutput)
-  return batches.blocks === null ? [{ system: jsonProtocol(topicPrompt, schemaJSON(topicReviewOutput)), input: JSON.stringify(batches.value) }]
-    : batches.blocks.flatMap(block => block.groups.map(group => ({ system: jsonProtocol(blockPrompt, schemaJSON(blockReviewOutput)), input: JSON.stringify(group.value),
-      acceptance: { spec: topicReviewSubstepSpec(topicId, plan.content, plan.members, plan.input, group.value, blockPrompt, blockReviewOutput),
-        valid: validTopicBlock(block.sentences.map(sentence => sentence.id), group.group.map(point => plan.references.alias(point.point_id)), blockReviewOutput) } })))
+  const prompt = structurePrompt(topicPrompt, structure), block = structurePrompt(blockPrompt, structure)
+  const batches = topicReviewBatches(plan.input.sentences, plan.members, plan.input, plan.memberInput, limit, prompt, topicReviewOutput, block, blockReviewOutput)
+  return batches.blocks === null ? [{ system: jsonProtocol(prompt, schemaJSON(topicReviewOutput)), input: JSON.stringify(batches.value) }]
+    : batches.blocks.flatMap(batch => batch.groups.map(group => ({ system: jsonProtocol(block, schemaJSON(blockReviewOutput)), input: JSON.stringify(group.value),
+      acceptance: { spec: topicReviewSubstepSpec(topicId, plan.content, plan.members, plan.input, group.value, block, blockReviewOutput, undefined, false, [], structure),
+        valid: validTopicBlock(batch.sentences.map(sentence => sentence.id), group.group.map(point => plan.references.alias(point.point_id)), blockReviewOutput) } })))
 }
 
 async function reviewTopicContentOnce(topicId: string, content: string, members: Point[], options: BuildLayeredOptions,
   previous?: PageDependencies['review'], metadataPass = false,
-  sourceContexts?: ReadonlyMap<string, TopicEvidenceSource>): Promise<{ content: string; review?: PageDependencies['review']; calls: number; failure?: string; incomplete?: boolean; needsMetadata?: boolean; needsRegeneration?: boolean }> {
+  sourceContexts?: ReadonlyMap<string, TopicEvidenceSource>, structure?: TopicStructureEvidence): Promise<{ content: string; review?: PageDependencies['review']; calls: number; failure?: string; incomplete?: boolean; needsMetadata?: boolean; needsRegeneration?: boolean }> {
   const settings = layeredSettings(options.topics || {}, options.tier)
   if (!settings.topicReview) return { content, calls: 0 }
-  const plan = topicReviewInput(topicId, content, members, options, previous, metadataPass, sourceContexts)
+  const plan = topicReviewInput(topicId, content, members, options, previous, metadataPass, sourceContexts, structure)
   content = plan.content; members = plan.members
   let { aliases, scopeRejected } = plan
   const { sentences, fingerprint, refreshMetadata, references, memberInput, input } = plan
@@ -292,9 +312,9 @@ async function reviewTopicContentOnce(topicId: string, content: string, members:
   }
   const substep = (prompt: string, request: unknown, schema: z.ZodType, valid: (raw: string) => boolean,
     signal: AbortSignal, dependencies: AcceptedRef[] = []) => validatedTask({ ...options, signal }, 'topicReview',
-    { protocol: topicReviewVersion, content, input, previous, metadataPass, request, prompt, schema: schemaJSON(schema) },
+    { protocol: reviewProtocol(structure), content, input, previous, metadataPass, request, prompt, schema: schemaJSON(schema) },
     active => call(prompt, request, schema, active), valid,
-    topicReviewSubstepSpec(topicId, content, members, input, request, prompt, schema, previous, metadataPass, dependencies))
+    topicReviewSubstepSpec(topicId, content, members, input, request, prompt, schema, previous, metadataPass, dependencies, structure))
   const fatal = (error: unknown) => {
     options.signal?.throwIfAborted()
     if (error instanceof Error && error.name === 'AbortError') throw error
@@ -303,7 +323,7 @@ async function reviewTopicContentOnce(topicId: string, content: string, members:
   const fits = (prompt: string, value: unknown, schema: z.ZodType) => Buffer.byteLength(jsonProtocol(prompt, schemaJSON(schema)) + JSON.stringify(value)) <= limit
   const evaluate = async (items: TopicReviewSentence[]) => {
     const final = items.some(item => item.original_text !== undefined)
-    const prompt = topicPrompt + (final ? finalRule : ''), block = blockPrompt + (final ? finalRule : ''), merge = mergePrompt + (final ? finalRule : '')
+    const prompt = structurePrompt(topicPrompt, structure) + (final ? finalRule : ''), block = structurePrompt(blockPrompt, structure) + (final ? finalRule : ''), merge = structurePrompt(mergePrompt, structure) + (final ? finalRule : '')
     const schema = final ? finalReviewOutput : topicReviewOutput, blockSchema = final ? finalBlockOutput : blockReviewOutput
     const selected = final ? members.filter(point => items.some(item => item.point_ids?.includes(references.alias(point.point_id)))) : members
     const batches = topicReviewBatches(items, selected, input, memberInput, limit, prompt, schema, block, blockSchema)
@@ -333,7 +353,7 @@ async function reviewTopicContentOnce(topicId: string, content: string, members:
       const reports = completed.map(result => result.report), dependencies = completed.flatMap(result => result.acceptedRef ? [result.acceptedRef] : [])
       const incomplete = new Set(reports.flatMap(report => report.missing))
       const mergeRequest = (group: typeof sentences) => ({ review_stage: 'topic-merge', contradiction_attribution: settings.contradictionReview, topic_id: topicId, sentences: group,
-        navigation: input.navigation, source_versions: input.source_versions,
+        navigation: input.navigation, source_versions: input.source_versions, ...(structure ? { library_structure: structure } : {}),
         blocks: reports.map(report => ({ ...report, items: report.items.filter(item => group.some(sentence => sentence.id === item.id)) })) })
       const batches = completeInputBlocks(sentences.filter(item => !incomplete.has(item.id)), group => fits(merge, mergeRequest(group), schema))
       const merged = await mapConcurrent(batches, options.client.concurrency?.() ?? 1, sentenceSignal, async (group, activeSignal) => {

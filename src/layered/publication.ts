@@ -407,8 +407,13 @@ export async function publishLibrary(root: string, pending: PendingBuild, signal
     // 整页字节一致才继承对象；本轮依赖仍保留，尤其不能丢掉仅核对新增的接受记录。
     if (pending.topic_scope) for (const [page, content] of files) if (hash(content) === previous.pages?.[page]) inherited.set(page, previous.pages[page]!)
     const produced = new Set(files.map(([page]) => page))
+    const previousTopics = pending.topic_scope && pending.topics ? previous.topics?.topics
+      ?? (await previousState(root, previous, previous.deps!, layeredSettings(options?.topics || {}, options?.tier))).topics : []
     for (const [page, digest] of Object.entries(previous.pages ?? {})) if (page !== 'index.md' && !page.startsWith('sources/') && !produced.has(page)) {
       files.push([page, await versionPage(root, previous, page)]); inherited.set(page, digest)
+      // 继承旧主题页时同时保留其真实实体，避免本轮父页失败使导航与旧页、依赖脱节。
+      const topic = previousTopics.find(topic => topic.path === page)
+      if (topic && !pending.topics!.state.topics.some(current => current.id === topic.id)) pending.topics!.state.topics.push(structuredClone(topic))
     }
     for (const [page, dependency] of Object.entries(previous.deps?.pages ?? {})) if (!page.startsWith('sources/') && !deps.pages[page]) deps.pages[page] = structuredClone(dependency)
   }

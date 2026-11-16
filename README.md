@@ -2,7 +2,7 @@
 
 llmwiki-local 是独立运行的本地 stdio MCP 服务，让 Codex 等客户端查询 Markdown 知识库、生成预览、确认发布，以及复制已有库并更换向量模型。无需安装 dsh。
 
-代码最初复制自 dsh-llmwiki 的 `ff44903`，共享建库、存储和查询代码按固定提交同步，独立安装、独立维护。当前预览版本为 **[0.3.0-preview.7](https://github.com/yunguotianming/mcp-llmwiki-local/releases/tag/0.3.0-preview.7)**，通过本仓 GitHub Release 独立分发。本版严格识别有来源导航且无成员、子页或模型的完整归档占位，复核正文、来源快照和发布元数据后记录本地排除；实际事实或依赖不符的页面继续真实核对，原升级身份、备份和费用保留。保留 preview.6 的来源摘要组合生产链及此前修复。查询回答继续完善，预览版不代表正式质量验收通过。实际同步提交和适配范围见[源仓库文件对照](docs/06-验收与测试/01-源仓库文件对照.md)，验收与发布状态见[项目进度](docs/00-项目进度/01-项目进度.md)。适配层负责配置、模型调用与 MCP；package.json 的 repository 记录本仓发布地址，source 记录同源插件的同步依据。许可与第三方声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+代码最初复制自 dsh-llmwiki 的 `ff44903`，共享建库、存储和查询代码按固定提交同步，独立安装、独立维护。当前预览版本为 **[0.3.0-preview.8](https://github.com/yunguotianming/mcp-llmwiki-local/releases/tag/0.3.0-preview.8)**，通过本仓 GitHub Release 独立分发。本版修复旧库升级的两类核对误拒：引文与原文只差 Windows/Unix 换行时保持定位一致；空成员父页可使用依赖版本中已校验的子页结构核对归档、路径和归属陈述。结构证据不证明研究结论，已有接受结果按原身份复用，旧正文及升级备份保持。祖先页生成失败后保留旧页及其对应实体和导航，失败缺口继续记录。历史要点向量漏引用的缓存恢复和此前修复继续保留。更新包后重启 MCP 服务以加载新构建。预览版的发布与各库续建、正式质量验收分别记录。实际同步提交和适配范围见[源仓库文件对照](docs/06-验收与测试/01-源仓库文件对照.md)，验收与发布状态见[项目进度](docs/00-项目进度/01-项目进度.md)。适配层负责配置、模型调用与 MCP；package.json 的 repository 记录本仓发布地址，source 记录同源插件的同步依据。许可与第三方声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 ## 1. 安装与启动
 
