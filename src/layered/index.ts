@@ -638,7 +638,7 @@ export async function buildLayeredLibrary(options: RecoveryBuildOptions): Promis
         await updateVectorCoverage(root, pending)
       } catch (error) {
         options.signal?.throwIfAborted()
-        if (pending.manifest.vector_state?.mode === 'none' || !(error instanceof Error && /向量|嵌入/.test(error.message))) throw error
+        if (pending.topic_scope || pending.manifest.vector_state?.mode === 'none' || !(error instanceof Error && /向量|嵌入/.test(error.message))) throw error
         measured.vectorDeferred = true
         await deferVectorStages(root, pending, committed, measured)
       }

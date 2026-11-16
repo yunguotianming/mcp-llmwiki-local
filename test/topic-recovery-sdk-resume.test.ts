@@ -21,7 +21,8 @@ async function inventory(root: string) {
 }
 async function failedPublication() {
   const f = await built('topics'), target = f.manifest.topics!.topics[0]!
-  f.manifest.topic_gaps = [{ topic_id: target.id, point_ids: target.point_ids, message: '删除未支撑句：需要新核对' }]
+  f.manifest.topic_gaps = [{ topic_id: target.id, point_ids: target.point_ids, message: 'Connection error.' }]
+  delete f.manifest.pages![target.path]
   await saveManifest(f.root, f.manifest)
   const retryTopics = { topicIds: [target.id] }, options = { ...f.options, retryTopics, publish: false, automaticRecovery: true }
   const publish = vi.spyOn(publication, 'publishLibrary').mockRejectedValueOnce(new Error('测试发布中断'))

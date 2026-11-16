@@ -2,7 +2,7 @@
 
 llmwiki-local 是独立运行的本地 stdio MCP 服务，让 Codex 等客户端查询 Markdown 知识库、生成预览、确认发布，以及复制已有库并更换向量模型。无需安装 dsh。
 
-代码最初复制自 dsh-llmwiki 的 `ff44903`，共享建库、存储和查询代码按固定提交同步，独立安装、独立维护。当前预览版本为 **[0.3.0-preview.4](https://github.com/yunguotianming/mcp-llmwiki-local/releases/tag/0.3.0-preview.4)**，通过本仓 GitHub Release 独立分发。本版补齐旧库归档占位与父页证据的升级兼容，旧核对结果须与当前证据等价才能复用；保留 preview.3 的已有向量引用和发布收尾修复。查询回答继续完善，预览版不代表正式质量验收通过。实际同步提交和适配范围见[源仓库文件对照](docs/06-验收与测试/01-源仓库文件对照.md)，验收与发布状态见[项目进度](docs/00-项目进度/01-项目进度.md)。适配层负责配置、模型调用与 MCP；package.json 的 repository 记录本仓发布地址，source 记录同源插件的同步依据。许可与第三方声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+代码最初复制自 dsh-llmwiki 的 `ff44903`，共享建库、存储和查询代码按固定提交同步，独立安装、独立维护。当前预览版本为 **[0.3.0-preview.5](https://github.com/yunguotianming/mcp-llmwiki-local/releases/tag/0.3.0-preview.5)**，通过本仓 GitHub Release 独立分发。本版修复定向主题补缺的嵌入身份与完整向量映射继承，并将可核验的旧预览沿原作业、同一批次重封为新版本和新摘要，保留原快照；提交须重新确认新摘要。保留 preview.4 的旧库升级兼容及此前发布收尾修复。查询回答继续完善，预览版不代表正式质量验收通过。实际同步提交和适配范围见[源仓库文件对照](docs/06-验收与测试/01-源仓库文件对照.md)，验收与发布状态见[项目进度](docs/00-项目进度/01-项目进度.md)。适配层负责配置、模型调用与 MCP；package.json 的 repository 记录本仓发布地址，source 记录同源插件的同步依据。许可与第三方声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 ## 1. 安装与启动
 

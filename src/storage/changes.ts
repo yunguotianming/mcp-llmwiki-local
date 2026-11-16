@@ -5,12 +5,16 @@ import type { LibraryStore } from './libraries.js'
 import { readOptional, saveObject, signature, writeState } from './files.js'
 import { actualPath, safePath, validateRoots, within } from './paths.js'
 import { withLibraryLock } from './lock.js'
-import { readCurrent, readPageObject, readVersion } from '../layered/objects.js'
-import { activatePublication, finishPublication, validatePublication } from '../layered/publication.js'
+import { readCurrent, readPageObject, readVersion, versionPage } from '../layered/objects.js'
+import { activatePublication, finishPublication, publishLibrary, validatePublication } from '../layered/publication.js'
 import { collectGarbage, validateCompleteVersion, withInventoryLock } from '../layered/retention.js'
-import { advanceStorageGeneration, withBuildLock, withStorageGeneration } from '../layered/files.js'
-import { hydrateVectors } from '../layered/vectors.js'
-import type { PendingBuild } from '../layered/schema.js'
+import { advanceStorageGeneration, hash, immutableWrite, withBuildLock, withStorageGeneration } from '../layered/files.js'
+import { hydrateVectors, storageJson } from '../layered/vectors.js'
+import { preserveRecoveryEmbedding } from '../layered/topics.js'
+import { createExecutionLedger, readVersionCosts } from '../layered/costs.js'
+import { isProductionFormat, protocolDigest, readProtocol, validateAcceptedRecord } from '../layered/models.js'
+import type { RecoveryPending } from '../layered/accepted.js'
+import type { AcceptedRecord, AcceptedRef, PendingBuild } from '../layered/schema.js'
 import { readRevocations, revokeSourcesAtRoot } from '../layered/revocations.js'
 import { refreshReadingCopy } from '../layered/reading-copy.js'
 import { scanSourceFiles } from '../ingest/scanner.js'
@@ -29,6 +33,39 @@ export interface PageProposal { path: string; content: string | null; expectedBe
 export interface PageWriter {
   // 实现必须在实际写入边界复核 before；Obsidian 端使用 vault.process 的 current。
   write(root: string, page: PageChange, bytes: Buffer | null): Promise<void>
+}
+interface PreviewRecovery {
+  schema: 'llmwiki-preview-recovery-v1'; version: string; base_version: string | null
+  batch: ChangeSet; pending: RecoveryPending; preview: { version: string; base_version: string | null; provenanceRef?: PendingBuild['provenanceRef']; costsRef?: PendingBuild['costsRef'] }
+  checksum: string
+}
+const missingTopicEmbedding = (pending: PendingBuild | undefined) => Boolean(pending?.topic_scope && pending.topics && !pending.topics.state.embedding.identity)
+async function validatePreviewAcceptances(root: string, pending: RecoveryPending, libraryId: string): Promise<void> {
+  const refs = new Map<string, AcceptedRef>()
+  const active = new Set(Object.values(pending.acceptedRefs ?? {}).map(ref => ref.taskId))
+  const remember = (ref: AcceptedRef) => {
+    if (!/^t:[a-f0-9]{64}$/.test(ref.taskId) || ref.path !== `work/accepted/tasks/${ref.taskId.slice(2)}.json`) throw new Error('预览恢复的接受路径不匹配。')
+    if (refs.has(ref.taskId) && refs.get(ref.taskId)!.digest !== ref.digest) throw new Error('预览恢复引用了同任务的不同接受摘要。')
+    refs.set(ref.taskId, ref)
+  }
+  const visit = (value: unknown): void => {
+    if (!value || typeof value !== 'object') return
+    const ref = value as AcceptedRef
+    if (typeof ref.taskId === 'string' && typeof ref.digest === 'string' && typeof ref.path === 'string') { if (active.has(ref.taskId)) remember(ref) }
+    else for (const child of Object.values(value)) visit(child)
+  }
+  visit(pending)
+  const hooks = createExecutionLedger(root)
+  for (const ref of refs.values()) {
+    const accepted = await readProtocol<AcceptedRecord>(root, ref.path, 'ACCEPTED_CORRUPT'), snapshot = await hooks.readAcceptance(ref.taskId)
+    if (!accepted || snapshot.status !== 'bound' || snapshot.acceptedDigest !== ref.digest || accepted.acceptedDigest !== ref.digest) throw new Error('预览恢复的接受记录未绑定或摘要不匹配。')
+    const { acceptedDigest, ...record } = accepted
+    validateAcceptedRecord(record)
+    if (record.identity.scope.libraryId !== libraryId || protocolDigest(record) !== acceptedDigest || protocolDigest(snapshot.record) !== acceptedDigest) throw new Error('预览恢复的接受身份或输出摘要不匹配。')
+    const bytes = await readFile(await safePath(root, snapshot.record.output.path))
+    if (hash(bytes) !== snapshot.record.output.digest || bytes.length !== snapshot.record.output.bytes) throw new Error('预览恢复的接受输出损坏。')
+    for (const dependency of record.dependencies) remember({ taskId: dependency.taskId, digest: dependency.acceptedDigest, path: `work/accepted/tasks/${dependency.taskId.slice(2)}.json` })
+  }
 }
 async function bytesAt(root: string, relative: string): Promise<Buffer | null> {
   try { return await readFile(await safePath(root, relative)) }
@@ -168,11 +205,12 @@ export class ChangeStore {
     return withBuildLock(path.dirname(root), () => withLibraryLock(root, 'layered-preview', () => withStorageGeneration(root, async () => {
       signal?.throwIfAborted()
       const batch = await getBatch(root, id)
-      if (!batch.layered || batch.libraryId !== libraryId || batch.digest !== approvedDigest) throw new Error('确认与批次不匹配。')
+      if (!batch.layered || batch.libraryId !== libraryId || batch.digest !== approvedDigest) throw new Error('确认与批次不匹配，请重新读取预览并确认新的摘要。')
       if (batch.status === (cancel ? 'cancelled' : 'committed')) return batch
       if (batch.status !== 'preview') throw new Error('批次当前不能提交或取消。')
       const current = await readCurrent(root)
       const pending = await hydrateVectors(root, await readOptional<PendingBuild>(await safePath(root, 'work/pending.json')))
+      if (!cancel && missingTopicEmbedding(pending)) throw new Error('该预览缺少未执行阶段的原嵌入成果，请重新读取预览并确认恢复后的新摘要。')
       if (cancel) {
         if (current?.version === batch.layered.version) throw new Error('该版本已激活，请继续提交以完成阅读目录刷新。')
         if (pending && pending.version !== batch.layered.version) throw new Error('分层作业已变化，不能取消其他作业。')
@@ -218,6 +256,72 @@ export class ChangeStore {
       return this.applyLayered(libraryId, batch.id, batch.digest, false)
     return batch
   }
+  private async recoverLayeredPreview(libraryId: string, root: string, initial: ChangeSet): Promise<ChangeSet> {
+    if (!initial.layered || initial.status !== 'preview') return initial
+    const candidate = await readOptional<RecoveryPending>(await safePath(root, 'work/pending.json'))
+    if (!missingTopicEmbedding(candidate) && !await readOptional(await safePath(root, `work/preview-recovery/${initial.id}/${initial.digest}.json`))) return initial
+    await this.libraries.root(libraryId, true)
+    return withBuildLock(path.dirname(root), () => withLibraryLock(root, 'layered-preview', () => withStorageGeneration(root, async () => {
+      const batch = await getBatch(root, initial.id)
+      if (!batch.layered || batch.status !== 'preview') return batch
+      const checkpoint = `work/preview-recovery/${batch.id}/${batch.digest}.json`
+      const saved = await readOptional<PreviewRecovery>(await safePath(root, checkpoint))
+      const currentPending = await readOptional<RecoveryPending>(await safePath(root, 'work/pending.json'))
+      if (!saved && !missingTopicEmbedding(currentPending)) return batch
+      const reject = () => { throw new Error('预览恢复的批次、基线或原作业已变化，已保留现场。') }
+      if (saved) {
+        const { checksum, ...record } = saved
+        if (record.schema !== 'llmwiki-preview-recovery-v1' || hash(storageJson(record)) !== checksum || digest(record.batch) !== batch.digest) return reject()
+      }
+      const original = saved?.pending ?? currentPending, preview = saved?.preview ?? await readOptional<PreviewRecovery['preview']>(await safePath(root, 'work/preview.json'))
+      const livePreview = await readOptional<PreviewRecovery['preview']>(await safePath(root, 'work/preview.json'))
+      const current = await readCurrent(root)
+      if (!original || !currentPending || !preview || !livePreview || !original.runId || original.source_scope || original.terms || currentPending.source_scope || currentPending.terms
+        || original.version !== batch.layered.version || original.base_version !== batch.layered.baseVersion
+        || current?.version !== original.base_version || preview.version !== original.version || preview.base_version !== original.base_version
+        || ![original.version, currentPending.version].includes(livePreview.version) || livePreview.base_version !== original.base_version
+        || currentPending.runId !== original.runId || currentPending.base_version !== original.base_version
+        || storageJson(currentPending.runIds) !== storageJson(original.runIds) || storageJson(currentPending.preview_context) !== storageJson(original.preview_context)
+        || storageJson(currentPending.acceptedRefs) !== storageJson(original.acceptedRefs)
+        || storageJson(currentPending.topic_scope) !== storageJson(original.topic_scope)
+        || !original.topic_scope?.targets.length || original.topic_scope.targets.some(id => !original.topic_scope!.completed.includes(id))) return reject()
+      const library = this.libraries.registration(libraryId, batch.registrationKey)
+      if ((await this.libraries.policy(libraryId)).revision !== batch.policyRevision) throw new Error('配置已变化，不能恢复原预览。')
+      await checkLayeredInputs(root, batch, library.sourceRoots)
+      const previous = await readVersion(root, original.version!), base = await readVersion(root, original.base_version!)
+      await preserveRecoveryEmbedding(root, structuredClone(currentPending), base)
+      if (storageJson(original.manifest) !== storageJson(previous) || storageJson(original.topics?.state) !== storageJson(previous.topics)
+        || storageJson(original.provenanceRef) !== storageJson(preview.provenanceRef) || storageJson(original.costsRef) !== storageJson(preview.costsRef)) return reject()
+      if (await isProductionFormat(root)) {
+        const costs = await readVersionCosts(root, previous.version!, hash(storageJson(previous)))
+        if (!costs.runs[original.runId]) return reject()
+      }
+      await validatePreviewAcceptances(root, original, libraryId)
+      const pending = await hydrateVectors(root, structuredClone(original))
+      for (const [page, draft] of Object.entries(pending.topics!.pages)) {
+        const body = (content: string) => content.replace(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/, '')
+        if (body(draft.content) !== body(await versionPage(root, previous, page))) return reject()
+      }
+      if (!await preserveRecoveryEmbedding(root, pending, base)) return batch
+      if (!saved) {
+        const record = { schema: 'llmwiki-preview-recovery-v1', version: original.version!, base_version: original.base_version, batch, pending: original, preview }
+        await immutableWrite(root, checkpoint, Buffer.from(storageJson({ ...record, checksum: hash(storageJson(record)) })))
+      }
+      // 只重新封装已接受的检查点；不装配模型客户端，不执行生成或嵌入阶段。
+      const version = await publishLibrary(root, pending, undefined, false), next = await readVersion(root, version)
+      this.libraries.registration(libraryId, batch.registrationKey)
+      if ((await this.libraries.policy(libraryId)).revision !== batch.policyRevision) throw new Error('配置已变化，恢复预览仍待重新核对。')
+      await checkLayeredInputs(root, batch, library.sourceRoots)
+      batch.pages = [...new Set([...Object.keys(base.pages!), ...Object.keys(next.pages!)])].sort()
+        .filter(page => base.pages![page] !== next.pages![page])
+        .map(page => ({ path: page, before: base.pages![page] ?? null, after: next.pages![page] ?? null }))
+      batch.layered.version = version
+      batch.message = '已从原作业恢复未执行阶段的成果并重新生成预览，请确认新的摘要；旧预览与原批次快照已保留。'
+      batch.digest = digest(batch)
+      await saveBatch(root, batch)
+      return batch
+    })))
+  }
   async prepare(libraryId: string, reason: string, proposals: PageProposal[], dependencies: Dependency[] = [], signal?: AbortSignal): Promise<ChangeSet> {
     signal?.throwIfAborted()
     if (!proposals.length) throw new Error('变更批次不能为空。')
@@ -261,7 +365,9 @@ export class ChangeStore {
     return batches.sort((a, b) => b.createdAt.localeCompare(a.createdAt))
   }
   async preview(libraryId: string, id: string) {
-    const root = await this.libraries.root(libraryId), batch = await this.reconcileLayered(libraryId, root, await getBatch(root, id))
+    const root = await this.libraries.root(libraryId)
+    let batch = await this.reconcileLayered(libraryId, root, await getBatch(root, id))
+    batch = await this.recoverLayeredPreview(libraryId, root, batch)
     if (batch.libraryId !== libraryId) throw new Error('批次属于其他数据库。')
     if (batch.layered) return { batch, pages: batch.status === 'cancelled' ? [] : await Promise.all(batch.pages.map(async page => ({ path: page.path,
       before: page.before === null ? null : await readPageObject(root, page.before), after: page.after === null ? null : await readPageObject(root, page.after) }))) }

@@ -10,7 +10,8 @@ import { memberContentHash } from './membership.js'
 import { identityRule, attributionRule, topicEvidenceContextRule, topicStudyRule } from './quality-prompts.js'
 import { compactCitationVersions, evidenceBlockIds, expandCitationVersions, restoreCitationVersions } from './anchors.js'
 import { readPageObject, readVersion, versionPage } from './objects.js'
-import { hydrateVectors, storageJson } from './vectors.js'
+import { hydrateVectors, readVectorRecord, storageJson } from './vectors.js'
+import { recordIdentity, sameIdentity } from './vector-identity.js'
 import { mapConcurrent } from '../llm/scheduler.js'
 import { localReferences } from './references.js'
 import { defaultPolicy } from '../domain/policy.js'
@@ -219,6 +220,39 @@ export async function previousState(root: string, committed: SnapshotManifest, d
 export const topicBelowThresholdMessage = '移出不同对象或问题的成员后，来源数不足新主题门槛；保留在来源层。'
 type TopicGap = NonNullable<SnapshotManifest['topic_gaps']>[number] & { kind?: 'below-threshold' }
 const belowThresholdGap = (gap: TopicGap) => gap.kind === 'below-threshold' || !gap.kind && gap.message === topicBelowThresholdMessage
+export async function preserveRecoveryEmbedding(root: string, pending: PendingBuild, committed: SnapshotManifest): Promise<boolean> {
+  if (!pending.topic_scope || !committed.version || !committed.topics) return false
+  const original = committed.topics.embedding, locked = committed.vector_state?.identity
+  const reject = () => { throw Object.assign(new Error('定向恢复的原嵌入身份或来源提取已变化，已保留检查点。'), { stagePause: true, stage: 'topic', code: 'TOPIC_SCOPE_EMBEDDING_CHANGED' }) }
+  if (pending.base_version !== committed.version || !locked || !sameIdentity(original.identity, locked)
+    || original.model !== locked.model || (original.precision ?? 'float32') !== locked.precision
+    || !sameIdentity(pending.manifest.vector_state?.identity, locked)) return reject()
+  const sourceIdentity = (manifest: SnapshotManifest) => JSON.stringify(manifest.sources.map(source =>
+    [source.source_id, source.source_version, source.content_hash, source.extract]).sort(([a], [b]) => String(a).localeCompare(String(b))))
+  if (sourceIdentity(pending.manifest) !== sourceIdentity(committed)) return reject()
+  const embeddings = [pending.topics?.state.embedding, pending.manifest.topics?.embedding].filter(item => item !== undefined)
+  for (const embedding of embeddings) {
+    if (embedding.url !== original.url || embedding.model !== original.model || embedding.precision !== original.precision
+      || embedding.identity && !sameIdentity(embedding.identity, locked)) return reject()
+  }
+  // 旧版定向恢复在未执行嵌入时丢掉身份并清空映射；仅从同一基线的已校验对象恢复。
+  if (!pending.topics || pending.topics.state.embedding.identity) return false
+  if (!pending.runId || !locked.revision || !Number.isSafeInteger(locked.dimensions) || locked.dimensions <= 0) return reject()
+  const vectors = committed.topics.vectors, saved = pending.topics.state.vectors
+  if (Object.keys(saved).length && storageJson(saved) !== storageJson(vectors)) return reject()
+  for (const reference of Object.values(vectors)) {
+    if (!reference.vector_id) return reject()
+    const record = await readVectorRecord(root, reference.vector_id)
+    if (!sameIdentity(recordIdentity(record, original.url), locked) || record.identity.input_hash !== reference.input_hash) return reject()
+  }
+  pending.topics.state.embedding = structuredClone(original)
+  pending.topics.state.vectors = (await hydrateVectors(root, structuredClone(committed.topics))).vectors
+  if (pending.manifest.topics) {
+    pending.manifest.topics.embedding = structuredClone(original)
+    pending.manifest.topics.vectors = pending.topics.state.vectors
+  }
+  return true
+}
 export async function prepareTopics(root: string, pending: PendingBuild, committed: SnapshotManifest, options: BuildLayeredOptions, inputLimit: number | undefined): Promise<{ changed: boolean; modelCalls: number }> {
   const settings = layeredSettings(options.topics || {}, options.tier)
   const deps = committed.version ? (await readVersion(root, committed.version)).deps : { pages: {}, reverse: {} }
@@ -227,7 +261,10 @@ export async function prepareTopics(root: string, pending: PendingBuild, committ
     if (Object.keys(deps.pages).some(page => page.startsWith('topics/'))) throw new Error('已有主题页的库不能关闭主题生成。')
     delete pending.topics; return { changed: false, modelCalls: 0 }
   }
-  if (options.retryTopics && !requestTopicRecovery(pending, options.retryTopics).length) return { changed: false, modelCalls: 0 }
+  const requestedTopics = options.retryTopics ? requestTopicRecovery(pending, options.retryTopics) : undefined
+  const restoredEmbedding = await preserveRecoveryEmbedding(root, pending, committed)
+  if (restoredEmbedding) await writeJson(root, 'work/pending.json', pending)
+  if (requestedTopics && !requestedTopics.length) return { changed: restoredEmbedding, modelCalls: 0 }
   const scope = pending.topic_scope, scopeIds = new Set(scope?.targets)
   if (scope) {
     const identities = recoverTopicIdentities(pending.manifest, pending.topics)
@@ -272,7 +309,7 @@ export async function prepareTopics(root: string, pending: PendingBuild, committ
       points.set(point.point_id, point); corpusPoints.push(point)
     }
   }
-  const lexical = pending.manifest.vector_state?.mode === 'none' || settings.embeddingMode === 'none'
+  const lexical = !scope && (pending.manifest.vector_state?.mode === 'none' || settings.embeddingMode === 'none')
     ? lexicalCorpus(corpusPoints, pending.manifest.point_labels) : undefined
   if (lexical) {
     options.vectorIdentity = lexical.identity
@@ -408,7 +445,7 @@ export async function prepareTopics(root: string, pending: PendingBuild, committ
   const stale = saved?.state.topics.some(topic => [...topic.point_ids, ...(topic.direct_point_ids ?? [])].some(id => !points.has(id)))
   if (saved?.fingerprint !== fingerprint || stale || retrying) {
     let baseline = resumable ? saved.state : previous
-    const state = structuredClone(baseline), identity = { ...(lexical ? { url: 'lexical:', model: lexical.identity.model } : embeddingEndpoint(settings)), precision: lexical ? lexical.identity.precision : settings.vectorPrecision,
+    const state = structuredClone(baseline), identity = scope ? structuredClone(baseline.embedding) : { ...(lexical ? { url: 'lexical:', model: lexical.identity.model } : embeddingEndpoint(settings)), precision: lexical ? lexical.identity.precision : settings.vectorPrecision,
       ...(options.vectorIdentity ? { identity: options.vectorIdentity } : {}) }
     const pages = resumable ? { ...saved.pages } : {}
     if (resumable) {
