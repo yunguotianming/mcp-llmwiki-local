@@ -7,10 +7,10 @@ import type { LibraryRegistration } from '../domain/config.js'
 import { signature } from '../storage/files.js'
 import { layeredIndex } from '../storage/jobs.js'
 import type { IndexRow } from '../storage/jobs.js'
-import { centroid, normalized, similarity } from '../layered/embedding.js'
+import { cachedPointVectors, centroid, normalized, similarity } from '../layered/embedding.js'
 import { createEmbeddingClient } from '../layered/cloud-embedding.js'
 import { embeddingReadiness, embeddingTimedOut, type EmbeddingReadiness } from '../layered/embedding-readiness.js'
-import type { EmbeddingClient, LibraryCard, EmbeddingIdentity } from '../layered/schema.js'
+import type { EmbeddingClient, LibraryCard, EmbeddingIdentity, Point } from '../layered/schema.js'
 import { validSourceId, withLayeredRead } from '../layered/revocations.js'
 import { withStateLayout } from '../storage/paths.js'
 import { SiyuanAdapter, validateSiyuanRoot, WikiExportClient } from '../layered/siyuan.js'
@@ -165,7 +165,9 @@ export class LayeredQuery {
     const result = await run(layered.root, { signal, checkAdmission: () => admission(library, layered, signal) }, async view => {
       const vectorState = await libraryVectorState(layered.root, view.manifest, library.layered)
       locked = vectorState?.identity
-      const pointReference = (id: string) => view.manifest.topics?.vectors[id]?.vector_id
+      const pointIds = new Set(Object.values(view.deps.pages).flatMap(page => page.points.map(point => point.point_id)))
+      const references = { ...view.manifest.topics?.vectors }
+      const pointReference = (id: string) => references[id]?.vector_id
       const identity = locked ? identityKey(locked) : vectorState?.mode ?? 'unresolved'
       if (hasVectorMode(vectorState?.mode) && locked) {
         failureKey = JSON.stringify([layered.root, identity, settings.localEmbeddingUrl, settings.localEmbeddingModel, settings.embeddingMode,
@@ -186,7 +188,21 @@ export class LayeredQuery {
         } catch (error) { degrade(error) }
       } else notices.push({ library: library.name, stage: 'embedding', retrieval: 'fts', reason: vectorState?.mode ?? 'unresolved',
         message: vectorState?.mode === 'none' ? '本库不使用向量，当前仅使用全文检索。' : vectorState?.message ?? '本库缺少向量身份，当前仅使用全文检索。' })
-      const stamp = JSON.stringify(['layered-query-v6', view.version, view.generation, identity, library.name])
+      // 历史主题映射可能漏收已有向量；只从当前可读要点回查已校验缓存，不补算资料。
+      const recovered: Record<string, string> = {}
+      if (vectorEnabled && locked) {
+        const missing = new Set([...pointIds].filter(id => !pointReference(id)))
+        const sourceIds = new Set([...missing].map(id => id.split(':')[0]!)), points: Point[] = []
+        for (const source of view.manifest.sources) if (sourceIds.has(source.source_id)) {
+          signal?.throwIfAborted()
+          const extraction = await readExtraction(layered.root, source.extract.path)
+          points.push(...extraction.segments.flatMap(segment => segment.points).filter(point => missing.has(point.point_id)))
+        }
+        if (points.length) for (const [id, reference] of Object.entries(await cachedPointVectors(layered.root, points, locked, view.manifest.topics?.embedding.url))) {
+          references[id] = reference; recovered[id] = reference.vector_id!
+        }
+      }
+      const stamp = JSON.stringify(['layered-query-v7', view.version, view.generation, identity, library.name, signature(JSON.stringify(recovered))])
       const archived = new Set(view.manifest.topics?.topics.filter(topic => topic.archived && !topic.point_ids.length).map(topic => topic.path))
       const rows = await layeredIndex<{ path: string; stamp: string; data: string }[]>(layered.root, 'index-read', {}, view.version, view.generation)
       // 单次读取视图内复用已校验的 Markdown；跨次查询仍必须重新回读并核对哈希。
@@ -241,12 +257,11 @@ export class LayeredQuery {
         page.vector = vectorEnabled && page.vectorIds.length ? centroid((await Promise.all(page.vectorIds.map(load))).filter(vector => vector.length)) : []
         page.pointVectors = vectorEnabled ? (await Promise.all(page.pointVectorIds.map(load))).filter(vector => vector.length) : []
       }
-      const pointIds = new Set(Object.values(view.deps.pages).flatMap(page => page.points.map(point => point.point_id)))
       const covered = [...pointIds].filter(id => {
         const reference = pointReference(id)
         return reference && availableVectors.has(reference)
       })
-      if (vectorEnabled && (missingVectors || covered.length < pointIds.size || vectorState?.coverage.missing.length)) notices.push({ library: library.name, stage: 'embedding', reason: 'partial-coverage',
+      if (vectorEnabled && (missingVectors || covered.length < pointIds.size)) notices.push({ library: library.name, stage: 'embedding', reason: 'partial-coverage',
         message: `向量覆盖不完整（要点 ${covered.length}/${pointIds.size}）；缺失或身份不符的部分仅走全文。` })
       const ranks: { paths: string[]; weight: number; channel: string }[] = [], lexical = new Set<string>(), vectors = new Set<string>()
       const pointScores = new Map<string, number>()

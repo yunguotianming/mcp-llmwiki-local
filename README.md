@@ -2,7 +2,7 @@
 
 llmwiki-local 是独立运行的本地 stdio MCP 服务，让 Codex 等客户端查询 Markdown 知识库、生成预览、确认发布，以及复制已有库并更换向量模型。无需安装 dsh。
 
-代码最初复制自 dsh-llmwiki 的 `ff44903`，共享建库、存储和查询代码按固定提交同步，独立安装、独立维护。当前预览版为 **[0.3.0-preview.2](https://github.com/yunguotianming/mcp-llmwiki-local/releases/tag/0.3.0-preview.2)**，通过本仓 GitHub Release 独立分发。本版包含首次建库颗粒度引导、旧库定向发布及中断备份恢复修复。查询回答继续完善，预览版不代表正式质量验收通过。实际同步提交和适配范围见[源仓库文件对照](docs/06-验收与测试/01-源仓库文件对照.md)，验收与发布状态见[项目进度](docs/00-项目进度/01-项目进度.md)。适配层负责配置、模型调用与 MCP；package.json 的 repository 记录本仓发布地址，source 记录同源插件的同步依据。许可与第三方声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+代码最初复制自 dsh-llmwiki 的 `ff44903`，共享建库、存储和查询代码按固定提交同步，独立安装、独立维护。当前预览版本为 **[0.3.0-preview.3](https://github.com/yunguotianming/mcp-llmwiki-local/releases/tag/0.3.0-preview.3)**，通过本仓 GitHub Release 独立分发。本版修复已有向量漏关联、主题完成后的发布恢复和发布后清理收尾，保留首次建库颗粒度引导及中断备份恢复。查询回答继续完善，预览版不代表正式质量验收通过。实际同步提交和适配范围见[源仓库文件对照](docs/06-验收与测试/01-源仓库文件对照.md)，验收与发布状态见[项目进度](docs/00-项目进度/01-项目进度.md)。适配层负责配置、模型调用与 MCP；package.json 的 repository 记录本仓发布地址，source 记录同源插件的同步依据。许可与第三方声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 ## 1. 安装与启动
 
@@ -37,6 +37,8 @@ node dist/cli.js mcp
 首次生成后随库策略在 `data/state/policy.json`（旧布局路径保持原样）；停止任务后可调整 `pageGenerationConcurrency` 和 `concurrencyLimit`，范围均为 1～1000，实际生成并发默认 3，不能超过上限；嵌入供应商闸门保持 50。模型路由和供应商重试、速率设置沿用核心配置校验。
 
 云端向量需显式选择 cloud，并设置 `cloudEmbeddingUrl`、`cloudEmbeddingModel`、`cloudEmbeddingKeyEnv`；最后一项填写环境变量名。查询向量默认冷态等待 10 秒、就绪后等待 2 秒，可在登记的 layered 配置中设置 `queryEmbeddingColdTimeoutMs` 和 `queryEmbeddingTimeoutMs`；超时降级不写入一分钟失败缓存，Ollama 查询超时可触发共享后台预热。已有库的向量身份绑定在库内，更换模型使用复制工具。纯全文库仍可生成来源与索引，不调用嵌入；主题组织行为沿用上游全文模式。
+
+历史库若遗漏要点的向量引用，查询会按当前要点正文哈希查找本地缓存，并核对向量对象和完整模型身份后复用；首次查询自动刷新旧检索索引。查询只嵌入查询词，不重新计算资料向量。确实缺失或身份不符的向量仍保留覆盖提示，对应内容可通过全文检索查阅。
 
 | 可用内存 | Ollama 模型建议 |
 | --- | --- |

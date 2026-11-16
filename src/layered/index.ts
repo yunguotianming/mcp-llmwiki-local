@@ -95,10 +95,19 @@ export async function buildLayeredLibrary(options: RecoveryBuildOptions): Promis
     if (selected) options = { ...options, retrySources: selected }
   }
   // 零目标不得进入首次写入升级，也不承接另一个未完成请求。
+  let finishingTopicRecovery = false
   if (options.retryTopics) {
     const current = await readCurrent(existingRoot), manifest = await readManifest(existingRoot, current)
     const saved = await readOptional<PendingBuild>(await safePath(existingRoot, 'work/pending.json'))
-    if (!selectTopicGaps(saved?.manifest ?? manifest, saved?.topics, options.retryTopics).length)
+    const scope = saved?.topic_scope, requested = options.retryTopics.topicIds
+    // 目标已经处理完但发布失败的同次作业仍须收尾，不能把它当成新的零目标请求。
+    const finishing = saved?.format_version === formatVersion && saved.base_version === current?.version && !saved.source_scope
+      && scope && scope.targets.length > 0 && scope.targets.every(id => typeof id === 'string' && id.trim() && scope.completed.includes(id))
+      && new Set(scope.targets).size === scope.targets.length && scope.completed.every(id => scope.targets.includes(id))
+      && requested && new Set(requested).size === scope.targets.length && requested.every(id => scope.targets.includes(id))
+      && !options.retryTopics.reasons?.length
+    finishingTopicRecovery = Boolean(finishing)
+    if (!finishing && !selectTopicGaps(saved?.manifest ?? manifest, saved?.topics, options.retryTopics).length)
       return { version: current?.version ?? '', added: [], modelCalls: 0, unchanged: true }
   }
   if (!options.recovery && options.client instanceof ModelClient && await readOptional(await safePath(existingRoot, '.llmwiki/policy.json'))) {
@@ -279,7 +288,7 @@ export async function buildLayeredLibrary(options: RecoveryBuildOptions): Promis
     let budget: Promise<number> | undefined
     const getInputLimit = () => budget ??= recoveryBudget('extract', async () => Math.min(await layeredInputBudget(options), settings.extractMaxInputBytes),
       Math.min(options.maxInputBytes ?? Infinity, settings.extractMaxInputBytes))
-    let changed = pending.source_scope ? storageJson(pending.manifest) !== storageJson(committed) : committed.anchor_format !== 'obsidian-block-v1' || !committed.page_created
+    let changed = finishingTopicRecovery || (pending.source_scope ? storageJson(pending.manifest) !== storageJson(committed) : committed.anchor_format !== 'obsidian-block-v1' || !committed.page_created)
       || Object.keys(committed.pages ?? {}).some(page => !validTimestamp(committed.page_created?.[page]))
       || storageJson(pending.manifest) !== storageJson(committed) || JSON.stringify(card) !== originalCard, modelCalls = 0
     const extractionAttemptStart = options.client.attempts?.length ?? 0

@@ -187,6 +187,7 @@ export class ChangeStore {
       } else {
         if (current?.version === batch.layered.version) {
           if (pending) await finishPublication(root, pending)
+          else if (await readOptional(await safePath(root, 'state/gc-pending.json'))) await collectGarbage(root)
         } else {
           const library = this.libraries.registration(libraryId, batch.registrationKey)
           if ((await this.libraries.policy(libraryId)).revision !== batch.policyRevision) throw new Error('配置已变化，请取消后重新生成预览。')

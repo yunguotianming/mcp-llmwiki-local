@@ -9,7 +9,7 @@ import { hash, withRevocationLock, writeJson } from './files.js'
 import { localDevice } from './devices.js'
 import { resumeRevocationCleanup } from './revocation-cleanup.js'
 import { pageObjectPath, readVersion, versionPage, validateVersionSidecars } from './objects.js'
-import { modelRetentionRoots } from './costs.js'
+import { modelRetentionRoots, readVersionCosts } from './costs.js'
 import { isProductionFormat, readProvenance, sidecarPath } from './models.js'
 import { readVectorRecord, storageJson, vectorPath, vectorUnavailable } from './vectors.js'
 import { hasVectorMode, recordIdentity, sameIdentity } from './vector-identity.js'
@@ -323,6 +323,7 @@ export async function collectGarbage(root: string, graceMs = readerLeaseMs): Pro
   await withInventoryLock(root, async () => {
     const current = await readOptional<CurrentVersion>(await safePath(root, 'state/current.json'))
     const retained = new Set([...(current ? [current.version, ...(current.history ?? []).slice(-1)] : []), ...(pins.get(path.resolve(root))?.keys() ?? [])])
+    const required = new Set(retained)
     const versions = (await listFiles(root, 'versions')).filter(file => /^versions\/v\d{6,}\.json$/.test(file))
     if (graceMs > 0) {
     const retired = await readOptional<Record<string, number>>(await safePath(root, 'state/retired-versions.json')) ?? {}
@@ -340,7 +341,7 @@ export async function collectGarbage(root: string, graceMs = readerLeaseMs): Pro
     for (const file of await listFiles(root, 'state/readers')) {
       if (!file.endsWith('.json')) continue
       const lease = await readOptional<ReaderLease>(await safePath(root, file))
-      if (lease && Number.isSafeInteger(lease.pid) && lease.pid > 0 && lease.device && /^v\d{6,}$/.test(lease.version) && Number.isFinite(lease.expires_at) && lease.expires_at > Date.now()) retained.add(lease.version)
+      if (lease && Number.isSafeInteger(lease.pid) && lease.pid > 0 && lease.device && /^v\d{6,}$/.test(lease.version) && Number.isFinite(lease.expires_at) && lease.expires_at > Date.now()) { retained.add(lease.version); required.add(lease.version) }
       else await unlink(await safePath(root, file)).catch(error => { if (error.code !== 'ENOENT') throw error })
     }
     const files = new Set<string>(), vectors = new Set<string>()
@@ -352,13 +353,19 @@ export async function collectGarbage(root: string, graceMs = readerLeaseMs): Pro
       references(value, files, vectors)
       if (!file.startsWith('conflicts/')) for (const key of ['version', 'base_version', 'target']) if (typeof value?.[key] === 'string' && /^v\d{6,}$/.test(value[key] as string)) {
         const version = value[key] as string
-        if (await readOptional(await safePath(root, `versions/${version}.json`))) retained.add(version)
+        if (await readOptional(await safePath(root, `versions/${version}.json`))) { retained.add(version); required.add(version) }
       }
     }
+    const production = await isProductionFormat(root)
     for (const version of retained) {
-      const manifest = await readVersion(root, version)
+      const provenancePresent = !production || required.has(version) || await readOptional(await safePath(root, sidecarPath(version, 'provenance'))) !== undefined
+      const costsPresent = !production || required.has(version) || await readOptional(await safePath(root, sidecarPath(version, 'costs'))) !== undefined
+      // 仅宽限期固定的残留可能停在主清单已写、附属文件未写齐的发布阶段；先保全其引用。
+      // 当前、历史指针、读者和作业根仍须完整；已经存在的附属文件也不能绕过校验。
+      const manifest = await readVersion(root, version, provenancePresent && costsPresent)
       references(manifest, files, vectors)
-      if (await isProductionFormat(root)) references(await readProvenance(root, version, hash(storageJson(manifest))), files, vectors)
+      if (production && provenancePresent) references(await readProvenance(root, version, hash(storageJson(manifest))), files, vectors)
+      if (production && costsPresent && !provenancePresent) await readVersionCosts(root, version, hash(storageJson(manifest)))
     }
     const cache = await readOptional<{ vectors: Record<string, { vector_id: string }> }>(await safePath(root, 'state/embeddings.json'))
     const building = await readOptional(await safePath(root, 'work/pending.json'))
