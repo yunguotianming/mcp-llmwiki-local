@@ -71,7 +71,7 @@ it('key=1时假模型生成、落盘、预览签名与提交保持同一协议�
   library.models.unified = { provider: 'fake', model: 'fake' }
   library.layered = { embeddingMode: 'none', extractionReview: 'off', topicReview: false }
   next.compatibleProviders = provider('1'); await config.writeRegistry(next, old)
-  const app = await session(config), start = await app.call('wiki_generate', { libraryId: library.id })
+  const app = await session(config), start = await app.call('wiki_generate', { libraryId: library.id, extractionGranularity: 'standard' })
   expect(start).toMatchObject({ libraryId: library.id, status: 'running' }); expect(start.jobId).toMatch(/^[a-f0-9-]{36}$/)
   const status = await finished(app.call, start.jobId)
   expect(status.status, status.error).toBe('preview'); expect(status.jobId).toBe(start.jobId)

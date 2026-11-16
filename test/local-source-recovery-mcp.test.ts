@@ -21,7 +21,7 @@ async function session() {
   const app = createMcpServer(config, runtime), client = new Client({ name: '来源补缺测试', version: '1' }), [a, b] = InMemoryTransport.createLinkedPair()
   await app.server.connect(a); await client.connect(b)
   const call = async (args: Record<string, unknown>) => {
-    const result = await client.callTool({ name: 'wiki_generate', arguments: { libraryId: library.id, ...args } })
+    const result = await client.callTool({ name: 'wiki_generate', arguments: { libraryId: library.id, extractionGranularity: 'standard', ...args } })
     const text = (result.content as { text: string }[])[0]!.text
     if (result.isError) throw new Error(text)
     return JSON.parse(text)

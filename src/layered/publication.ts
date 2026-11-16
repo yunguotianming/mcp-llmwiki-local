@@ -355,7 +355,10 @@ export async function publishLibrary(root: string, pending: PendingBuild, signal
   pending.card.source_count = pending.manifest.sources.length; pending.card.updated_at = new Date().toISOString()
   await writeJson(root, 'work/pending.json', pending)
   const files: [string, string][] = [], allPoints: Point[] = []
-  const publicationTags = pending.terms ? prepareTags(pending.terms.records) : undefined
+  const retainTopicTags = !!pending.topic_scope && !pending.terms
+  const previousDependencies = retainTopicTags ? previous?.deps : undefined
+  const publicationTags = pending.terms ? prepareTags(pending.terms.records)
+    : previousDependencies ? prepareTags(Object.values(previousDependencies.pages).flatMap(page => page.terms ?? [])) : undefined
   const gaps: string[] = (pending.manifest.gaps ?? []).map(gap => `- 导出缺口 ${gap.source_id}：${hash(JSON.stringify(gap))}`)
   persistTopicRecovery(pending)
   const topicGaps = topicGapDiagnostics(pending.manifest, pending.topics ? { ...pending.topics, gaps: pending.manifest.topic_gaps ?? pending.topics.gaps ?? [] } : undefined).map(gap => `- 主题缺口 ${gap.topic_id} [${gap.category}／${gap.effect}／${gap.stage}]：${gap.message.replace(/[\r\n]/g, ' ')}；${gap.point_ids.length} 条成员要点保留在来源页。`)
@@ -372,11 +375,20 @@ export async function publishLibrary(root: string, pending: PendingBuild, signal
       else delete entry.pending_topic_points
       allPoints.push(...extraction.segments.flatMap(segment => segment.points))
       signal?.throwIfAborted()
-      const policy = pending.manifest.tag_policy
-      const candidates = extraction.tag_candidates ?? extraction.tags ?? [], tags = publicationTags ?? prepareTags(extraction.segments.flatMap(segment => segment.terms))
-      entry.tags = mergedTags(tags.canonical(candidates, policy?.vocabulary, policy?.only, policy?.limit), pending.manifest.tag_merges)
-      const minimum = Math.min(3, policy?.limit ?? 8, policy?.only && policy.vocabulary.length ? tags.canonical(policy.vocabulary).length : 3)
-      entry.tag_status = tagStatus(entry.tags, (extraction.tag_status?.personal_information_removed ?? 0) + candidates.filter(personalTag).length, minimum)
+      const priorSource = retainTopicTags ? previous?.sources.find(source => source.source_id === entry.source_id) : undefined
+      if (priorSource) {
+        // 定向主题恢复没有重新接受来源标签，沿用基线，失败发布留下的待办值也不能冒充新结果。
+        if (priorSource.tags) entry.tags = structuredClone(priorSource.tags)
+        else delete entry.tags
+        if (priorSource.tag_status) entry.tag_status = structuredClone(priorSource.tag_status)
+        else delete entry.tag_status
+      } else {
+        const policy = pending.manifest.tag_policy
+        const candidates = extraction.tag_candidates ?? extraction.tags ?? [], tags = publicationTags ?? prepareTags(extraction.segments.flatMap(segment => segment.terms))
+        entry.tags = mergedTags(tags.canonical(candidates, policy?.vocabulary, policy?.only, policy?.limit), pending.manifest.tag_merges)
+        const minimum = Math.min(3, policy?.limit ?? 8, policy?.only && policy.vocabulary.length ? tags.canonical(policy.vocabulary).length : 3)
+        entry.tag_status = tagStatus(entry.tags, (extraction.tag_status?.personal_information_removed ?? 0) + candidates.filter(personalTag).length, minimum)
+      }
       // 来源字段已由结构化状态确定，直接渲染一次，省去整页 YAML 的解析和再次序列化。
       publicationCreated(pending, page, entry)
       files.push([page, renderSource(entry, extraction)])
@@ -391,7 +403,9 @@ export async function publishLibrary(root: string, pending: PendingBuild, signal
   Object.assign(deps.pages, pending.terms?.section_dependencies ?? {})
   // 定向补缺跳过的阶段保留基线成果；只补本轮未产出的页面，不覆盖已更新的叶页和父页。
   const inherited = new Map<string, string>()
-  if (pending.source_scope && previous) {
+  if ((pending.source_scope || pending.topic_scope) && previous) {
+    // 整页字节一致才继承对象；本轮依赖仍保留，尤其不能丢掉仅核对新增的接受记录。
+    if (pending.topic_scope) for (const [page, content] of files) if (hash(content) === previous.pages?.[page]) inherited.set(page, previous.pages[page]!)
     const produced = new Set(files.map(([page]) => page))
     for (const [page, digest] of Object.entries(previous.pages ?? {})) if (page !== 'index.md' && !page.startsWith('sources/') && !produced.has(page)) {
       files.push([page, await versionPage(root, previous, page)]); inherited.set(page, digest)
@@ -441,7 +455,12 @@ export async function publishLibrary(root: string, pending: PendingBuild, signal
   for (let offset = 0; offset < files.length; offset += 8) {
     const results = await withRevocationLock(root, () => Promise.allSettled(files.slice(offset, offset + 8).map(async ([relative, value]) => {
       signal?.throwIfAborted()
-      pending.manifest.pages![relative] = inherited.get(relative) ?? await putPage(root, relative.startsWith('sources/') ? value : publicationMetadata(pending, relative, value, deps.pages[relative]?.sources, publicationTags))
+      const inheritedDigest = inherited.get(relative)
+      if (inheritedDigest) { pending.manifest.pages![relative] = inheritedDigest; return }
+      const retainedTags = retainTopicTags && relative.startsWith('topics/') && previous?.pages?.[relative]
+        ? topicHeader(await versionPage(root, previous, relative)).tags : undefined
+      pending.manifest.pages![relative] = await putPage(root, relative.startsWith('sources/') ? value : publicationMetadata(pending, relative, value, deps.pages[relative]?.sources, publicationTags,
+        Array.isArray(retainedTags) ? retainedTags.map(String) : undefined))
     })))
     for (const result of results) if (result.status === 'rejected') throw result.reason
   }

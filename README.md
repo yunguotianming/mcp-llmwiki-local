@@ -2,7 +2,7 @@
 
 llmwiki-local 是独立运行的本地 stdio MCP 服务，让 Codex 等客户端查询 Markdown 知识库、生成预览、确认发布，以及复制已有库并更换向量模型。无需安装 dsh。
 
-代码最初复制自 dsh-llmwiki 的 `ff44903`，共享建库、存储和查询代码按固定提交同步，独立安装、独立维护。当前包版本为 **0.3.0-preview.1**，独立发布到 [mcp-llmwiki-local](https://github.com/yunguotianming/mcp-llmwiki-local)。先验证建库模块，再发布本仓预览版并补建三个库；查询回答继续完善，预览版不代表正式质量验收通过。实际同步提交和适配范围见[源仓库文件对照](docs/06-验收与测试/01-源仓库文件对照.md)，验收与发布状态见[项目进度](docs/00-项目进度/01-项目进度.md)。适配层负责配置、模型调用与 MCP；package.json 的 repository 记录本仓发布地址，source 记录同源插件的同步依据。许可与第三方声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+代码最初复制自 dsh-llmwiki 的 `ff44903`，共享建库、存储和查询代码按固定提交同步，独立安装、独立维护。当前预览版为 **[0.3.0-preview.1](https://github.com/yunguotianming/mcp-llmwiki-local/releases/tag/0.3.0-preview.1)**，通过本仓 GitHub Release 独立分发。查询回答继续完善，预览版不代表正式质量验收通过。实际同步提交和适配范围见[源仓库文件对照](docs/06-验收与测试/01-源仓库文件对照.md)，验收与发布状态见[项目进度](docs/00-项目进度/01-项目进度.md)。适配层负责配置、模型调用与 MCP；package.json 的 repository 记录本仓发布地址，source 记录同源插件的同步依据。许可与第三方声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 ## 1. 安装与启动
 
@@ -60,6 +60,26 @@ node dist/cli.js mcp
 `registry.compatibleProviders` 可登记 `compatible:<名称>`，指定 `baseUrl`、`model`、`api`（`openai-completions` 或 `openai-responses`），凭据按上节选择一种方式；`registry.embeddingService` 使用同一凭据约定。配置文件仍使用原有 `{ registry, runtime }` 外层。两种协议沿用相同的模型路由和日志脱敏规则。
 
 建库阶段策略、线路和并发配额分别来自库策略的 `buildModels` 与登记的 `modelExecution`。已接受成果、实际模型、生产记录和升级备份沿用共用核心；暂停后换模型续跑先复用已有成果。旧模型路由和 `runtime` 配置继续有效。
+
+### 2.3 首次建库选择颗粒度
+
+这项引导是预览发布后的新增功能，已发布的 `0.3.0-preview.1` ZIP 尚不包含。需求见[FR-10](docs/02-需求/01-独立服务验收范围.md)，当前源码的实现与验证状态见[项目进度](docs/00-项目进度/01-项目进度.md)。
+
+首次调用 `wiki_generate`，尚无成果或恢复任务的新库会返回 `selection_required` 和档位说明。客户端应先解释差异、询问用户，再携选择调用；收到待选择结果时，生成作业尚未启动。
+
+| 档位 | 基础要点上限 | 覆盖深度 | 默认核对强度 |
+| --- | ---: | --- | --- |
+| 极简 minimal | 5 | 最关键内容 | 不做额外提取、主题及矛盾核对 |
+| 粗放 coarse | 10 | 核心内容 | 不做额外提取、主题及矛盾核对 |
+| 适中 balanced | 25 | 重要内容，略去一般细节 | 关键提取核对、主题核对 |
+| 标准 standard | 50 | 重要及较重要内容 | 关键提取核对、主题核对 |
+| 细致 detailed | 75 | 重要内容和主要细节 | 全量提取、主题及矛盾核对 |
+| 精细 fine | 100 | 尽量覆盖全部有据内容 | 全量提取、主题及矛盾核对 |
+| 自定义 custom | 1～500 | 用户指定固定上限 | 联动不超过该上限的最高预设档位 |
+
+上限不是必须凑足的数量；预设随长文篇幅扩为基础值的 1～4 倍，短文单包请求可能进一步收缩，自定义不扩额。越细通常调用量和耗时越高，实际取决于原文、缺口与复用结果；所有档位都不得编造原文没有的知识。表中核对强度是档位默认值，库中显式设置优先。
+
+用户选择精细后，传入 `extractionGranularity: "fine"`；选择自定义则同时传 `extractionGranularity: "custom"` 和整数 `customPointLimit`。已有成果或可恢复任务继续使用原颗粒度，无需重新选择；这两个首次建库参数不能用于修改已有库的档位。扫描不要求选择，登记和只读查阅也不会启动建库。
 
 ## 3. 在 Codex 登记 MCP
 

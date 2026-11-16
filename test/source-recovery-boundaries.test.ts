@@ -7,7 +7,8 @@ import { hash } from '../src/layered/files.js'
 import { storageJson } from '../src/layered/vectors.js'
 import { createMcpHandler } from '../src/mcp/server.js'
 import { createLocalHost } from '../src/local/host.js'
-import { emptyRegistry } from '../src/domain/config.js'
+import { emptyRegistry, newLibrary } from '../src/domain/config.js'
+import { defaultPolicy } from '../src/domain/policy.js'
 import { cleanupLayeredFixtures, mockSupportReview, snapshotManifest } from './layered-fixture.js'
 import { sourceRecoveryExtraction, sourceRecoveryFixture } from './source-recovery-fixture.js'
 
@@ -77,7 +78,11 @@ it('显式空种类零派发拒绝', async () => {
 })
 
 it('独立MCP公开并转发现有generate的来源选择器', async () => {
-  const host = createLocalHost(emptyRegistry()), handle = createMcpHandler(host)
+  const f = await sourceRecoveryFixture()
+  const registry = emptyRegistry()
+  registry.libraries.push({ ...newLibrary('library1'), wikiPath: f.root, sourceRoots: [f.knowledgeRoot] })
+  const host = createLocalHost(registry), handle = createMcpHandler(host)
+  vi.spyOn(host.store, 'policy').mockResolvedValue({ initialized: true, writable: true, revision: 'r', message: '', policy: defaultPolicy() })
   const generate = vi.spyOn(host.operations, 'generate').mockResolvedValue({ status: 'unchanged', version: 'v000001', modelCalls: 0 })
   const retrySources = { sourceIds: ['S-0001'], kinds: ['summary'] }
   try {

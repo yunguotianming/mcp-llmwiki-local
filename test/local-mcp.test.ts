@@ -72,7 +72,7 @@ it('SDK 保留作业工具并接入库管理、回答和回源，搜索浏览阅
 it('SDK 假模型生成立即返回，状态含预览成本，签名提交后新布局可查询', async () => {
   const f = await setupBuild()
   expect((await f.call('wiki_list_libraries')).libraries[0].libraryId).toBe(f.library.id)
-  const start = await f.call('wiki_generate', { libraryId: f.library.id })
+  const start = await f.call('wiki_generate', { libraryId: f.library.id, extractionGranularity: 'standard' })
   expect(start.status).toBe('running')
   const status = await finished(f.call, start.jobId)
   expect(status.status, status.error).toBe('preview'); expect(status.digest).toBeTruthy(); expect(status.preview.length).toBeGreaterThan(0)
@@ -86,8 +86,12 @@ it('SDK 假模型生成立即返回，状态含预览成本，签名提交后新
 
 it('源库同一写锁占用时立即返回明确错误，不启动作业', async () => {
   const f = await setupBuild()
+  const previous = f.config.registry(), next = structuredClone(previous)
+  next.libraries[0]!.wikiPath = path.join(f.root, '单独Wiki目录')
+  await f.config.writeRegistry(next, previous)
   await withBuildLock(f.source, async () => {
-    await expect(f.call('wiki_generate', { libraryId: f.library.id })).rejects.toThrow('正在被占用')
+    await expect(f.call('wiki_generate', { libraryId: f.library.id, extractionGranularity: 'standard' })).rejects.toThrow('正在被占用')
+    expect((await f.jobs.store.policy(f.library.id)).initialized).toBe(false)
   })
 })
 
@@ -105,7 +109,7 @@ it('缺 DeepSeek 密钥仍搜索原话，并返回理解降级标注', async () 
 })
 
 it('SDK 取消预览保留当前版本，参数非法时拒绝', async () => {
-  const f = await setupBuild(), start = await f.call('wiki_generate', { libraryId: f.library.id })
+  const f = await setupBuild(), start = await f.call('wiki_generate', { libraryId: f.library.id, extractionGranularity: 'standard' })
   const status = await finished(f.call, start.jobId); expect(status.status, status.error).toBe('preview')
   expect((await f.call('wiki_cancel', { jobId: start.jobId })).status).toBe('cancelled')
   expect(await readCurrent(f.library.wikiPath)).toBeUndefined()

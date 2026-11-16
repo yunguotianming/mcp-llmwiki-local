@@ -22,8 +22,8 @@
   },
   "source": {
     "repository": "https://github.com/yunguotianming/dsh-llmwiki",
-    "commit": "078b0579b021d0b67c8aa74d9c628111ba81c823",
-    "localCommit": "7a5604e613189ca3ffb78f7ac67d93a0d2c4e832"
+    "commit": "e4d477282332dc6a84fca131c0f916d1d554c7f9",
+    "localCommit": "c1e6f32ba158d0b3880ab5befd5de97fe681efb4"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",

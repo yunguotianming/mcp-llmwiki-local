@@ -2,6 +2,7 @@ import { z } from 'zod'
 import { createRequire } from 'node:module'
 import type { LocalHost } from '../local/host.js'
 import { callLibraryTool, libraryTools, libraryResourceTemplate, listLibraryResources } from '../host/library-management.js'
+import { generationChoiceShape, generationSelectionDescription, generationSelectionInstructions, withMcpGenerationSelection } from './generation-selection.js'
 
 const { version } = createRequire(import.meta.url)('../../package.json') as { version: string }
 const id = z.string().min(1), empty = z.strictObject({})
@@ -13,6 +14,7 @@ export const localToolInputs = {
   wiki_read: z.strictObject({ library: id, path: id, version: id.optional(), offset: z.number().int().nonnegative().optional(), maxChars: z.number().int().positive().optional() }),
   wiki_source_read: z.strictObject({ library: id, sourceId: id, locator: id, version: id.optional(), sourceVersion: id.optional(), offset: z.number().int().nonnegative().optional(), maxChars: z.number().int().positive().optional() }),
   wiki_generate: z.strictObject({ libraryId: id, action: z.enum(['scan', 'generate']).default('generate'),
+    ...generationChoiceShape,
     retrySources: z.strictObject({ sourceIds: z.array(id).min(1), kinds: z.array(z.enum(['summary', 'review'])).min(1) }).optional() }),
   wiki_changes: z.strictObject({ libraryId: id, action: z.enum(['list', 'preview', 'commit', 'cancel']), batchId: id.optional(), digest: id.optional() }),
   wiki_status: z.strictObject({ libraryId: id, version: id.optional() }),
@@ -34,9 +36,9 @@ export function createMcpHandler(host: LocalHost, notify?: (message: unknown) =>
     if (request.method === 'notifications/initialized') initialized = true
     if (request.id === undefined) return
     const result = (value: unknown) => ({ jsonrpc: '2.0', id: request.id, result: value })
-    if (request.method === 'initialize') return result({ protocolVersion: '2024-11-05', capabilities: { tools: {}, resources: { listChanged: true, subscribe: true } }, serverInfo: { name: 'llmwiki-local', version } })
+    if (request.method === 'initialize') return result({ protocolVersion: '2024-11-05', capabilities: { tools: {}, resources: { listChanged: true, subscribe: true } }, serverInfo: { name: 'llmwiki-local', version }, instructions: generationSelectionInstructions })
     if (request.method === 'ping') return result({})
-    if (request.method === 'tools/list') return result({ tools: [...Object.entries(localToolInputs).filter(([name]) => !libraryTools.some(tool => tool.name === name)).map(([name, schema]) => ({ name, inputSchema: z.toJSONSchema(schema) })), ...libraryTools] })
+    if (request.method === 'tools/list') return result({ tools: [...Object.entries(localToolInputs).filter(([name]) => !libraryTools.some(tool => tool.name === name)).map(([name, schema]) => ({ name, inputSchema: z.toJSONSchema(schema), ...(name === 'wiki_generate' ? { description: generationSelectionDescription } : {}) })), ...libraryTools] })
     try {
       if (request.method === 'resources/list') return result(host.sanitize(await listLibraryResources(services, request.params?.cursor), request.method))
       if (request.method === 'resources/templates/list') return result({ resourceTemplates: [libraryResourceTemplate] })
@@ -62,7 +64,11 @@ export function createMcpHandler(host: LocalHost, notify?: (message: unknown) =>
         case 'wiki_browse': { const args = localToolInputs[name].parse(raw); value = await host.query.browse(args.library, args.ref, args, signal); break }
         case 'wiki_read': { const args = localToolInputs[name].parse(raw); value = await host.query.read(args.path, args.library, args.maxChars, signal, args); break }
         case 'wiki_source_read': { const args = localToolInputs[name].parse(raw); value = await host.query.sourceRead(args.sourceId, args.locator, args.library, { ...args, signal }); break }
-        case 'wiki_generate': { const args = localToolInputs[name].parse(raw); value = await host.operations.generate(args.libraryId, args.action, signal, undefined, false, undefined, undefined, undefined, args.retrySources); break }
+        case 'wiki_generate': {
+          const args = localToolInputs[name].parse(raw)
+          value = await withMcpGenerationSelection(host.store, args, host.operations.running,
+            () => host.operations.generate(args.libraryId, args.action, signal, undefined, false, undefined, undefined, undefined, args.retrySources)); break
+        }
         case 'wiki_changes': { const args = localToolInputs[name].parse(raw); value = await host.operations.changes(args.libraryId, args.action, signal, args.batchId, args.digest); break }
         case 'wiki_status': { const args = localToolInputs[name].parse(raw); value = await host.operations.productionStatus(args.libraryId, args.version); break }
         case 'wiki_pause': { const args = localToolInputs[name].parse(raw); value = host.stop(args.libraryId); break }
