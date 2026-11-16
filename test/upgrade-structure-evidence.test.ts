@@ -84,9 +84,11 @@ it('真实子对象结构贯通估算和审核，保留旧正文且不伪造研�
 
 it('伪研究和资料未提及断言仍交模型核对，拒绝后不改旧页或生成占位排除', async () => {
   const f = await fixture(true)
-  await expect(upgradeLibrary(f.root, f.client.upgradeOptions)).rejects.toThrow()
+  const done = (await upgradeLibrary(f.root, f.client.upgradeOptions))!
+  expect(done.status).toBe('complete')
   expect(f.calls[0]!.input.sentences.some(s => s.text.includes('死亡率'))).toBe(true)
-  expect(f.calls.some(call => call.input.review_stage === 'topic-correction')).toBe(true)
+  expect(f.calls.some(call => call.input.review_stage === 'topic-correction')).toBe(false)
+  expect(Object.values(done.reviewSettled ?? {}).flatMap(group => Object.values(group.objects)).some(object => object.outcome.kind === 'pending')).toBe(true)
   expect(await readFile(path.join(f.root, f.parentObject), 'utf8')).toBe(f.content)
   expect((await readUpgradeStatus(f.root))!.reviewExclusions?.[f.parentObject]).toBeUndefined()
 })

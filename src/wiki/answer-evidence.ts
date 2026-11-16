@@ -3,6 +3,7 @@ import { terms } from './identity-search.js'
 import { excerpts, pageParagraphs, tokenCost } from './page-search.js'
 import type { EvidenceSegment, PageExcerpt } from './page-search.js'
 import { PageMetadataError } from './page-metadata.js'
+import type { PendingTopicReview } from '../layered/schema.js'
 
 export interface AnswerEvidenceSource { sourceId: string; sourceVersion: string; path: string; title: string }
 export interface AnswerEvidenceSegment extends EvidenceSegment { sources: AnswerEvidenceSource[] }
@@ -10,10 +11,12 @@ export interface AnswerEvidence {
   id: number; path: string; title: string; content: string; hash: string; version: string
   anchor: string; locator: string; truncated: boolean; unverified: boolean
   sources: AnswerEvidenceSource[]; segments: AnswerEvidenceSegment[]
+  pendingReview?: PendingTopicReview
 }
 export interface AnswerEvidenceHit {
   path: string; title: string; version: string; sourceVersions: { sourceId: string; sourceVersion: string }[]
   snippet: string; snippetSegments: EvidenceSegment[]; anchor: string; excerpts: PageExcerpt[]
+  pendingReview?: PendingTopicReview
 }
 export interface AnswerEvidenceOptions {
   budget: number; limit: number
@@ -23,6 +26,7 @@ export interface AnswerEvidencePage {
   path: string; title: string; content: string; currentVersion: string; status: string
   sourceVersions?: { sourceId: string; sourceVersion: string }[] | undefined
   truncated?: boolean | undefined
+  pendingReview?: PendingTopicReview
 }
 export interface AnswerEvidenceReadOptions extends AnswerEvidenceOptions {
   read: (path: string, maxChars: number, signal: AbortSignal | undefined, options: { version: string; offset?: number }) => Promise<AnswerEvidencePage | undefined>
@@ -74,9 +78,11 @@ function candidateIdentity(content: string, hit: AnswerEvidenceHit, aliases: Rea
       return [...known].sort().map(ref => `[${ref}]`).join(' ')
     }).replace(/\s+/g, ' ').trim()
   // 只凭同一完整主张及同一真实引用集合合并；没有可证明的锚点映射时保留原候选。
-  return unresolved || !refs.size ? `${hit.path}\0${content}` : `${body}\0${[...refs].sort().join('\0')}`
+  const identity = unresolved || !refs.size ? `${hit.path}\0${content}` : `${body}\0${[...refs].sort().join('\0')}`
+  // 待核实结论绑定版本和页面，不能与同文来源合并后迁移或丢失该状态。
+  return hit.pendingReview ? `${identity}\0${JSON.stringify(hit.pendingReview)}` : identity
 }
-type Candidate = Omit<AnswerEvidence, 'id'> & { score: number; matched: string[]; namedTitles: string[]; rank: number; hit: AnswerEvidenceHit }
+type Candidate = Omit<AnswerEvidence, 'id'> & { score: number; matched: string[]; namedTitles: string[]; rank: number; hit: AnswerEvidenceHit; sourceUnverified: boolean }
 function candidates(question: string, hits: AnswerEvidenceHit[], version: string, options: AnswerEvidenceOptions): Candidate[] {
   const result: Candidate[] = [], seen = new Map<string, Candidate>(), questionTerms = terms(question)
   const aliases = referenceAliases(hits, version), requestedTitles = [...question.matchAll(/《([^》]+)》/g)].map(match => titleIdentity(match[1]!)).filter(Boolean)
@@ -96,16 +102,18 @@ function candidates(question: string, hits: AnswerEvidenceHit[], version: string
       const names = new Set([hit.title, ...sources.map(source => source.title)].map(titleIdentity))
       const namedTitles = citedSources(content).length ? requestedTitles.filter(title => names.has(title)) : []
       const candidate = { path: hit.path, title: hit.title, content, hash: signature(content), version, anchor: original.anchor, locator: original.locator,
-        sources, segments: [{ ...original, start: 0, end: content.length, sources }], truncated: original.truncated, unverified: original.unverified,
-        score, matched: [...new Set(paragraphs.flatMap(block => block.matched))], namedTitles, rank, hit }
+        sources, segments: [{ ...original, start: 0, end: content.length, sources, unverified: original.unverified || !!hit.pendingReview }],
+        truncated: original.truncated, unverified: original.unverified || !!hit.pendingReview, ...(hit.pendingReview ? { pendingReview: hit.pendingReview } : {}),
+        score, matched: [...new Set(paragraphs.flatMap(block => block.matched))], namedTitles, rank, hit, sourceUnverified: original.unverified }
       const key = candidateIdentity(content, hit, aliases), previous = seen.get(key)
       if (previous) {
         const unverified = previous.unverified || candidate.unverified, truncated = previous.truncated || candidate.truncated, firstRank = Math.min(previous.rank, rank)
+        const sourceUnverified = previous.sourceUnverified || candidate.sourceUnverified
         const score = Math.max(previous.score, candidate.score), matched = [...new Set([...previous.matched, ...candidate.matched])], namedTitles = [...new Set([...previous.namedTitles, ...candidate.namedTitles])]
         // 保留带真实展开引用的正文，不能用更短的原始锚点替代原文定位。
         if (citedSources(candidate.content).length > citedSources(previous.content).length || citedSources(candidate.content).length === citedSources(previous.content).length && ownSource(candidate.path) && !ownSource(previous.path)) Object.assign(previous, candidate)
         previous.rank = firstRank; previous.score = score; previous.matched = matched; previous.namedTitles = namedTitles
-        previous.unverified = unverified; previous.truncated = truncated
+        previous.unverified = unverified; previous.truncated = truncated; previous.sourceUnverified = sourceUnverified
         for (const segment of previous.segments) { segment.unverified ||= unverified; segment.truncated ||= truncated }
         continue
       }
@@ -148,7 +156,7 @@ export function selectAnswerEvidence(question: string, hits: AnswerEvidenceHit[]
     if (!window?.content || !substantive(window.content)) window = fit(available)
     if (!window?.content || !substantive(window.content)) continue
     available -= tokenCost(window.content)
-    const { score: _score, matched: _matched, namedTitles: _namedTitles, rank: _rank, hit: _hit, ...quote } = item, truncated = item.truncated || window.content !== item.content
+    const { score: _score, matched: _matched, namedTitles: _namedTitles, rank: _rank, hit: _hit, sourceUnverified: _sourceUnverified, ...quote } = item, truncated = item.truncated || window.content !== item.content
     const bindings = sourcesFor(window.content, item.hit, options.sourceTitles)
     result.push({ ...quote, id: result.length + 1, content: window.content, hash: signature(window.content), truncated, sources: bindings,
       segments: (window.segments ?? []).map(segment => ({ ...segment, anchor: item.anchor, locator: item.locator, contextLocator: item.segments[0]!.contextLocator,
@@ -162,7 +170,7 @@ export async function assembleAnswerEvidence(question: string, hits: AnswerEvide
   const initial = candidates(question, hits, version, options), titles = new Map(options.sourceTitles), references = new Map<string, { source: AnswerEvidenceSource; score: number; unverified: boolean }>()
   for (const item of initial) for (const source of item.sources) {
     const key = sourceKey(source), previous = references.get(key)
-    references.set(key, { source, score: Math.max(previous?.score ?? 0, item.score), unverified: !!previous?.unverified || item.unverified })
+    references.set(key, { source, score: Math.max(previous?.score ?? 0, item.score), unverified: !!previous?.unverified || item.sourceUnverified })
   }
   const seeds = [...references.values()].sort((a, b) => b.score - a.score).slice(0, 8), ready: typeof seeds = []
   // 八个来源各读 512 字符，再给最多四个来源各读 30,000 字符；合计最多 124,096 字符。
@@ -195,7 +203,8 @@ export async function assembleAnswerEvidence(question: string, hits: AnswerEvide
     const content = end >= 0 ? page.content.slice(0, end) : ''
     const quotes = excerpts({ library: '', path: page.path, title: page.title, content }, [question], options.budget)
       .map(quote => ({ ...quote, segments: (quote.segments ?? []).map(segment => ({ ...segment, unverified: segment.unverified || seed.unverified })) }))
-    supplemented.push({ path: page.path, title: page.title, version, sourceVersions: page.sourceVersions!, snippet: '', snippetSegments: [], anchor: '', excerpts: quotes })
+    supplemented.push({ path: page.path, title: page.title, version, sourceVersions: page.sourceVersions!, snippet: '', snippetSegments: [], anchor: '', excerpts: quotes,
+      ...(page.pendingReview ? { pendingReview: page.pendingReview } : {}) })
   }
   return selectAnswerEvidence(question, [...hits, ...supplemented], version, { ...options, sourceTitles: titles })
 }

@@ -7,6 +7,7 @@ import type { WikiAnswer } from '../wiki/chat.js'
 import type { LocalHost } from '../local/host.js'
 import type { WikiOperations } from './wiki-operations.js'
 import type { UpgradeStatus } from '../layered/upgrade.js'
+import type { PendingTopicReview } from '../layered/schema.js'
 import type { generateLocalLayered } from './local-layered.js'
 import type { copyLibraryWithEmbedding } from './query-vectors.js'
 import type { SnapshotManifest, TopicGap } from '../layered/schema.js'
@@ -44,6 +45,10 @@ export function publicResult(value: unknown, secrets: readonly string[], operati
   const upgrade = (item: UpgradeStatus | null | undefined) => item && project(item, { id: item.id, status: item.status,
     backupPath: item.backupPath, originalFormat: item.originalFormat, inputDigest: item.inputDigest, files: item.files,
     reuse: item.reuse, steps: item.steps, accepted: item.accepted })
+  const pendingReview = (item: PendingTopicReview) => project(item, { status: item.status, reason: item.reason, version: item.version,
+    pagePath: item.pagePath, objectDigest: item.objectDigest, reviewFingerprint: item.reviewFingerprint, dependenciesDigest: item.dependenciesDigest,
+    sourceRefs: item.sourceRefs, protocol: item.protocol, runId: item.runId, stepId: item.stepId, taskId: item.taskId, attemptIds: item.attemptIds,
+    sentences: item.sentences.map(sentence => project(sentence, { id: sentence.id, support: sentence.support })) })
   const segments = (text: string, items: EvidenceSegment[] | undefined) => {
     const content = unsafe(text)
     // 文本改变后不能继续声称旧引用逐字对应；当前范围只展示遮蔽文本，须重新回源核实。
@@ -59,9 +64,10 @@ export function publicResult(value: unknown, secrets: readonly string[], operati
   const hit = (item: Search['results'][number]) => project(item, { path: item.path, type: item.type, anchor: item.anchor,
     page_ref: item.page_ref, topic_path: item.topic_path, snippetSegments: segments(item.snippet, item.snippetSegments), excerpts: item.excerpts.map(excerpt),
     ...('status' in item ? { status: item.status, retrieval: item.retrieval, id: item.id, sources: item.sources, sourceVersions: item.sourceVersions,
-      version: item.version, currentVersion: item.currentVersion } : {}) })
+      version: item.version, currentVersion: item.currentVersion, ...(item.pendingReview ? { pendingReview: pendingReview(item.pendingReview) } : {}) } : {}) })
   const answer = (item: WikiAnswer) => project(item, { createdAt: item.createdAt, citations: item.citations.map(citation =>
-    project(citation, { path: citation.path, hash: citation.hash, segments: segments(citation.excerpt, citation.segments), version: citation.version })) })
+    project(citation, { path: citation.path, hash: citation.hash, segments: segments(citation.excerpt, citation.segments), version: citation.version,
+      ...(citation.pendingReview ? { pendingReview: pendingReview(citation.pendingReview) } : {}) })) })
   const topicGap = (item: TopicGap) => project(item, { topic_id: item.topic_id, point_ids: item.point_ids, kind: item.kind,
     category: item.category, effect: item.effect, stage: item.stage,
     reasons: item.reasons?.map(reason => project(reason, { sentence_id: reason.sentence_id })) })
@@ -147,7 +153,8 @@ export function publicResult(value: unknown, secrets: readonly string[], operati
     case 'wiki_read': {
       const item = value as Result<WikiQuery['read']>
       return project(item, { path: item.path, type: item.type, ...('currentVersion' in item ? { currentVersion: item.currentVersion,
-        version: item.version, status: item.status, sources: item.sources, sourceVersions: item.sourceVersions } : {}) })
+        version: item.version, status: item.status, sources: item.sources, sourceVersions: item.sourceVersions,
+        ...(item.pendingReview ? { pendingReview: pendingReview(item.pendingReview) } : {}) } : {}) })
     }
     case 'wiki_source_read': {
       const item = value as Result<WikiQuery['sourceRead']>

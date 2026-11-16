@@ -3,7 +3,7 @@ import type { ModelRef } from '../domain/config.js'
 import { readFile } from 'node:fs/promises'
 import { atomicWrite, hash, readVerifiedObject } from './files.js'
 import { safePath } from '../storage/paths.js'
-import type { AcceptedRecord, AcceptedRef, Extraction, PendingBuild, ProductionArtifact, ProductionRecord, SnapshotManifest, VersionProvenance } from './schema.js'
+import type { AcceptedRecord, AcceptedRef, Extraction, PendingBuild, PendingTopicReview, ProductionArtifact, ProductionRecord, SnapshotManifest, SourceRef, VersionProvenance } from './schema.js'
 import { storageJson } from './vectors.js'
 
 export type { ModelRef } from '../domain/config.js'
@@ -184,6 +184,72 @@ export function validateProvenance(value: VersionProvenance, version: string, ma
     active.delete(id); complete.add(id)
   }
   for (const id of Object.keys(value.artifacts)) visit(id)
+  for (const [page, review] of Object.entries(value.pendingTopicReviews ?? {})) {
+    if (review.status !== 'unverified' || review.reason !== 'semantic-rejection' || review.version !== version || review.pagePath !== page
+      || !page.startsWith('topics/') || !page.endsWith('.md') || !digestPattern.test(review.objectDigest)
+      || !digestPattern.test(review.reviewFingerprint) || !digestPattern.test(review.dependenciesDigest) || !sourceRefsValid(review.sourceRefs)
+      || !review.protocol || !review.runId || !review.stepId || !/^t:[a-f0-9]{64}$/.test(review.taskId)
+      || !Array.isArray(review.attemptIds) || !review.attemptIds.length || review.attemptIds.some(id => !id.startsWith(`a:${review.runId}:`))
+      || canonicalJson(review.attemptIds) !== canonicalJson(sortedUnique(review.attemptIds))
+      || !Array.isArray(review.sentences) || !review.sentences.length || new Set(review.sentences.map(item => item.id)).size !== review.sentences.length
+      || review.sentences.some(item => !item.id || typeof item.text !== 'string' || typeof item.missing !== 'string'
+        || !['完整支撑', '部分支撑', '不支撑'].includes(item.support))
+      || !review.sentences.some(item => item.support !== '完整支撑')) throw protocolError('PROVENANCE_INCOMPLETE', '旧页待核实记录无效：' + page)
+  }
+}
+
+/** 绑定旧页实际消费的证据；本版本编号和向量配置不参与内容身份。 */
+export async function pageReviewBinding(root: string, manifest: SnapshotManifest, page: string): Promise<{ dependenciesDigest: string; sourceRefs: SourceRef[] }> {
+  const nodes: unknown[] = [], refs: SourceRef[] = [], active = new Set<string>(), seen = new Set<string>()
+  const visit = async (current: SnapshotManifest, relative: string) => {
+    const key = `${current.version}:${relative}`
+    if (active.has(key)) throw protocolError('PROVENANCE_INCOMPLETE', '旧页证据依赖成环。')
+    if (seen.has(key)) return
+    const digest = current.pages?.[relative], dependency = current.deps?.pages[relative]
+    if (!digest || !dependency) throw protocolError('PROVENANCE_INCOMPLETE', '旧页证据依赖缺失：' + relative)
+    active.add(key)
+    const sources = sortedUnique(dependency.sources).map(id => {
+      const source = current.sources.find(item => item.source_id === id)
+      if (!source) throw protocolError('PROVENANCE_INCOMPLETE', '旧页证据来源缺失：' + id)
+      refs.push({ sourceId: id, sourceVersion: source.source_version })
+      return { id, version: source.source_version, snapshot: source.files.source, extract: source.extract.path, title: source.metadata.title }
+    })
+    const topic = current.topics?.topics.find(item => item.path === relative)
+    nodes.push({ version: current.version === manifest.version ? 'self' : current.version, page: relative, objectDigest: digest,
+      sources, points: dependency.points, claims: dependency.claims ?? null,
+      children: (dependency.children ?? []).map(child => ({ page: child.page, version: !child.version || child.version === current.version ? 'self' : child.version })),
+      topic: topic ? { id: topic.id, title: topic.title, summary: topic.summary, archived: topic.archived === true,
+        parent_id: topic.parent_id, point_ids: topic.point_ids, direct_point_ids: topic.direct_point_ids ?? null } : null })
+    for (const child of dependency.children ?? []) {
+      const version = child.version || current.version
+      const childManifest = version === current.version ? current : await (await import('./objects.js')).readVersion(root, version!, false)
+      await visit(childManifest, child.page)
+    }
+    active.delete(key); seen.add(key)
+  }
+  await visit(manifest, page)
+  return { dependenciesDigest: protocolDigest(nodes), sourceRefs: sortedUnique(refs) }
+}
+
+export async function validatePendingTopicReviews(root: string, value: VersionProvenance, manifest: SnapshotManifest): Promise<void> {
+  for (const [page, review] of Object.entries(value.pendingTopicReviews ?? {})) {
+    const binding = await pageReviewBinding(root, manifest, page)
+    if (review.version !== manifest.version || manifest.pages?.[page] !== review.objectDigest
+      || binding.dependenciesDigest !== review.dependenciesDigest || canonicalJson(binding.sourceRefs) !== canonicalJson(review.sourceRefs))
+      throw protocolError('PROVENANCE_INCOMPLETE', '旧页待核实记录与当前证据不符：' + page)
+  }
+}
+
+/** 仅在受管版本变更中保留同字节、同证据的旧状态，读取时不修复损坏。 */
+export async function inheritPendingTopicReviews(root: string, previous: VersionProvenance | undefined, manifest: SnapshotManifest): Promise<VersionProvenance['pendingTopicReviews']> {
+  const result: Record<string, PendingTopicReview> = {}
+  for (const [page, review] of Object.entries(previous?.pendingTopicReviews ?? {})) {
+    if (manifest.pages?.[page] !== review.objectDigest) continue
+    const binding = await pageReviewBinding(root, manifest, page)
+    if (binding.dependenciesDigest !== review.dependenciesDigest || canonicalJson(binding.sourceRefs) !== canonicalJson(review.sourceRefs)) continue
+    result[page] = { ...structuredClone(review), version: manifest.version! }
+  }
+  return Object.keys(result).length ? result : undefined
 }
 // 父成果随当前版本封存；不依赖仍被保留的历史版本或接受工作目录。
 export function retainDerivedArtifacts(artifacts: VersionProvenance['artifacts'], available: VersionProvenance['artifacts']): void {
@@ -268,6 +334,10 @@ export async function readProvenance(root: string, version: string, checksum: st
     const envelope = await readProtocol<{ checksum: string; provenance: VersionProvenance }>(root, sidecarPath(version, 'provenance'), 'PROVENANCE_INCOMPLETE')
     if (!envelope || protocolDigest(envelope.provenance) !== envelope.checksum) throw new Error('附属文件缺失或摘要不符')
     validateProvenance(envelope.provenance, version, checksum)
+    if (Object.keys(envelope.provenance.pendingTopicReviews ?? {}).length) {
+      const manifest = await (await import('./objects.js')).readVersion(root, version, false)
+      await validatePendingTopicReviews(root, envelope.provenance, manifest)
+    }
     if (Object.values(envelope.provenance.artifacts).some(artifact => artifact.derivedFrom)) {
       const manifest = await (await import('./objects.js')).readVersion(root, version, false)
       if (hash(storageJson(manifest)) !== checksum) throw new Error('派生成果与当前清单不符')
@@ -278,6 +348,11 @@ export async function readProvenance(root: string, version: string, checksum: st
 }
 export async function writeProvenance(root: string, provenance: VersionProvenance): Promise<{ path: string; checksum: string }> {
   validateProvenance(provenance, provenance.version, provenance.manifestChecksum)
+  if (Object.keys(provenance.pendingTopicReviews ?? {}).length) {
+    const manifest = await (await import('./objects.js')).readVersion(root, provenance.version, false)
+    if (hash(storageJson(manifest)) !== provenance.manifestChecksum) throw protocolError('PROVENANCE_INCOMPLETE', '旧页待核实记录与待写清单不符。')
+    await validatePendingTopicReviews(root, provenance, manifest)
+  }
   if (Object.values(provenance.artifacts).some(artifact => artifact.derivedFrom)) {
     const manifest = await (await import('./objects.js')).readVersion(root, provenance.version, false)
     if (hash(storageJson(manifest)) !== provenance.manifestChecksum) throw protocolError('PROVENANCE_INCOMPLETE', '派生成果与待写清单不符。')
@@ -456,7 +531,16 @@ export async function publicationProvenance(root: string, pending: PendingBuild,
     return [checksum, bases[checksum]!]
   }))
   else delete value.derivationBases
+  const inheritedReviews = await inheritPendingTopicReviews(root, previous, pending.manifest)
+  for (const page of Object.keys(inheritedReviews ?? {})) {
+    // 本轮新核对接受取代历史状态；仅沿用旧接受时继续保留原状态。
+    const current = pending.manifest.deps?.pages[page]?.review?.acceptedRef
+    const prior = base?.deps?.pages[page]?.review?.acceptedRef
+    if (current && canonicalJson(current) !== canonicalJson(prior)) delete inheritedReviews![page]
+  }
+  if (inheritedReviews && Object.keys(inheritedReviews).length) value.pendingTopicReviews = inheritedReviews
   validateProvenance(value, value.version, manifestChecksum)
+  await validatePendingTopicReviews(root, value, pending.manifest)
   await validateDerivedObjects(root, value, pending.manifest)
   // 内嵌闭合链，移除未被本版本引用的历史记录。
   const needed = new Set<string>()

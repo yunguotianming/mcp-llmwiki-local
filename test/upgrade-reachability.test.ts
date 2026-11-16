@@ -192,12 +192,13 @@ it('已付费混合旧计划从备份找回后收缩，同身份费用保留且�
   expect(done.accepted['已退出的原步骤']).toEqual(restored.accepted['已退出的原步骤'])
 }, 60000)
 
-it('有效根内真实不支撑仍暂停，旧正文和缺核对标记保持', async () => {
+it('有效根内完整语义拒绝保留为待核实并继续，旧正文和缺核对标记保持', async () => {
   const f = await fixture(), current = await f.version(1, [1]); await f.current(current)
   const before = await readFile(path.join(f.root, 'versions/v000001.json')), m = models(f, 'semantic')
-  await expect(upgradeLibrary(f.root, m.client(8).upgradeOptions)).rejects.toMatchObject({ code: 'UPGRADE_REVIEW_PAUSED' })
-  expect((await readUpgradeStatus(f.root))!.status).toBe('paused'); expect(m.calls.length).toBeGreaterThan(0)
+  const done = (await upgradeLibrary(f.root, m.client(8).upgradeOptions))!
+  expect(done.status).toBe('complete'); expect(m.calls.length).toBeGreaterThan(0)
+  expect(Object.values(done.reviewSettled ?? {}).flatMap(group => Object.values(group.objects)).some(object => object.outcome.kind === 'pending')).toBe(true)
   expect(await readFile(path.join(f.root, 'versions/v000001.json'))).toEqual(before)
   expect(current.deps!.pages['topics/T-1.md']!.review).toBeUndefined()
-  expect(JSON.parse(await readFile(path.join(f.root, '.llmwiki/policy.json'), 'utf8')).libraryFormat).not.toBe('0.3.0')
+  expect(JSON.parse(await readFile(path.join(f.root, '.llmwiki/policy.json'), 'utf8')).libraryFormat).toBe('0.3.0')
 }, 60000)

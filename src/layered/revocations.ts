@@ -10,6 +10,9 @@ import { beginRevocationCleanup, resumeRevocationCleanup } from './revocation-cl
 import { checkWriter } from './devices.js'
 import { formatVersion, locatorRange, topicPath } from './schema.js'
 import type { CurrentVersion, Dependencies, PendingBuild, Revocations, SnapshotManifest } from './schema.js'
+import type { PendingTopicReview } from './schema.js'
+import { isProductionFormat, readProvenance } from './models.js'
+import { storageJson } from './vectors.js'
 import type { ReadingCopyState } from './reading-copy.js'
 
 export const validSourceId = (id: string): boolean => /^(?:S-\d{4,}|\d{14}-[a-z0-9]{7})$/.test(id)
@@ -92,6 +95,7 @@ export async function revokeSourcesAtRoot(root: string, sourceIds: string[], rea
 }
 export interface LayeredReadResult {
   status: 'ok' | 'updating' | 'updated' | 'external'; content: string; version: string; sourceVersion?: string; warning?: string; path?: string
+  pendingReview?: PendingTopicReview
 }
 function blocked(page: string, manifest: SnapshotManifest, deps: Dependencies, revocations: Revocations): boolean {
   if (manifest.rebuild_pages?.includes(page.split('#')[0]!)) return true
@@ -105,6 +109,7 @@ export interface LayeredReadView {
   root: string; current: CurrentVersion; version: string; generation: number; manifest: SnapshotManifest; deps: Dependencies
   conflicts: Set<string>
   warning?: string
+  pendingReview(page: string): PendingTopicReview | undefined
   resolve(relative: string): string
   document(relative: string): Promise<LayeredReadResult>
   source(sourceId: string, options?: { sourceVersion?: string | undefined; locator?: string | undefined }): Promise<LayeredReadResult>
@@ -126,6 +131,7 @@ export async function withLayeredRead<T>(root: string, action: (view: LayeredRea
     }
     const deps = manifest.deps
     if (!deps) throw new Error('发布版本依赖表缺失。')
+    const pendingReviews = await isProductionFormat(root) ? (await readProvenance(root, version, hash(storageJson(manifest)))).pendingTopicReviews : undefined
     const reading = options.filterConflicts ? await readOptional<ReadingCopyState>(await safePath(root, 'state/reading-copy.json')) : undefined
     indexDependencies(deps)
     const aliases = manifest.aliases
@@ -150,6 +156,12 @@ export async function withLayeredRead<T>(root: string, action: (view: LayeredRea
     }
     const view: LayeredReadView = {
       root, current, version, generation: revocations.generation, manifest, deps, resolve, conflicts: new Set(), ...(pinned.warning ? { warning: pinned.warning } : {}),
+      pendingReview: relative => {
+        const page = resolve(relative).split('#')[0]!
+        if (blocked(page, manifest, deps, revocations)) return undefined
+        const review = pendingReviews?.[page]
+        return review ? structuredClone(review) : undefined
+      },
       unchanged: async () => JSON.stringify(await readCurrent(root)) === JSON.stringify(current) && (await readRevocations(root)).generation === revocations.generation,
       document: async relative => {
         options.signal?.throwIfAborted()
@@ -200,7 +212,8 @@ export async function withLayeredRead<T>(root: string, action: (view: LayeredRea
           const match = /\]\(((?:sources|topics|terms)\/[^)]+\.md)\)/.exec(line)
           return match && blocked(resolve(match[1]!), manifest, deps, revocations) ? `- [更新中](${match[1]})` : line
         }).join('\n')
-        return { status: 'ok', content, version, path: page, ...(pinned.warning ? { warning: pinned.warning } : {}) }
+        const pendingReview = view.pendingReview(file)
+        return { status: 'ok', content, version, path: page, ...(pinned.warning ? { warning: pinned.warning } : {}), ...(pendingReview ? { pendingReview } : {}) }
       },
       source: async (sourceId, sourceOptions = {}) => {
         await pinned.assert()

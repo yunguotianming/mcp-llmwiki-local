@@ -9,7 +9,7 @@ import { checkWriter } from './devices.js'
 import { indexDependencies } from './revocations.js'
 import type { CurrentVersion, Revocations, SnapshotManifest, TopicState } from './schema.js'
 import type { ReadingCopyState } from './reading-copy.js'
-import { artifactId, isProductionFormat, protocolDigest, protocolError, readProtocol, readProvenance, retainDerivedArtifacts, sidecarPath, writeProtocol, writeProvenance } from './models.js'
+import { artifactId, inheritPendingTopicReviews, isProductionFormat, protocolDigest, protocolError, readProtocol, readProvenance, retainDerivedArtifacts, sidecarPath, writeProtocol, writeProvenance } from './models.js'
 import type { AcceptanceSnapshot, AttemptEntry, VersionProvenance } from './schema.js'
 import type { VersionCosts } from './costs.js'
 import { modelRetentionRoots } from './costs.js'
@@ -141,6 +141,10 @@ async function cleanProductionVersion(root: string, manifest: SnapshotManifest, 
   for (const item of Object.values(artifacts)) for (const id of [...item.productionIds, ...(item.inheritedFrom?.productionIds ?? [])]) visit(id)
   value.artifacts = artifacts; value.records = Object.fromEntries([...needed].map(id => [id, value.records[id]!]))
   value.manifestChecksum = hash(storageJson(manifest)); value.revocationGeneration = manifest.revocation_generation
+  for (const [page, review] of Object.entries(value.pendingTopicReviews ?? {})) if (review.sourceRefs.some(ref => revoked.has(ref.sourceId))) delete value.pendingTopicReviews![page]
+  const pendingReviews = await inheritPendingTopicReviews(root, value, manifest)
+  if (pendingReviews) value.pendingTopicReviews = pendingReviews
+  else delete value.pendingTopicReviews
   await writeProvenance(root, value)
   const costFile = sidecarPath(version, 'costs'), cost = await readProtocol<{ checksum: string; costs: VersionCosts }>(root, costFile, 'PROVENANCE_INCOMPLETE')
   if (!cost || protocolDigest(cost.costs) !== cost.checksum) throw protocolError('PROVENANCE_INCOMPLETE', '撤权成本汇总缺失。')

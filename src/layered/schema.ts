@@ -305,10 +305,17 @@ export interface SummaryCompletionProof {
   settings: Pick<LayeredSettings, 'sourceSummaryFanout' | 'sourceSummaryMaxPoints' | 'sourcePointBaseChars' | 'sourcePointMaxMultiplier' | 'sourceChapterMinPoints' | 'sourceLongChapterChars'>
   accepted: { ref: AcceptedRef; record: Omit<AcceptedRecord, 'acceptedDigest'>; output: string }[]
 }
+export interface PendingTopicReview {
+  status: 'unverified'; reason: 'semantic-rejection'
+  version: string; pagePath: string; objectDigest: string; reviewFingerprint: string; dependenciesDigest: string
+  sourceRefs: SourceRef[]; protocol: string; runId: string; stepId: string; taskId: string; attemptIds: string[]
+  sentences: { id: string; text: string; support: '完整支撑' | '部分支撑' | '不支撑'; missing: string }[]
+}
 export interface VersionProvenance {
   schema: 'llmwiki-provenance-v1'; version: string; manifestChecksum: string; revocationGeneration: number
   artifacts: Record<string, ProductionArtifact>; records: Record<string, ProductionRecord>
   derivationBases?: Record<string, string>
+  pendingTopicReviews?: Record<string, PendingTopicReview>
 }
 export interface NormalizedUsage { inputTokens: number; cacheReadTokens: number; cacheWriteTokens: number; outputTokens: number }
 export interface PriceSnapshot {

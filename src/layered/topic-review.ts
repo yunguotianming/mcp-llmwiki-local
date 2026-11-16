@@ -137,12 +137,18 @@ export function topicReviewFingerprint(content: string, members: Point[], contra
   return structure ? hash(JSON.stringify([topicStructureReviewVersion, base, structure])) : base
 }
 
+export interface TopicSemanticReview {
+  complete: true
+  sentences: { id: string; text: string; support: '完整支撑' | '部分支撑' | '不支撑'; missing: string }[]
+}
 export async function reviewTopicContent(topicId: string, content: string, members: Point[], options: BuildLayeredOptions,
   previous?: PageDependencies['review'], metadataPass = false,
   sourceContexts?: ReadonlyMap<string, TopicEvidenceSource>, continuation?: {
     state?: TopicRepairState | undefined; runId: string; preserveBudget?: boolean; save(state: TopicRepairState): Promise<void>
-  }, structure?: TopicStructureEvidence): Promise<{ content: string; review?: PageDependencies['review']; calls: number; failure?: string; incomplete?: boolean }> {
+  }, structure?: TopicStructureEvidence, legacyReviewOnly = false): Promise<{ content: string; review?: PageDependencies['review']; calls: number; failure?: string; incomplete?: boolean; semanticReview?: TopicSemanticReview }> {
   if (!layeredSettings(options.topics || {}, options.tier).topicReview) return { content, calls: 0 }
+  // 旧页只核对首轮；拒绝记录独立于正常主题的纠正与接受流程。
+  if (legacyReviewOnly) return reviewTopicContentOnce(topicId, content, members, options, previous, metadataPass, sourceContexts, structure, true)
   const input = topicReviewFingerprint(content, members, true, sourceContexts, structure)
   const evidence = topicReviewFingerprint('', members, true, sourceContexts, structure), protocol = reviewProtocol(structure)
   let state = continuation?.state
@@ -200,7 +206,7 @@ async function reviewTopicPass(topicId: string, content: string, members: Point[
 }
 
 function topicReviewInput(topicId: string, content: string, members: Point[], options: BuildLayeredOptions,
-  previous?: PageDependencies['review'], metadataPass = false, sourceContexts?: ReadonlyMap<string, TopicEvidenceSource>, structure?: TopicStructureEvidence) {
+  previous?: PageDependencies['review'], metadataPass = false, sourceContexts?: ReadonlyMap<string, TopicEvidenceSource>, structure?: TopicStructureEvidence, legacyReviewOnly = false) {
   const settings = layeredSettings(options.topics || {}, options.tier)
   members = orderedMembers(members)
   const cited = citedTopicPoints(content, members)
@@ -208,7 +214,7 @@ function topicReviewInput(topicId: string, content: string, members: Point[], op
   if (refreshMetadata && cited.length && !content.includes('## 子主题导航')) members = cited
   let aliases = topicAliases(content)
   let scopeRejected = content.includes('范围：按成员证据阅读。')
-  if (scopeRejected) content = rebuildTopicScope(content, cited.length ? cited : members)
+  if (scopeRejected && !legacyReviewOnly) content = rebuildTopicScope(content, cited.length ? cited : members)
   const sentences = [...topicSentences(content), ...aliases.map((text, index) => ({ id: 'A' + index, text: '别名：' + text, start: -1, end: -1 }))]
   const memberEvidence = new Map(members.map(point => [point.point_id, point.evidence.map(evidence => {
     const context = topicEvidenceContext(evidence, sourceContexts?.get(evidence.source_id))
@@ -260,8 +266,8 @@ function topicBlockReport(raw: string, ids: string[], memberIds: string[], schem
     const matches = envelope.success ? envelope.data.items.filter(item => item && typeof item === 'object' && 'id' in item && item.id === id) : []
     const parsed = matches.length === 1 ? schema.shape.items.element.safeParse(matches[0]) : undefined
     if (!parsed?.success || !parsed.data.findings.trim() || parsed.data.point_ids.some(id => !memberIds.includes(id))) return []
-    const checked = checkedVerdicts(JSON.stringify({ items: [parsed.data] }), [id], true)[0]!
-    return checked.missing.startsWith('核对协议缺口：') ? [] : [parsed.data]
+    try { checkedVerdicts(JSON.stringify({ items: [parsed.data] }), [id]); return [parsed.data] }
+    catch { return [] }
   })
   return { member_ids: memberIds, items: output, missing: ids.filter(id => !output.some(item => item.id === id)) }
 }
@@ -275,9 +281,9 @@ interface TopicReviewRequest { system: string; input: string; acceptance?: { spe
 
 /** 仅列出可在派发前确定的初轮请求；分块后的合并依赖模型报告，另由账本累计。 */
 export function topicReviewRequests(topicId: string, content: string, members: Point[], options: BuildLayeredOptions,
-  limit: number, sourceContexts?: ReadonlyMap<string, TopicEvidenceSource>, structure?: TopicStructureEvidence): TopicReviewRequest[] {
+  limit: number, sourceContexts?: ReadonlyMap<string, TopicEvidenceSource>, structure?: TopicStructureEvidence, legacyReviewOnly = false): TopicReviewRequest[] {
   if (!layeredSettings(options.topics || {}, options.tier).topicReview) return []
-  const plan = topicReviewInput(topicId, content, members, options, undefined, false, sourceContexts, structure)
+  const plan = topicReviewInput(topicId, content, members, options, undefined, false, sourceContexts, structure, legacyReviewOnly)
   if (!plan.sentences.length) return []
   const prompt = structurePrompt(topicPrompt, structure), block = structurePrompt(blockPrompt, structure)
   const batches = topicReviewBatches(plan.input.sentences, plan.members, plan.input, plan.memberInput, limit, prompt, topicReviewOutput, block, blockReviewOutput)
@@ -289,10 +295,11 @@ export function topicReviewRequests(topicId: string, content: string, members: P
 
 async function reviewTopicContentOnce(topicId: string, content: string, members: Point[], options: BuildLayeredOptions,
   previous?: PageDependencies['review'], metadataPass = false,
-  sourceContexts?: ReadonlyMap<string, TopicEvidenceSource>, structure?: TopicStructureEvidence): Promise<{ content: string; review?: PageDependencies['review']; calls: number; failure?: string; incomplete?: boolean; needsMetadata?: boolean; needsRegeneration?: boolean }> {
+  sourceContexts?: ReadonlyMap<string, TopicEvidenceSource>, structure?: TopicStructureEvidence, legacyReviewOnly = false): Promise<{ content: string; review?: PageDependencies['review']; calls: number; failure?: string; incomplete?: boolean; needsMetadata?: boolean; needsRegeneration?: boolean; semanticReview?: TopicSemanticReview }> {
   const settings = layeredSettings(options.topics || {}, options.tier)
   if (!settings.topicReview) return { content, calls: 0 }
-  const plan = topicReviewInput(topicId, content, members, options, previous, metadataPass, sourceContexts, structure)
+  const originalContent = content
+  const plan = topicReviewInput(topicId, content, members, options, previous, metadataPass, sourceContexts, structure, legacyReviewOnly)
   content = plan.content; members = plan.members
   let { aliases, scopeRejected } = plan
   const { sentences, fingerprint, refreshMetadata, references, memberInput, input } = plan
@@ -321,6 +328,7 @@ async function reviewTopicContentOnce(topicId: string, content: string, members:
     if (error && typeof error === 'object' && ('budgetPause' in error || 'stagePause' in error || 'storageFailure' in error || 'code' in error && ['EIO', 'ENOSPC', 'EACCES', 'EPERM', 'ENOENT'].includes(String(error.code)))) throw error
   }
   const fits = (prompt: string, value: unknown, schema: z.ZodType) => Buffer.byteLength(jsonProtocol(prompt, schemaJSON(schema)) + JSON.stringify(value)) <= limit
+  let evaluationComplete = true
   const evaluate = async (items: TopicReviewSentence[]) => {
     const final = items.some(item => item.original_text !== undefined)
     const prompt = structurePrompt(topicPrompt, structure) + (final ? finalRule : ''), block = structurePrompt(blockPrompt, structure) + (final ? finalRule : ''), merge = structurePrompt(mergePrompt, structure) + (final ? finalRule : '')
@@ -328,6 +336,8 @@ async function reviewTopicContentOnce(topicId: string, content: string, members:
     const selected = final ? members.filter(point => items.some(item => item.point_ids?.includes(references.alias(point.point_id)))) : members
     const batches = topicReviewBatches(items, selected, input, memberInput, limit, prompt, schema, block, blockSchema)
     const verdicts = (raw: string, ids: string[]) => {
+      // 完整性由协议结构确定；模型的自然语言缺失说明不参与状态分类。
+      try { checkedVerdicts(raw, ids) } catch { evaluationComplete = false }
       const checked = checkedVerdicts(raw, ids, true)
       const output = final ? z.object({ items: z.array(z.unknown()) }).parse(parseModelJson(raw, schemaJSON(schema))).items : []
       return checked.map(item => {
@@ -335,7 +345,7 @@ async function reviewTopicContentOnce(topicId: string, content: string, members:
         const matches = output.filter(value => value && typeof value === 'object' && 'id' in value && value.id === item.id)
         const parsed = matches.length === 1 ? finalReviewOutput.shape.items.element.safeParse(matches[0]) : undefined
         return parsed?.success ? { ...item, claim_preserved: parsed.data.claim_preserved }
-          : { ...item, support: '不支撑' as const, missing: '核对协议缺口：最终句缺少有效的主张保持判定。', claim_preserved: undefined }
+          : (evaluationComplete = false, { ...item, support: '不支撑' as const, missing: '核对协议缺口：最终句缺少有效的主张保持判定。', claim_preserved: undefined })
       })
     }
     if (batches.blocks === null) return verdicts(await call(prompt, batches.value, schema), items.map(item => item.id))
@@ -352,6 +362,7 @@ async function reviewTopicContentOnce(topicId: string, content: string, members:
       })
       const reports = completed.map(result => result.report), dependencies = completed.flatMap(result => result.acceptedRef ? [result.acceptedRef] : [])
       const incomplete = new Set(reports.flatMap(report => report.missing))
+      if (incomplete.size) evaluationComplete = false
       const mergeRequest = (group: typeof sentences) => ({ review_stage: 'topic-merge', contradiction_attribution: settings.contradictionReview, topic_id: topicId, sentences: group,
         navigation: input.navigation, source_versions: input.source_versions, ...(structure ? { library_structure: structure } : {}),
         blocks: reports.map(report => ({ ...report, items: report.items.filter(item => group.some(sentence => sentence.id === item.id)) })) })
@@ -366,7 +377,7 @@ async function reviewTopicContentOnce(topicId: string, content: string, members:
           return verdicts(result.value, ids).map(item => final && reports.some(report => report.items.some(value => value.id === item.id && 'claim_preserved' in value && value.claim_preserved === false))
             ? { ...item, claim_preserved: false } : item)
         }
-        catch (error) { fatal(error); return group.map(item => ({ id: item.id, support: '不支撑' as const, missing: '核对协议缺口：合并核对未完成。', claim_preserved: undefined })) }
+        catch (error) { fatal(error); evaluationComplete = false; return group.map(item => ({ id: item.id, support: '不支撑' as const, missing: '核对协议缺口：合并核对未完成。', claim_preserved: undefined })) }
       })
       return [...merged.flat(), ...[...incomplete].map(id => ({ id, support: '不支撑' as const, missing: '核对协议缺口：分块核对未完成。', claim_preserved: undefined }))]
     })
@@ -374,12 +385,26 @@ async function reviewTopicContentOnce(topicId: string, content: string, members:
   }
   // 预算或传输失败不是“不支撑”，不能据此删掉正文；由主题任务登记缺口。
   let rejected: { id: string; missing: string }[], failure: string | undefined, incomplete = false
-  try { rejected = (await evaluate(input.sentences)).filter(item => item.support !== '完整支撑') }
+  let initial: Awaited<ReturnType<typeof evaluate>> = []
+  try { initial = await evaluate(input.sentences); rejected = initial.filter(item => item.support !== '完整支撑') }
   catch (error) {
     fatal(error); incomplete = true; failure = '主题核对未完成：' + String(error)
     rejected = sentences.map(item => ({ id: item.id, missing: failure! }))
   }
-  incomplete ||= rejected.some(item => item.missing.startsWith('核对协议缺口：'))
+  if (legacyReviewOnly) {
+    if (incomplete || !evaluationComplete) return { content: originalContent, calls, incomplete: true, failure: failure ?? '主题核对协议未完整覆盖初轮输入。' }
+    if (rejected.length) return { content: originalContent, calls, semanticReview: { complete: true,
+      sentences: initial.map(item => ({ id: item.id, text: input.sentences.find(sentence => sentence.id === item.id)!.text, support: item.support, missing: item.missing })) } }
+    return { content: originalContent, calls, review: { fingerprint: fingerprint(originalContent), removed: [], aliases, models: mergeModels(usage.models) } }
+  }
+  const semanticRejections = (items: { id: string; missing: string }[]) => items.filter(item => {
+    if (!item.missing.startsWith('核对协议缺口：') && !item.missing.startsWith('主题核对未完成：')) return true
+    incomplete = true
+    failure ??= '主题核对未完成：' + item.id + '；' + item.missing
+    return false
+  })
+  // 未完成核对不能推出语义不支撑，保留原句并仅纠正已有完整判定的拒绝。
+  rejected = semanticRejections(rejected)
   const rejectedAliases = new Set(rejected.filter(item => item.id.startsWith('A')).map(item => item.id))
   if (rejectedAliases.size) aliases = aliases.filter((_item, index) => !rejectedAliases.has('A' + index))
   rejected = rejected.filter(item => !item.id.startsWith('A'))
@@ -391,6 +416,7 @@ async function reviewTopicContentOnce(topicId: string, content: string, members:
   const replacements = new Map<string, string>(), removed: string[] = []
   const reasons: NonNullable<NonNullable<PageDependencies['review']>['reasons']> = []
   const correctRejected = async (rejections: { id: string; missing: string }[], items: TopicReviewSentence[]) => {
+    rejections = semanticRejections(rejections)
     if (!rejections.length) return
     const schema = topicCorrectionOutput
     const accepted = new Map<string, string>()
@@ -407,6 +433,8 @@ async function reviewTopicContentOnce(topicId: string, content: string, members:
         return completeInputBlocks(orderedMembers(members), group => fits(correctionPrompt, request(group), schema)).map(request)
       }) : [correctionInput]
       for (const batch of batches) {
+        // 已有候选或已终止的句子会忽略后续响应，派发前跳过这类完整批次；候选仍须最终核对。
+        if (batch.validationFeedback.every(item => candidates.has(item.id) || rejectedReasons.get(item.id) === '改变原主张')) continue
         const output = await call(correctionPrompt, batch, schema)
         responses.add(output)
         const raw = z.object({ sentences: z.array(z.unknown()) }).parse(parseModelJson(output, schemaJSON(schema)))

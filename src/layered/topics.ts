@@ -638,17 +638,18 @@ export async function prepareTopics(root: string, pending: PendingBuild, committ
   const upgradeTopic = (topic: Topic) => inScope(topic.id) && (options.reextract === undefined || options.reextract === 'all' || !deps.pages[topic.path]
     || affected.has(topic.path) || topic.point_ids.some(id => options.reextract!.includes(id.split(':')[0]!)))
   pending.manifest.topic_gaps = build.gaps ??= []
-  const pauseOriginal = async (topic: Topic, error: unknown) => {
+  const pauseReview = async (topic: Topic, error: unknown) => {
     const original = originalPages.get(topic.path)
-    if (!scope || !original) return false
-    build.pages[topic.path] = structuredClone(original.page)
-    Object.assign(topic, structuredClone(original.topic))
-    if (original.excluded) (build.state.excluded_members ??= {})[topic.id] = structuredClone(original.excluded)
-    else if (build.state.excluded_members) delete build.state.excluded_members[topic.id]
-    scope.completed = scope.completed.filter(id => id !== topic.id)
+    if (original) {
+      build.pages[topic.path] = structuredClone(original.page)
+      Object.assign(topic, structuredClone(original.topic))
+      if (original.excluded) (build.state.excluded_members ??= {})[topic.id] = structuredClone(original.excluded)
+      else if (build.state.excluded_members) delete build.state.excluded_members[topic.id]
+    } else topic.page_status = 'pending'
+    if (scope) scope.completed = scope.completed.filter(id => id !== topic.id)
     const message = error instanceof Error ? error.message : String(error)
     build.gaps = (build.gaps ?? []).filter(gap => gap.topic_id !== topic.id)
-    build.gaps.push({ topic_id: topic.id, point_ids: [...topic.point_ids], message, stage: 'review', effect: '质量审计通知' })
+    build.gaps.push({ topic_id: topic.id, point_ids: [...topic.point_ids], message, stage: 'review', effect: original ? '质量审计通知' : '整页阻塞' })
     pending.manifest.topic_gaps = build.gaps
     await checkpoint()
     if (error && typeof error === 'object' && ('budgetPause' in error || 'stagePause' in error || error instanceof Error && error.name === 'AbortError')) throw error
@@ -736,7 +737,7 @@ export async function prepareTopics(root: string, pending: PendingBuild, committ
     options.signal?.throwIfAborted()
     content = checked.content; build.model_calls += checked.calls
     if ('failure' in checked && checked.failure) {
-      if (checked.incomplete) await pauseOriginal(topic, checked.failure)
+      if (checked.incomplete) await pauseReview(topic, checked.failure)
       await failTopic(topic, new Error(checked.failure), undefined, checked.review?.reasons); return
     }
     if (checked.review) dependencies = { ...dependencies, review: checked.review }
@@ -1364,7 +1365,7 @@ export async function prepareTopics(root: string, pending: PendingBuild, committ
             const checked = await checkTopic(topic, page.content, page.dependencies.review, activeSignal, (page.dependencies as AcceptedDependencies).acceptedRef, page.dependencies)
             build.model_calls += checked.calls
             if (checked.failure) {
-              if (checked.incomplete) await pauseOriginal(topic, checked.failure)
+              if (checked.incomplete) await pauseReview(topic, checked.failure)
               await failTopic(topic, new Error(checked.failure), undefined, checked.review?.reasons)
             }
             else if (checked.calls || checked.content !== page.content || checked.review?.fingerprint !== page.dependencies.review?.fingerprint) await savePage(topic, checked.content, { ...page.dependencies, ...(checked.review ? { review: checked.review } : {}) })
@@ -1395,7 +1396,7 @@ export async function prepareTopics(root: string, pending: PendingBuild, committ
             || error && typeof error === 'object' && ('budgetPause' in error || 'stagePause' in error || 'storageFailure' in error || 'configurationFailure' in error || 'code' in error
               && ['EIO', 'ENOSPC', 'EACCES', 'EPERM', 'ENOENT', 'ENOTDIR', 'EISDIR', 'EROFS', 'EMFILE', 'ENFILE', 'EBUSY'].includes(String(error.code)))
           if (global) {
-            if (originalPages.has(topic.path)) await pauseOriginal(topic, error)
+            if (originalPages.has(topic.path)) await pauseReview(topic, error)
           } else if (error && typeof error === 'object' && 'needsRegeneration' in error && !childrenOf(build.state, topic).length) {
             const repair = build.repairs?.[topic.id]
             if (repair) { repair.stage = 'generate'; repair.regenerations = (repair.regenerations ?? 0) + 1 }

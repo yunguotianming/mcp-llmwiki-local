@@ -6,18 +6,18 @@ import { safePath } from '../storage/paths.js'
 import { withLibraryLock } from '../storage/lock.js'
 import { policySchema } from '../domain/policy-schema.js'
 import { appendLog, atomicWrite, hash } from './files.js'
-import { canonicalJson, legacyProvenance, protocolDigest, protocolError, readProtocol, sortedUnique, writeProtocol, writeProvenance, artifactId, readProvenance } from './models.js'
+import { canonicalJson, legacyProvenance, protocolDigest, protocolError, readProtocol, sortedUnique, writeProtocol, writeProvenance, artifactId, readProvenance, pageReviewBinding } from './models.js'
 import { createExecutionLedger, readRunCosts, readVersionCosts, usageTokens, writeVersionCosts } from './costs.js'
-import type { AcceptedRef, ExecutionHooks, SnapshotManifest, StageId } from './schema.js'
+import type { AcceptedRef, AttemptEntry, ExecutionHooks, PendingTopicReview, SnapshotManifest, StageId } from './schema.js'
 import { storageJson } from './vectors.js'
-import { executeAccepted, makeTaskIdentity, readAccepted, recoverAccepted, withRecovery } from './accepted.js'
+import { executeAccepted, makeTaskIdentity, readAccepted, recoverAccepted, taskIdFor, withRecovery } from './accepted.js'
 import type { AcceptanceBindings, RecoveryPending } from './accepted.js'
 import type { BuildLayeredOptions, Extraction, PageDependencies, Point, SourceEntry, TaskIdentity } from './schema.js'
 import { extractionReviewRequests, reviewExtraction, reviewPromptHash } from './review.js'
-import { reviewTopicContent, topicReviewFingerprint, topicReviewRequests, topicReviewVersion, topicStructureReviewVersion } from './topic-review.js'
+import { reviewTopicContent, topicReviewFingerprint, topicReviewRequests, topicReviewVersion, topicStructureReviewVersion, topicSentences } from './topic-review.js'
 import type { TopicStructureEvidence } from './topic-review.js'
 import type { TopicEvidenceSource } from './topic-metadata.js'
-import { topicClaimText, topicEvidenceContext } from './topic-metadata.js'
+import { topicAliases, topicClaimText, topicEvidenceContext } from './topic-metadata.js'
 import { layeredSettings } from '../domain/config.js'
 import { topicBudget } from './input-budget.js'
 import { readRetentionRoots } from './retention.js'
@@ -35,6 +35,14 @@ export interface UpgradeStep {
   reviewOrigin?: { id: string; inputDigest: string; revocationGeneration: number }
 }
 export interface UpgradeEstimate { calls: number; inputTokens: number; outputTokens: number }
+interface ReviewObjectOutcome {
+  identity: TaskIdentity
+  /** 范围收缩只改变组计划；已闭合对象保留首次记录的步骤身份。 */
+  stepId?: string
+  outcome: { kind: 'accepted'; ref: AcceptedRef } | { kind: 'pending'; records: PendingTopicReview[]; attemptTasks: Record<string, string> }
+}
+interface ReviewSettlement { inputDigest: string; unitIds: string[]; objects: Record<string, ReviewObjectOutcome> }
+export type UpgradeStepResult = AcceptedRef | { kind: 'settled'; settlement: ReviewSettlement }
 interface ReuseItem { path: string; digest: string; kind: 'extraction' | 'page' | 'vector' | 'checkpoint'; after: string }
 interface UpgradeReviewExclusion {
   rule: 'archived-topic-placeholder-v1' | 'archived-topic-placeholder-v2'; reason: string; objectDigest: string; dependencyDigests: string[]; pagePaths: string[]
@@ -45,6 +53,8 @@ export interface UpgradeStatus {
   steps: UpgradeStep[]; accepted: Record<string, AcceptedRef>
   /** 逐对象本地排除依据；不表示模型核对通过，也不产生接受记录。 */
   reviewExclusions?: Record<string, UpgradeReviewExclusion>
+  /** 逐对象终态；完整语义拒绝独立保存，绝不冒充接受。 */
+  reviewSettled?: Record<string, ReviewSettlement>
   estimate: UpgradeEstimate
   limits: { maxCalls?: number; maxTokens?: number }
   actual: { calls: number; tokens: number; unknownUsage: number }
@@ -62,7 +72,8 @@ export interface UpgradeOptions {
   estimateReview?: (step: UpgradeStep, root: string) => Promise<UpgradeEstimate & { maxInputTokens: number; maxOutputTokens: number }>
   inputLimitTokens?: number
   onStatus?: (status: UpgradeStatus) => void | Promise<void>
-  runStep?: (step: UpgradeStep, context: { root: string; runId: string; hooks: ExecutionHooks; replayOnly: boolean }) => Promise<AcceptedRef>
+  runStep?: (step: UpgradeStep, context: { root: string; runId: string; hooks: ExecutionHooks; replayOnly: boolean;
+    saveReviewSettlement?: (value: ReviewSettlement) => Promise<void> }) => Promise<UpgradeStepResult>
   signal?: AbortSignal
 }
 
@@ -251,6 +262,7 @@ async function upgradeTopic(root: string, versions: Awaited<ReturnType<typeof ma
   if (points.length !== expected.size || new Set(points.map(point => point.point_id)).size !== expected.size)
     throw protocolError('UPGRADE_ROOT_INCOMPLETE', '有效主题根的成员缺失或不唯一。')
   return { topicId: path.basename(page, '.md'), content: await readFile(await safePath(root, id), 'utf8'), points, contexts,
+    owners: owners.map(({ manifest, page }) => ({ manifest, page })),
     structure: undefined as TopicStructureEvidence | undefined }
 }
 async function upgradeTopicStructure(root: string, versions: Awaited<ReturnType<typeof manifests>>, id: string): Promise<TopicStructureEvidence | undefined> {
@@ -333,6 +345,83 @@ function assertReviewEvidence(value: { units: UpgradeUnitResult[] }, plans: Awai
       throw protocolError('UPGRADE_REVIEW_EVIDENCE_CHANGED', '升级主题核对证据已变化，原接受不适用于当前对象：' + id)
   }
 }
+const settledStep = (step: UpgradeStep, exclusions: Record<string, UpgradeReviewExclusion>, settlement?: ReviewSettlement) =>
+  Boolean(settlement && reviewUnitIds(step, exclusions).every(id => settlement.objects[id]))
+
+function reviewSettlementFor(state: UpgradeStatus | undefined, step: UpgradeStep, exclusions: Record<string, UpgradeReviewExclusion>): ReviewSettlement | undefined {
+  const direct = state?.reviewSettled?.[step.id]
+  if (direct || !step.reviewOrigin) return direct
+  const objects: ReviewSettlement['objects'] = {}, unitIds = reviewUnitIds(step, exclusions)
+  for (const [stepId, settlement] of Object.entries(state?.reviewSettled ?? {})) for (const id of unitIds) {
+    const saved = settlement.objects[id]
+    if (!saved || saved.identity.scope.unitId !== `${step.reviewOrigin.id}:object:${id}`) continue
+    const inherited = { ...saved, stepId: saved.stepId ?? stepId }
+    if (objects[id] && canonicalJson(objects[id]) !== canonicalJson(inherited))
+      throw protocolError('UPGRADE_CHECKPOINT_CORRUPT', '同一原对象存在冲突的逐对象终态。')
+    objects[id] = inherited
+  }
+  return Object.keys(objects).length ? { inputDigest: step.inputDigest, unitIds, objects } : undefined
+}
+
+async function pendingBindings(root: string, planned: Awaited<ReturnType<typeof upgradeReviewUnit>>, options: BuildLayeredOptions) {
+  if (planned.unit.kind !== 'topic') throw protocolError('UPGRADE_CHECKPOINT_CORRUPT', '提取核对不能旁路为旧主题待核实。')
+  const unit = planned.unit
+  return Promise.all(unit.owners.map(async ({ manifest, page }) => ({ version: manifest.version!, pagePath: page,
+    objectDigest: hash(unit.content), ...await pageReviewBinding(root, manifest, page),
+    reviewFingerprint: topicReviewFingerprint(unit.content, unit.points, layeredSettings(options.topics || {}, options.tier).contradictionReview, unit.contexts, unit.structure),
+    protocol: unit.structure ? topicStructureReviewVersion : topicReviewVersion, taskId: taskIdFor(planned.identity) })))
+}
+async function validateReviewSettlement(root: string, step: UpgradeStep, runId: string, settlement: ReviewSettlement | undefined,
+  plans: Awaited<ReturnType<typeof upgradeReviewUnit>>[], bindings: AcceptanceBindings, options: BuildLayeredOptions) {
+  if (!settlement) return
+  const corrupt = (message: string) => protocolError('UPGRADE_CHECKPOINT_CORRUPT', '旧主题逐对象检查点无效：' + message)
+  if (settlement.inputDigest !== step.inputDigest || canonicalJson(settlement.unitIds) !== canonicalJson(plans.map(plan => plan.id))
+    || !settlement.objects || Object.keys(settlement.objects).some(id => !plans.some(plan => plan.id === id))) throw corrupt('范围或输入摘要不符。')
+  for (const [id, saved] of Object.entries(settlement.objects)) {
+    const planned = plans.find(plan => plan.id === id)!
+    if (canonicalJson(saved.identity) !== canonicalJson(planned.identity)) throw corrupt('对象任务身份不符：' + id)
+    if (saved.outcome.kind === 'accepted') {
+      const accepted = await readAccepted(root, bindings, planned.identity, planned.valid)
+      if (!accepted || saved.outcome.ref.taskId !== taskIdFor(planned.identity)
+        || saved.outcome.ref.digest !== accepted.record.acceptedDigest
+        || saved.outcome.ref.path !== `work/accepted/tasks/${saved.outcome.ref.taskId.slice(2)}.json`) throw corrupt('对象接受引用不符。')
+      assertReviewEvidence({ units: [accepted.value] }, [planned], options)
+      continue
+    }
+    if (saved.outcome.kind !== 'pending' || planned.unit.kind !== 'topic') throw corrupt('对象终态无效。')
+    const expected = await pendingBindings(root, planned, options), records = saved.outcome.records
+    if (!Array.isArray(records) || records.length !== expected.length) throw corrupt('版本归属不完整。')
+    const sentences = [...topicSentences(planned.unit.content).map(({ id, text }) => ({ id, text })),
+      ...topicAliases(planned.unit.content).map((text, index) => ({ id: 'A' + index, text: '别名：' + text }))]
+    for (const binding of expected) {
+      const record = records.find(record => record.version === binding.version && record.pagePath === binding.pagePath)
+      if (!record || Object.entries(binding).some(([key, value]) => canonicalJson(record[key as keyof PendingTopicReview]) !== canonicalJson(value))
+        || record.status !== 'unverified' || record.reason !== 'semantic-rejection' || record.runId !== runId || record.stepId !== (saved.stepId ?? step.id)
+        || !Array.isArray(record.sentences) || record.sentences.length !== sentences.length
+        || record.sentences.some((sentence, index) => sentence.id !== sentences[index]!.id || sentence.text !== sentences[index]!.text
+          || !['完整支撑', '部分支撑', '不支撑'].includes(sentence.support) || typeof sentence.missing !== 'string'
+          || (sentence.support === '完整支撑' ? Boolean(sentence.missing.trim()) : !sentence.missing.trim()))
+        || !record.sentences.some(sentence => sentence.support !== '完整支撑') || !Array.isArray(record.attemptIds) || !record.attemptIds.length
+        || canonicalJson(record.attemptIds) !== canonicalJson(sortedUnique(record.attemptIds))) throw corrupt('旧对象、证据、句级范围或尝试绑定不符。')
+      for (const attemptId of record.attemptIds) {
+        const match = /^a:([a-f0-9-]{36}):([1-9]\d*)$/i.exec(attemptId)
+        if (!match || match[1] !== runId) throw corrupt('尝试不属于本轮。')
+        const entry = await readProtocol<AttemptEntry>(root, `logs/model-runs/${runId}/attempts/${match[2]}.json`, 'UPGRADE_CHECKPOINT_CORRUPT')
+        if (!entry || entry.request.attemptId !== attemptId || entry.request.runId !== runId || entry.request.stage !== step.stage
+          || entry.request.taskId !== saved.outcome.attemptTasks[attemptId] || entry.state !== 'finished'
+          || entry.outcome?.finish !== 'success' || entry.outcome.status !== 'finished') throw corrupt('尝试尚未成功结束或归属不符。')
+        if (entry.request.taskId !== record.taskId) {
+          const child = await bindings.hooks.readAcceptance(entry.request.taskId)
+          if (child.status !== 'bound' || child.record.identity.stage !== step.stage
+            || child.record.identity.validatorVersion !== 'topic-review-substep-v1'
+            || child.record.identity.semanticVersion !== record.protocol
+            || !child.record.identity.scope.unitId.startsWith(`topic:${planned.unit.topicId}:review-call:`)
+            || !child.acceptedAttemptIds.includes(attemptId)) throw corrupt('分块尝试未绑定本主题核对协议。')
+        }
+      }
+    }
+  }
+}
 
 /** 统计当前证据和窗口已确定的初轮包；后续合并、纠正和重试由实际账本累计。 */
 export function upgradeReviewEstimator(bind: (hooks?: ExecutionHooks) => AcceptanceBindings, options: BuildLayeredOptions): NonNullable<UpgradeOptions['estimateReview']> {
@@ -350,8 +439,11 @@ export function upgradeReviewEstimator(bind: (hooks?: ExecutionHooks) => Accepta
     const plans = await Promise.all(reviewUnitIds(step, exclusions).map(async id => selectUpgradeReviewUnit(root, versions,
       await upgradeReviewUnit(root, versions, sources, unitParent, id), bindings, options, saved?.value)))
     if (saved) { assertReviewEvidence(saved.value, plans, options); return estimate }
+    const state = await readUpgradeStatus(root), settlement = reviewSettlementFor(state, step, exclusions)
+    await validateReviewSettlement(root, step, state?.id ?? '', settlement, plans, bindings, options)
     const pending = []
     for (const planned of plans) {
+      if (settlement?.objects[planned.id]) continue
       const accepted = await readAccepted(root, bindings, planned.identity, planned.valid)
       if (accepted) assertReviewEvidence({ units: [accepted.value] }, [planned], options)
       else pending.push(planned.unit)
@@ -369,7 +461,7 @@ export function upgradeReviewEstimator(bind: (hooks?: ExecutionHooks) => Accepta
         if (requests.some(request => Buffer.byteLength(request.system + request.input) > Math.floor(inputLimit * settings.extractCeilingRatio)))
           throw protocolError('UPGRADE_INPUT_LIMIT', '完整证据超出候选输入窗口。')
       } else {
-        requests = topicReviewRequests(unit.topicId, unit.content, unit.points, { ...options, topics: { ...options.topics || {}, topicReview: true } }, inputLimit, unit.contexts, unit.structure)
+        requests = topicReviewRequests(unit.topicId, unit.content, unit.points, { ...options, topics: { ...options.topics || {}, topicReview: true } }, inputLimit, unit.contexts, unit.structure, true)
       }
       for (const request of requests) {
         if (request.acceptance && await readAccepted(root, bindings,
@@ -398,24 +490,58 @@ export function upgradeReviewRunner(bind: (hooks: ExecutionHooks) => AcceptanceB
     if (!activeStep || activeStep.id !== step.id) throw protocolError('UPGRADE_ROOT_CHANGED', '核对范围已变化，请重新进行升级预检。')
     const sources = reviewSources(versions, step)
     const exclusions = await reviewExclusions(context.root, versions, [step])
-    const bindings = bind(context.hooks)
+    let attemptTasks: Record<string, string> = {}
+    const completedAttempts = new Set<string>()
+    let observing = false
+    const bindings = bind({ ...context.hooks, beforeAttempt: async request => {
+      const reserved = await context.hooks.beforeAttempt(request)
+      if (reserved.status === 'reserved') attemptTasks[request.attemptId] = request.taskId
+      return reserved
+    }, afterAttempt: async outcome => {
+      await context.hooks.afterAttempt(outcome)
+      if (outcome.status === 'finished' && outcome.finish === 'success') completedAttempts.add(outcome.attemptId)
+    }, readAcceptance: async taskId => {
+      const snapshot = await context.hooks.readAcceptance(taskId)
+      if (observing && snapshot.status !== 'missing') for (const attemptId of snapshot.acceptedAttemptIds.filter(id => id.startsWith(`a:${context.runId}:`))) {
+        attemptTasks[attemptId] = taskId; completedAttempts.add(attemptId)
+      }
+      return snapshot
+    } })
     const identity = upgradeReviewIdentity(bindings, physical, step, sources)
     const unitParent = reviewUnitParent(step, identity)
     const previous = await readAccepted(context.root, bindings, identity, validReviewStep(step, exclusions))
     const plans = await Promise.all(reviewUnitIds(step, exclusions).map(async id => selectUpgradeReviewUnit(context.root, versions,
       await upgradeReviewUnit(context.root, versions, sources, unitParent, id), bindings, options, previous?.value)))
+    const settlement: ReviewSettlement = reviewSettlementFor(state, step, exclusions)
+      ?? { inputDigest: step.inputDigest, unitIds: plans.map(plan => plan.id), objects: {} }
+    await validateReviewSettlement(context.root, step, context.runId, settlement, plans, bindings, options)
+    const save = async (id: string, value: ReviewObjectOutcome) => {
+      settlement.objects[id] = value
+      if (context.saveReviewSettlement) await context.saveReviewSettlement(settlement)
+      else {
+        const current = await readUpgradeStatus(context.root)
+        if (!current || current.id !== context.runId) throw protocolError('UPGRADE_CHECKPOINT_CORRUPT', '缺少本轮升级检查点。')
+        ;(current.reviewSettled ??= {})[step.id] = settlement
+        await writeProtocol(context.root, checkpoint, current)
+      }
+    }
     const pending = { runId: context.runId, acceptedProtocol: 1 } as RecoveryPending
     return withRecovery(context.root, pending, { ...options, recovery: bindings, automaticRecovery: true, replayOnly: context.replayOnly }, async active => {
       const valid = validReviewStep(step, exclusions)
       if (previous) assertReviewEvidence(previous.value, plans, active)
       const recovered = previous ? await recoverAccepted(identity, valid) : undefined
-      const accepted = recovered ?? await executeAccepted(identity, async () => {
-        const units: UpgradeUnitResult[] = []
-        for (const [index, id] of reviewUnitIds(step, exclusions).entries()) {
-          const planned = plans[index]!
-          const saved = await recoverAccepted(planned.identity, planned.valid)
-          if (saved) assertReviewEvidence({ units: [saved.value] }, [planned], active)
-          const result = saved ?? await executeAccepted(planned.identity, async () => {
+      if (recovered) return recovered.acceptedRef
+      if (context.replayOnly) throw protocolError('ACCEPTED_MISSING', '离线回放缺少旧整组接受。')
+      const units: UpgradeUnitResult[] = [], refs: AcceptedRef[] = []
+      for (const planned of plans) {
+        const id = planned.id, closed = settlement.objects[id]
+        if (closed?.outcome.kind === 'pending') continue
+        attemptTasks = {}; completedAttempts.clear(); observing = true
+        const saved = await recoverAccepted(planned.identity, planned.valid)
+        if (saved) assertReviewEvidence({ units: [saved.value] }, [planned], active)
+        let semanticReview: import('./topic-review.js').TopicSemanticReview | undefined
+        // 对象核对处于独立接受作用域；拒绝响应不能进入之后的整组接受。
+        const result = saved ?? await executeAccepted(planned.identity, async () => {
             const unit = planned.unit
             if (unit.kind === 'extraction') {
               const inputLimit = (await bindings.stageInputBudgets(step.stage, { system: '', input: '' }))[0]!.inputLimitBytes
@@ -425,14 +551,32 @@ export function upgradeReviewRunner(bind: (hooks: ExecutionHooks) => AcceptanceB
               if (points.some(point => point.verification?.status !== 'verified')) throw protocolError('UPGRADE_REVIEW_PAUSED', '升级提取核对尚未全部通过。')
               return { id, result: points.map(point => ({ point_id: point.point_id, verification: point.verification })) }
             }
-            const reviewed = await reviewTopicContent(unit.topicId, unit.content, unit.points, { ...active, topics: { ...active.topics || {}, topicReview: true } }, undefined, false, unit.contexts, undefined, unit.structure)
+            const reviewed = await reviewTopicContent(unit.topicId, unit.content, unit.points, { ...active, topics: { ...active.topics || {}, topicReview: true } }, undefined, false, unit.contexts, undefined, unit.structure, true)
+            if (reviewed.incomplete) throw protocolError('UPGRADE_REVIEW_PAUSED', '升级主题核对尚未完成；旧正文保持。')
+            if (reviewed.semanticReview?.complete && reviewed.semanticReview.sentences.some(sentence => sentence.support !== '完整支撑')) {
+              semanticReview = reviewed.semanticReview
+              return { id, result: { semanticReview } }
+            }
             if (reviewed.failure || !reviewed.review || reviewed.review.removed.length || reviewed.content !== unit.content) throw protocolError('UPGRADE_REVIEW_PAUSED', '升级主题核对未通过；旧正文保持。')
             return { id, result: reviewed.review }
-          }, planned.valid)
-          units.push(result.value)
+        }, planned.valid)
+        observing = false
+        if (semanticReview) {
+          const attemptIds = sortedUnique([...completedAttempts])
+          if (!attemptIds.length) throw protocolError('UPGRADE_REVIEW_PAUSED', '语义拒绝缺少成功结束的模型尝试，旧页保持。')
+          const records: PendingTopicReview[] = (await pendingBindings(context.root, planned, active)).map(binding => ({ ...binding,
+            status: 'unverified', reason: 'semantic-rejection', runId: context.runId, stepId: step.id, attemptIds, sentences: semanticReview!.sentences }))
+          await save(id, { identity: planned.identity, stepId: step.id, outcome: { kind: 'pending', records,
+            attemptTasks: Object.fromEntries(attemptIds.map(attemptId => [attemptId, attemptTasks[attemptId]!])) } })
+        } else {
+          if (!result.acceptedRef) throw protocolError('ACCEPTED_MISSING', '升级对象核对未形成接受结果。')
+          units.push(result.value); refs.push(result.acceptedRef)
+          await save(id, { identity: planned.identity, stepId: step.id, outcome: { kind: 'accepted', ref: result.acceptedRef } })
         }
-        return { units }
-      }, valid)
+      }
+      await validateReviewSettlement(context.root, step, context.runId, settlement, plans, bindings, active)
+      if (Object.values(settlement.objects).some(value => value.outcome.kind === 'pending')) return { kind: 'settled' as const, settlement }
+      const accepted = await executeAccepted(identity, async () => ({ units }), valid, refs)
       if (!accepted.acceptedRef) throw protocolError('ACCEPTED_MISSING', '升级核对未形成可追溯的接受结果。')
       return accepted.acceptedRef
     }, false)
@@ -783,6 +927,10 @@ export async function upgradeLibrary(root: string, options: UpgradeOptions = {})
       for (const [id, previous] of Object.entries(currentState.reviewExclusions ?? {})) if (currentState.steps.some(step => step.unitIds.includes(id))
         && (!exclusions[id] || canonicalJson(previous) !== canonicalJson(exclusions[id]))) throw protocolError('UPGRADE_ROOT_CHANGED', '归档占位排除依据发生变化：' + id)
       if (Object.keys(exclusions).length) currentState.reviewExclusions = { ...currentState.reviewExclusions, ...exclusions }
+      for (const step of currentState.steps) {
+        const settlement = reviewSettlementFor(currentState, step, exclusions)
+        if (settlement) (currentState.reviewSettled ??= {})[step.id] = settlement
+      }
       currentState.estimate = totalEstimate(currentState.steps)
       await writeProtocol(root, checkpoint, currentState)
       // 新协议显式保存单元身份及输入摘要；接受提交早于升级检查点时精确恢复。
@@ -801,38 +949,58 @@ export async function upgradeLibrary(root: string, options: UpgradeOptions = {})
         if (bound.status !== 'bound') throw new Error('升级准备结果尚未恢复接受提交。')
         await hooks.onAccepted({ prepareId: bound.prepareId, taskId: bound.taskId, acceptedDigest: bound.acceptedDigest! })
         currentState.accepted[step.id] = { taskId: bound.taskId, path: `work/accepted/tasks/${bound.taskId.slice(2)}.json`, digest: bound.acceptedDigest! }
+        if (currentState.reviewSettled) delete currentState.reviewSettled[step.id]
       }
       for (const step of currentState.steps.filter(step => step.kind === 'review' && currentState.accepted[step.id])) {
         if (!options.runStep) throw protocolError('UPGRADE_STEP_UNBOUND', '升级核对接受结果需要业务校验。')
         const ref = await options.runStep(step, { root, runId: currentState.id, hooks, replayOnly: true })
-        if (canonicalJson(ref) !== canonicalJson(currentState.accepted[step.id])) throw protocolError('ACCEPT_CONFLICT', '升级核对接受引用不符。')
+        if ('kind' in ref || canonicalJson(ref) !== canonicalJson(currentState.accepted[step.id])) throw protocolError('ACCEPT_CONFLICT', '升级核对接受引用不符。')
       }
       await refreshReviewEstimates(root, currentState.steps, options, currentState.accepted)
       currentState.estimate = totalEstimate(currentState.steps)
       await writeProtocol(root, checkpoint, currentState)
       const localOnly = (step: UpgradeStep) => step.kind === 'review' && !reviewUnitIds(step, exclusions).length
-      const remaining = currentState.steps.filter(step => !currentState.accepted[step.id] && !localOnly(step))
+      const remaining = currentState.steps.filter(step => !currentState.accepted[step.id] && !localOnly(step) && !settledStep(step, exclusions, currentState.reviewSettled?.[step.id]))
       const remainingEstimate = totalEstimate(remaining)
       if (currentState.limits.maxCalls !== undefined && currentState.actual.calls + remainingEstimate.calls > currentState.limits.maxCalls
         || currentState.limits.maxTokens !== undefined && currentState.actual.tokens + remainingEstimate.inputTokens + remainingEstimate.outputTokens > currentState.limits.maxTokens) return report('paused', '初轮预计用量超过用户设置的升级上限。')
       for (const step of currentState.steps) {
         options.signal?.throwIfAborted()
-        if (currentState.accepted[step.id] || localOnly(step)) continue
+        if (currentState.accepted[step.id] || localOnly(step) || settledStep(step, exclusions, currentState.reviewSettled?.[step.id])) continue
         if (step.estimatedInputTokens > (options.inputLimitTokens ?? Infinity)) return report('paused', '完整证据超出候选输入窗口。')
         if (!options.runStep) return report('paused', '升级补齐执行器尚未提供，旧版本继续可读。')
         const stepHooks: ExecutionHooks = { ...hooks, beforeAttempt: async request => {
           if (request.runId !== currentState.id || request.stage !== step.stage) throw new Error('升级请求不属于预检步骤或累计预算。')
           return hooks.beforeAttempt(request)
         } }
-        const ref = await options.runStep(step, { root, runId: currentState.id, hooks: stepHooks, replayOnly: false })
+        const result = await options.runStep(step, { root, runId: currentState.id, hooks: stepHooks, replayOnly: false,
+          saveReviewSettlement: async value => {
+            ;(currentState.reviewSettled ??= {})[step.id] = structuredClone(value)
+            await writeProtocol(root, checkpoint, currentState)
+          } })
+        if ('kind' in result) {
+          if (step.kind !== 'review' || !settledStep(step, exclusions, result.settlement)) throw protocolError('UPGRADE_CHECKPOINT_CORRUPT', '逐对象补齐尚未全部闭合。')
+          ;(currentState.reviewSettled ??= {})[step.id] = result.settlement
+          await writeProtocol(root, checkpoint, currentState)
+          continue
+        }
+        const ref = result
         const prepared = await hooks.readAcceptance(ref.taskId)
         if (prepared.status !== 'bound' || prepared.acceptedDigest !== ref.digest) throw new Error('升级补齐尚未通过 IF-50/51 接受。')
         if (prepared.record.identity.scope.unitId !== step.id || prepared.record.identity.inputDigest !== step.inputDigest || prepared.record.identity.stage !== step.stage) throw new Error('补齐接受记录不属于预检单元。')
         currentState.accepted[step.id] = ref
+        if (currentState.reviewSettled) delete currentState.reviewSettled[step.id]
         await writeProtocol(root, checkpoint, currentState)
       }
       for (const { manifest, checksum } of await manifests(root)) {
         const provenance = await legacyProvenance(root, manifest, checksum)
+        for (const settlement of Object.values(currentState.reviewSettled ?? {})) for (const saved of Object.values(settlement.objects)) {
+          if (saved.outcome.kind !== 'pending') continue
+          for (const record of saved.outcome.records.filter(record => record.version === manifest.version)) {
+            if (manifest.pages?.[record.pagePath] !== record.objectDigest) throw protocolError('UPGRADE_ROOT_CHANGED', '待核实主题与保留版本不符。')
+            ;(provenance.pendingTopicReviews ??= {})[record.pagePath] = record
+          }
+        }
         for (const [id, exclusion] of Object.entries(exclusions)) {
           if (!Object.values(manifest.pages ?? {}).includes(exclusion.objectDigest)) continue
           const metadata = { target: id, fields: ['review-exclusion'], value: exclusion }
@@ -840,7 +1008,10 @@ export async function upgradeLibrary(root: string, options: UpgradeOptions = {})
             sourceRefs: [], status: 'local-derived' as const, productionIds: [], inheritedFrom: null, metadata }
           provenance.artifacts[artifactId(artifact)] = artifact
         }
-        for (const [stepId, ref] of Object.entries(currentState.accepted)) {
+        const completedRefs: [string, AcceptedRef][] = [...Object.entries(currentState.accepted),
+          ...Object.entries(currentState.reviewSettled ?? {}).flatMap(([stepId, settlement]) => Object.values(settlement.objects)
+            .flatMap(saved => saved.outcome.kind === 'accepted' ? [[stepId, saved.outcome.ref] as [string, AcceptedRef]] : []))]
+        for (const [stepId, ref] of completedRefs) {
           const step = currentState.steps.find(s => s.id === stepId)
           if (!step) continue
           const accepted = await hooks.readAcceptance(ref.taskId)
@@ -849,7 +1020,7 @@ export async function upgradeLibrary(root: string, options: UpgradeOptions = {})
           const raw = await readFile(await safePath(root, accepted.record.output.path))
           if (hash(raw) !== accepted.record.output.digest) throw new Error('升级补齐输出摘要不符。')
           const value = accepted.record.output.encoding === 'utf8-json' ? JSON.parse(raw.toString('utf8')) : raw.toString('utf8')
-          const targets = step.kind === 'review' ? (value as { units: UpgradeUnitResult[] }).units.map(unit => unit.id) : step.unitIds
+          const targets = step.kind === 'review' ? ((value as { units?: UpgradeUnitResult[] }).units ?? [value as UpgradeUnitResult]).map(unit => unit.id) : step.unitIds
           const metadata = { target: targets.join(','), fields: [step.kind], value }
           const artifact = { kind: 'metadata' as const, objectPath: null, objectDigest: protocolDigest(metadata), pagePath: null,
             sourceRefs: sortedUnique(accepted.record.identity.scope.sourceRefs), status: 'recorded' as const, productionIds: sortedUnique(Object.keys(accepted.record.productions)), inheritedFrom: null, metadata }

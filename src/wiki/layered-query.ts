@@ -10,7 +10,7 @@ import type { IndexRow } from '../storage/jobs.js'
 import { cachedPointVectors, centroid, normalized, similarity } from '../layered/embedding.js'
 import { createEmbeddingClient } from '../layered/cloud-embedding.js'
 import { embeddingReadiness, embeddingTimedOut, type EmbeddingReadiness } from '../layered/embedding-readiness.js'
-import type { EmbeddingClient, LibraryCard, EmbeddingIdentity, Point } from '../layered/schema.js'
+import type { EmbeddingClient, LibraryCard, EmbeddingIdentity, PendingTopicReview, Point } from '../layered/schema.js'
 import { validSourceId, withLayeredRead } from '../layered/revocations.js'
 import { withStateLayout } from '../storage/paths.js'
 import { SiyuanAdapter, validateSiyuanRoot, WikiExportClient } from '../layered/siyuan.js'
@@ -31,6 +31,7 @@ export interface PageReadOptions extends LayeredReadOptions { offset?: number | 
 export interface SourceReadOptions extends PageReadOptions { sourceVersion?: string | undefined; maxChars?: number | undefined }
 interface IndexedPage extends WikiPage {
   warning?: string
+  pendingReview?: PendingTopicReview
   id: string; sources: string[]; sourceVersions: { sourceId: string; sourceVersion: string }[]
   sourceDate: string; sourceType: string; credibility: string; version: string; currentVersion: string; vector: number[]
   pointVectors: number[][]; vectorIds: string[]; pointVectorIds: string[]
@@ -67,12 +68,13 @@ export function paginate(result: LayeredReadResult, maxChars: number, offset = 0
 }
 function pageValue(library: LibraryRegistration, view: LayeredReadView, relative: string, raw: string): IndexedPage {
   const { header, content } = pageMetadata(raw, relative), sources = (view.deps.pages[relative] ?? view.deps.pages[relative.split('#')[0]!])?.sources ?? []
+  const pendingReview = view.pendingReview(relative)
   const type = relative === 'index.md' ? 'navigation' : relative.includes('#') ? relative.startsWith('sources/') ? 'source' : 'term'
     : header.page_type === 'index' && relative.startsWith('terms/index-') ? 'term-index' : text(header.page_type)
   if (!['source', 'topic', 'term', 'term-index', 'navigation'].includes(type)) throw new PageMetadataError(relative)
   return { library: library.name, path: relative, type: type as IndexedPage['type'], id: text(header.id), title: text(header.title) || /^#\s+(.+)$/m.exec(content)?.[1] || relative,
     aliases: strings(header.aliases), tags: strings(header.tags), updated: text(header.updated), content, summary: stripBlockIds(content).replace(/^#+\s*/gm, '').replace(/\s+/g, ' ').trim().slice(0, 240),
-    hash: signature(raw), links: [], sources, ...(view.warning ? { warning: view.warning } : {}), sourceVersions: sources.map(sourceId => ({ sourceId, sourceVersion: view.manifest.sources.find(source => source.source_id === sourceId)?.source_version ?? '' })),
+    hash: signature(raw), links: [], sources, ...(pendingReview ? { pendingReview } : {}), ...(view.warning ? { warning: view.warning } : {}), sourceVersions: sources.map(sourceId => ({ sourceId, sourceVersion: view.manifest.sources.find(source => source.source_id === sourceId)?.source_version ?? '' })),
     sourceDate: text(header.source_date), sourceType: text(header.source_type), credibility: text(header.credibility), version: view.version, currentVersion: view.current.version, vector: [], pointVectors: [], vectorIds: [], pointVectorIds: [] }
 }
 // 向量记录对象由已校验对象缓存按文件元数据复用，内容不可变；同一记录的归一化结果跟随记录对象复用，记录被淘汰或文件变化时一并失效。
@@ -356,7 +358,8 @@ export class LayeredQuery {
       const result = await view.document(relative)
       const page = result.status === 'ok' ? pageValue(library, view, result.path!, result.content) : undefined
       return { library: library.name, path: result.path!, type: page?.type ?? 'updating', title: page?.title ?? '更新中', aliases: page?.aliases ?? [], tags: page?.tags ?? [],
-        ...(page ? { updated: page.updated, sources: page.sources, sourceVersions: page.sourceVersions, sourceDate: page.sourceDate, sourceType: page.sourceType, credibility: page.credibility } : {}),
+        ...(page ? { updated: page.updated, sources: page.sources, sourceVersions: page.sourceVersions, sourceDate: page.sourceDate, sourceType: page.sourceType, credibility: page.credibility,
+          ...(page.pendingReview ? { pendingReview: page.pendingReview } : {}) } : {}),
         currentVersion: view.current.version, ...paginate(result, maxChars, options.offset) }
     })
   }

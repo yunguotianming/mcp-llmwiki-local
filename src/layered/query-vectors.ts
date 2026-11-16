@@ -19,7 +19,7 @@ import { identityKey, probeIdentity, selection } from './vector-identity.js'
 import { clusteringVersion } from './clustering.js'
 import { buildConfiguration } from './build-configuration.js'
 import type { EmbeddingClient } from './schema.js'
-import { artifactId, isProductionFormat, readProvenance, writeProvenance } from './models.js'
+import { artifactId, inheritPendingTopicReviews, isProductionFormat, readProvenance, writeProvenance } from './models.js'
 import { readVersionCosts, writeVersionCosts } from './costs.js'
 import { storageJson } from './vectors.js'
 
@@ -109,6 +109,9 @@ export async function copyWithEmbedding(source: string, target: CopyEmbeddingTar
       if (production) {
         for (const artifact of Object.values(production.artifacts)) artifact.inheritedFrom = { version: previous, artifactId: artifactId(artifact), productionIds: artifact.productionIds }
         production.version = manifest.version; production.manifestChecksum = hash(storageJson(manifest))
+        const pendingReviews = await inheritPendingTopicReviews(targetRoot, production, manifest)
+        if (pendingReviews) production.pendingTopicReviews = pendingReviews
+        else delete production.pendingTopicReviews
         await writeProvenance(targetRoot, production)
         await writeVersionCosts(targetRoot, manifest.version, production.manifestChecksum, [], costs!)
       }

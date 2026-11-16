@@ -28,9 +28,9 @@ async function snapshot(root: string, files?: string[]) {
 async function fixture() {
   const f = await legacyFixture('0.2.1'), source = f.manifest.sources[0]!
   const text = await readFile(path.join(f.root, source.files.source), 'utf8')
-  const segment = { locator: 'L1-L1', start: 0, end: text.length, text_hash: source.content_hash }
+  const segment = { locator: 'L1-L1', start: 0, end: text.length, text_hash: hash(text) }
   source.segments = [segment]
-  const point: Point = { point_id: source.source_id + ':P1', text: '护理证据' + '成员条件'.repeat(500), text_hash: hash('成员'), section: '主要发现',
+  const point: Point = { point_id: source.source_id + ':P1', text: '护理证据' + '成员条件'.repeat(500), text_hash: segment.text_hash, section: '主要发现',
     locator: 'L1-L1', source_version: source.source_version,
     evidence: [{ source_id: source.source_id, source_version: source.source_version, locator: 'L1-L1', quote: text }],
     verification: { status: 'verified', missing: '', fingerprint: '历史已核对' } }
