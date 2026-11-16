@@ -65,7 +65,7 @@ it('主题漏项纠正仍缺失时保留正常句与未完成句，标记协议�
 it('主题分块核对漏项只纠正相应句，已完成句继续合并且未知成员短编号拒收', async () => {
   const f = reviewFixture(), members = Array.from({ length: 4 }, (_, index) => ({ ...point('完整事实。'.repeat(150)), point_id: 'S-0001:sha256:' + index,
     evidence: [{ source_id: 'S-0001', source_version: 'v1', locator: 'L4-L4', quote: '完整引文。'.repeat(150) }] }))
-  f.options.topics = { topicReviewInputBudget: 7000 }
+  f.options.topics = { topicReviewInputBudget: 8000 }
   const body = '# 标题\n## 条件\n- 正常句。[证据](a.md)\n- 漏项句。[证据](a.md)', requests: any[] = []
   f.call.mockImplementation(async (_task, _system, raw) => {
     const d = JSON.parse(raw); requests.push(d)

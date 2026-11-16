@@ -32,7 +32,7 @@ export function reviewFixture(points = [point()]) {
   const text = '远处甲\n前二\n前一\n结果提高。\n后一\n后二\n远处乙'
   const segment = { locator: 'L1-L7', start: 0, end: text.length, text_hash: hash(text) }
   const metadata = { title: '测试', source_type: '资料', credibility: 'low' as const, credibility_reason: '测试', source_date: '2026-11-09', source_date_basis: '原文日期' as const }
-  const source = { path: 'a.md', bytes: Buffer.from(text), text, contentHash: hash(text), metadata, segments: [segment] }
+  const source = { path: 'a.md', bytes: Buffer.from(text), text, contentHash: hash(text), sourceVersion: 'v1', metadata, segments: [segment] }
   const extraction: Extraction = { format_version: 1, source_id: 'S-0001', source_hash: source.contentHash, processing, metadata, calls: [], segments: [{ ...segment, resource_hashes: [], processing_fingerprint: '', points, terms: [] }] }
   const call = vi.fn(async (_task: any, _system: string, input: string) => JSON.stringify(output(JSON.parse(input))))
   const options: BuildLayeredOptions = { knowledgeRoot: '', tier: 50, client: { call: call as any, info: vi.fn(async () => ({ provider: 'mock', id: 'extractor', name: '核对模型', context: { contextWindow: 131072 } })) as any }, topics: {} }

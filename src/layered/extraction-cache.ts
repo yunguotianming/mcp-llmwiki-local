@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { sections } from './schema.js'
 import type { Extraction } from './schema.js'
 import { abortable } from '../llm/client.js'
@@ -9,6 +10,8 @@ import { safePath } from '../storage/paths.js'
 import { resolveLibraryRoot } from '../storage/library-root.js'
 import type { BuildLayeredOptions } from './schema.js'
 import type { LayeredModelTask } from '../domain/config.js'
+import { executeAccepted, makeTaskIdentity, recoverAccepted, recoveryContext, taskIdFor } from './accepted.js'
+import type { AcceptedRef, AcceptedTaskSpec, RecoveryStage } from './accepted.js'
 
 const inFlight = new Map<string, { controller: AbortController; promise: Promise<unknown>; subscribers: number }>()
 // 同键并发合并为一次；订阅者单独取消，最后一个离开才取消底层调用。
@@ -46,15 +49,39 @@ export async function shareExtraction<T>(key: string, signal: AbortSignal | unde
 }
 
 export const taskReceiptProtocol = 'validated-tasks-v1'
+export const taskCallContext = new AsyncLocalStorage<{ receipt_key: string | null; invalidation_reason?: string }>()
+export async function recoveryTask<T>(options: BuildLayeredOptions, operation: RecoveryStage, identity: unknown,
+  work: (signal: AbortSignal) => Promise<T>, valid: (value: T) => boolean, spec: AcceptedTaskSpec): Promise<{ value: T; reused: boolean; acceptedRef?: AcceptedRef }> {
+  if (!recoveryContext()) return { value: await work(options.signal ?? new AbortController().signal), reused: false }
+  return validatedTask(options, operation, identity, work, valid, spec)
+}
 // 回执只保存调用方已完成全部业务校验的结果；请求身份只落摘要，模型配置不会写入缓存。
-export async function validatedTask<T>(options: BuildLayeredOptions, operation: LayeredModelTask, identity: unknown,
-  work: (signal: AbortSignal) => Promise<T>, valid: (value: T) => boolean): Promise<{ value: T; reused: boolean }> {
-  if (!path.isAbsolute(options.knowledgeRoot)) return { value: await work(options.signal ?? new AbortController().signal), reused: false }
+export async function validatedTask<T>(options: BuildLayeredOptions, operation: LayeredModelTask | RecoveryStage, identity: unknown,
+  work: (signal: AbortSignal) => Promise<T>, valid: (value: T) => boolean, spec?: AcceptedTaskSpec): Promise<{ value: T; reused: boolean; acceptedRef?: AcceptedRef }> {
+  const execute = (signal: AbortSignal, receipt_key: string | null) => taskCallContext.run({ receipt_key,
+    ...(options.invalidationReason ? { invalidation_reason: options.invalidationReason } : {}) }, () => work(signal))
+  const recovery = recoveryContext()
+  if (recovery && spec) {
+    const task = await makeTaskIdentity(operation as RecoveryStage, spec), taskId = taskIdFor(task)
+    return shareExtraction(recovery.root + '\0accepted\0' + taskId, options.signal, async signal => {
+      const checked = (value: T) => { try { return valid(value) } catch { return false } }
+      const saved = await recoverAccepted<T>(task, checked)
+      const result = saved ?? await executeAccepted(task, () => execute(signal, taskId), checked, spec.dependencies)
+      if (result.acceptedRef) {
+        ;(recovery.pending.acceptedRefs ??= {})[spec.unitId] = result.acceptedRef
+        if (recovery.persist) await writeJson(recovery.root, 'work/pending.json', recovery.pending)
+      }
+      return result
+    })
+  }
+  // 核对等旧子调用由外层业务接受任务承接，不提前解析旧模型目录。
+  if (recovery) return { value: await execute(options.signal ?? new AbortController().signal, null), reused: false }
+  if (!path.isAbsolute(options.knowledgeRoot)) return { value: await execute(options.signal ?? new AbortController().signal, null), reused: false }
   const root = options.siyuan ? options.knowledgeRoot : await resolveLibraryRoot(options.knowledgeRoot, options.wikiPath,
     options.topics === false ? { embeddingMode: 'none' } : options.topics ?? {})
   const generation = async () => (await readOptional<{ generation: number }>(await safePath(root, 'state/revocations.json')))?.generation ?? 0
   const epoch = await generation()
-  const model = await options.client.info('ingest', options.signal, undefined, operation)
+  const model = await options.client.info('ingest', options.signal, undefined, operation as LayeredModelTask)
   const key = hash(JSON.stringify([taskReceiptProtocol, operation, model, options.taskModelIdentity, options.promptVersion,
     options.tier, options.topics, options.previewContext, epoch, identity]))
   const file = 'cache/tasks/' + hashName(key) + '.json'
@@ -66,7 +93,7 @@ export async function validatedTask<T>(options: BuildLayeredOptions, operation: 
     const checked = (value: T) => { try { return valid(value) } catch { return false } }
     if (stored?.key === key && hash(JSON.stringify(stored.value)) === stored.digest && checked(stored.value) && await generation() === epoch) return { value: stored.value, reused: true }
     signal.throwIfAborted()
-    const result = await work(signal)
+    const result = await execute(signal, key)
     signal.throwIfAborted()
     if (checked(result)) await withRevocationLock(root, async () => {
       signal.throwIfAborted()

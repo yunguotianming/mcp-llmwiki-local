@@ -12,7 +12,7 @@ vi.mock('node:fs/promises', async original => ({ ...await original<typeof import
 beforeEach(() => vi.stubGlobal('fetch', () => { throw new Error('离线回归禁止网络请求') }))
 afterEach(() => { cleanupLayeredFixtures(); vi.unstubAllGlobals() })
 
-it('B11 升级：真实 v0.1.1 已发布库未变增量零调用且版本不变', async () => {
+it('B11 升级：真实 v0.1.1 已发布库只补一次证据核对，不重提且续跑零调用', async () => {
   const baseline = JSON.parse(await readFile(new URL('./fixtures/v011-published.json', import.meta.url), 'utf8'))
   expect(baseline.commit).toBe('b22dec2')
   const f = await layeredFixture()
@@ -25,11 +25,20 @@ it('B11 升级：真实 v0.1.1 已发布库未变增量零调用且版本不变'
   f.options.topics = false
   f.options.client.info = async () => ({ provider: 'mock', id: 'review', name: '测试模型', context: { contextWindow: 128000 } })
   const before = await snapshotManifest(f.root)
+  const oldExtractionBytes = await readFile(path.join(f.root, before.sources[0]!.extract.path))
+  const claims = (value: any) => value.segments.flatMap((segment: any) => segment.points.map(({ point_id, text, section, source_version, evidence }: any) => ({ point_id, text, section, source_version, evidence })))
   f.options.name = before.card.name; f.options.domain = before.card.domain
   const result = await buildLayeredLibrary(f.options)
-  expect(f.call, '未变升级不得重提或重核对').not.toHaveBeenCalled()
-  expect(result).toMatchObject({ unchanged: true, version: before.version, modelCalls: 0 })
-  expect((await snapshotManifest(f.root)).version).toBe(before.version)
+  expect(f.call).toHaveBeenCalledTimes(1)
+  expect(JSON.parse(f.call.mock.calls[0]![2]).review_stage).toBe('extraction')
+  expect(result).toMatchObject({ unchanged: false, modelCalls: 1 })
+  const after = await snapshotManifest(f.root)
+  expect(await readFile(path.join(f.root, before.sources[0]!.extract.path))).toEqual(oldExtractionBytes)
+  expect(claims(JSON.parse(await readFile(path.join(f.root, after.sources[0]!.extract.path), 'utf8')))).toEqual(claims(JSON.parse(oldExtractionBytes.toString())))
+  expect(after.sources[0]!.pending_topic_points).toEqual(before.sources[0]!.pending_topic_points)
+  f.call.mockClear()
+  expect(await buildLayeredLibrary(f.options)).toMatchObject({ unchanged: true, version: result.version, modelCalls: 0 })
+  expect(f.call).not.toHaveBeenCalled()
 })
 
 it.each([

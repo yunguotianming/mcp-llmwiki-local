@@ -38,11 +38,11 @@ const untrustedReviewOutput = z.object({ items: z.array(correctionItem) })
 schemaJSON(untrustedReviewOutput, 'layered_support_review_envelope')
 const supportCorrectionPrompt = jsonProtocol(explanationRule + '完整支撑时 missing 填 null。' + '你是资料提取纠正器。只补充每项 evidence，并返回 id、support、missing；主张 text、section、paragraph_id 由程序保留。不能改主张。只引用该项 paragraphs 中逐字原文，可以跨段分别补证；保留旧证据，新增有内容的证据跨度，同一行也可补充。仍不能完整支撑则如实标注。' + evidenceContextRule + attributionRule, schemaJSON(correctionSchema))
 
-// 协议内容随模块加载确定，所有要点共用其摘要，主张和引文仍各自参与核对身份。
-const reviewPromptDigestFor = (legacyRequestOrder = false) => hash(JSON.stringify(['support-v2-content-hash', ...(legacyRequestOrder ? ['rules-before-source-v1'] : []), jsonProtocol(extractionReviewPrompt, schemaJSON(reviewOutput)),
+// 证据绑定协议同时进入篇级策略和接受任务身份，旧缺维度回执不能视为新协议通过。
+const reviewPromptDigestFor = (legacyRequestOrder = false) => hash(JSON.stringify(['support-v2-content-hash', 'source-evidence-context-v1', ...(legacyRequestOrder ? ['rules-before-source-v1'] : []), jsonProtocol(extractionReviewPrompt, schemaJSON(reviewOutput)),
   jsonProtocol(topicReviewPrompt, schemaJSON(reviewOutput)), supportCorrectionPrompt,
   schemaJSON(reviewOutput), schemaJSON(correctionSchema), schemaJSON(untrustedReviewOutput)]))
-// 语义身份不含请求组织标记；兼容已发布的早期 v0.2.0 核对回执。
+// 请求组织可兼容，但两种顺序都必须遵守当前证据绑定协议。
 const reviewPromptDigest = reviewPromptDigestFor(), orderedReviewPromptDigest = reviewPromptDigestFor(true)
 export function reviewPromptHash(): string { return reviewPromptDigest }
 
@@ -69,24 +69,29 @@ export function overviewLimits(options: BuildLayeredOptions) {
   return { chinese: settings.sourceOverviewChineseChars, english: settings.sourceOverviewEnglishWords }
 }
 export function reviewFingerprint(point: Point, legacyRequestOrder = false): string {
-  return hash(JSON.stringify([legacyRequestOrder ? orderedReviewPromptDigest : reviewPromptHash(), point.text, point.section, point.evidence.map(item => item.quote)]))
+  return hash(JSON.stringify([legacyRequestOrder ? orderedReviewPromptDigest : reviewPromptHash(), point.text, point.section, point.locator, point.source_version,
+    point.evidence.map(item => [item.source_id, item.source_version, item.locator, item.quote])]))
 }
 export function reviewNeedsRetry(extraction: Extraction): boolean {
-  return (extraction.correction_batches?.semantic ?? 0) < 2 && extraction.segments.some(segment => segment.points.some(point => point.verification?.missing.startsWith('核对未完成：')
-    && !point.verification.retry_attempted))
+  return extraction.segments.some(segment => segment.points.some(point => point.verification?.missing.startsWith('核对证据无效：')
+    || (extraction.correction_batches?.semantic ?? 0) < 2 && point.verification?.missing.startsWith('核对未完成：') && !point.verification.retry_attempted))
+}
+export function sourceReviewNeedsRetry(extraction: Extraction): boolean {
+  return reviewNeedsRetry(extraction) || extraction.segments.some(segment => segment.points.some(point => !point.verification
+    || point.verification.status === 'unverified' && (extraction.correction_batches?.semantic ?? 0) < 2))
 }
 const fatal = (error: unknown, options: BuildLayeredOptions) => {
   options.signal?.throwIfAborted()
   if (error instanceof Error && error.name === 'AbortError') throw error
-  if (error && typeof error === 'object' && ('budgetPause' in error || 'code' in error && ['EIO', 'ENOSPC', 'EACCES', 'EPERM', 'ENOENT'].includes(String(error.code)))) throw error
+  if (error && typeof error === 'object' && ('budgetPause' in error || 'stagePause' in error || 'storageFailure' in error || 'code' in error && ['EIO', 'ENOSPC', 'EACCES', 'EPERM', 'ENOENT'].includes(String(error.code)))) throw error
 }
 
 // 每篇先合并为一批；仅在核对输入超出实际上下文预算时分批，原文只传各引文前后两行。
 export async function reviewExtraction(extraction: Extraction, source: LocalSource, options: BuildLayeredOptions, inputLimit: number, checkpoint: () => Promise<void> = async () => {}): Promise<number> {
   let executed = false
   // 回执会回填整份对象，元数据和摘要等非段落内容也必须参与身份。
-  const receipt = await validatedTask(options, 'extract', { stage: 'support-review', protocol: reviewPromptHash(), source,
-    extraction_hash: hash(JSON.stringify(extraction, null, 2) + '\n'), inputLimit }, async signal => {
+  const receipt = await validatedTask(options, 'extractionReview', { stage: 'support-review', protocol: reviewPromptHash(), source,
+    extraction_hash: hash(JSON.stringify(extraction, null, 2) + '\n'), inputLimit, retrySources: options.retrySources ?? null }, async signal => {
     executed = true
     const calls = await reviewExtractionOnce(extraction, source, { ...options, signal }, inputLimit, checkpoint)
     return { extraction, calls }
@@ -96,50 +101,57 @@ export async function reviewExtraction(extraction: Extraction, source: LocalSour
   return executed ? receipt.value.calls : 0
 }
 
-async function reviewExtractionOnce(extraction: Extraction, source: LocalSource, options: BuildLayeredOptions, inputLimit: number, checkpoint: () => Promise<void>): Promise<number> {
-  const settings = layeredSettings(options.topics || {}, options.tier), policy = reviewPolicy(options)
+function extractionReviewPlan(extraction: Extraction, source: LocalSource, options: BuildLayeredOptions, inputLimit: number) {
+  const settings = layeredSettings(options.topics || {}, options.tier)
   const requestLimit = Math.floor(inputLimit * settings.extractCeilingRatio)
-  extraction.overview_limits = overviewLimits(options)
   const points = extraction.segments.flatMap(segment => segment.points)
-  const syncGaps = () => {
-    extraction.gaps = (extraction.gaps ?? []).filter(gap => gap.kind !== 'unverified_claim')
-    for (const segment of extraction.segments) for (const point of segment.points) if (point.verification?.status === 'unverified') {
-      extraction.gaps.push({ kind: 'unverified_claim', segment_hashes: [segment.text_hash],
-        item: { source_id: extraction.source_id, point_id: point.point_id, reason: point.verification.missing },
-        reasons: [{ rule: 'semantic-support', expected: '引文完整支撑主张', actual: point.verification.missing }] })
+  const selected = points.filter(point => (!options.retrySources || point.verification?.status !== 'verified')
+    && (settings.extractionReview === 'all' || settings.extractionReview === 'key' && ['主要发现', '方法'].includes(point.section)))
+  const lines = source.text.split(/\r?\n/), sourceVersion = source.sourceVersion ?? source.contentHash
+  const parts = source.segments.map((segment, paragraph_id) => ({ ...segment, paragraph_id, text: source.text.slice(segment.start, segment.end) }))
+  // 声明摘要不能替代实际正文；段界也决定引文归属及可见邻文。每篇只计算一次正文摘要。
+  const sourceFingerprint = hash(JSON.stringify([extraction.source_id, source.sourceId, sourceVersion, source.contentHash, hash(source.text),
+    source.segments.map(segment => [segment.locator, segment.start, segment.end])]))
+  const fingerprint = (point: Point, legacyRequestOrder = false) => hash(JSON.stringify([reviewFingerprint(point, legacyRequestOrder), sourceFingerprint]))
+  const contexts = new Map<Point, { range: string; text: string }[]>()
+  const invalid = new Map<Point, string>()
+  for (const point of selected) {
+    try {
+      if (source.sourceId && source.sourceId !== extraction.source_id || extraction.source_hash !== source.contentHash)
+        throw new Error('提取对象与实际来源身份或正文版本不一致。')
+      if (point.source_version !== sourceVersion || !point.evidence.length) throw new Error('要点版本不属于当前来源，或缺少引文。')
+      contexts.set(point, point.evidence.map(evidence => {
+        if (evidence.source_id !== extraction.source_id || evidence.source_version !== sourceVersion) throw new Error('引文来源身份或版本不属于当前来源。')
+        const owner = evidenceParagraph(parts, evidence), segment = owner && parts[owner.paragraph_id]
+        if (!segment || !evidence.quote.trim() || segment.start < 0 || segment.end > source.text.length || segment.start > segment.end)
+          throw new Error('引文无法唯一定位到当前来源的原文段。')
+        const block = evidence.locator.startsWith('block:')
+        const [first, last] = block ? [1, segment.text.split(/\r?\n/).length] : locatorRange(evidence.locator)
+        const body = block ? segment.text : lines.slice(first - 1, last).join('\n')
+        const match = matchQuotation(body, evidence.quote)
+        if (!match || !block && last > lines.length) throw new Error('引文不逐字匹配指定定位的原文。')
+        const start = first - 1 + (body.slice(0, match.start).match(/\n/g) ?? []).length
+        const end = start + (match.quote.match(/\n/g) ?? []).length
+        const contextLines = block ? segment.text.split(/\r?\n/) : lines
+        const from = Math.max(0, start - 2), to = Math.min(contextLines.length, end + 3)
+        return { range: block ? segment.locator + ':' + from + ':' + to : 'lines:' + from + ':' + to, text: contextLines.slice(from, to).join('\n') }
+      }))
+    } catch (error) {
+      invalid.set(point, '核对证据无效：' + String(error))
     }
   }
-  const selected = points.filter(point => settings.extractionReview === 'all' || settings.extractionReview === 'key' && ['主要发现', '方法'].includes(point.section))
-  if (settings.extractionReview === 'off') { syncGaps(); extraction.review_policy = policy; return 0 }
   const retry = (point: Point) => point.verification?.missing.startsWith('核对未完成：') && !point.verification.retry_attempted
-  const fresh = selected.filter(point => ![reviewFingerprint(point), reviewFingerprint(point, true)].includes(point.verification?.fingerprint ?? '') || retry(point))
+  const fresh = selected.filter(point => !invalid.has(point) && (![fingerprint(point), fingerprint(point, true)].includes(point.verification?.fingerprint ?? '') || retry(point)))
   const references = localReferences(selected.map(point => point.point_id))
-  const lines = source.text.split(/\r?\n/)
-  const sourceVersion = source.sourceVersion ?? source.contentHash
   const inputPoint = (point: Point, table: ReturnType<typeof reviewContextTable>) => ({ id: references.alias(point.point_id), text: point.text, section: point.section,
     ...(absenceClaim(point.text)
-      ? { source_context_ref: table.reference(extraction.source_id, sourceVersion, 'full', separateImages(source.text).text) } : {}), evidence: point.evidence.map(evidence => {
-    const segment = source.segments.find(segment => segment.locator.startsWith('block:') ? segment.locator === evidence.locator
-      : locatorRange(segment.locator)[0] <= locatorRange(evidence.locator)[0] && locatorRange(segment.locator)[1] >= locatorRange(evidence.locator)[1])!
-    const context = evidence.locator.startsWith('block:') ? (() => {
-      const body = source.text.slice(segment.start, segment.end), match = matchQuotation(body, evidence.quote)
-      const start = (body.slice(0, match?.start ?? 0).match(/\n/g) ?? []).length
-      const end = start + ((match?.quote ?? evidence.quote).match(/\n/g) ?? []).length
-      const from = Math.max(0, start - 2), to = Math.min(body.split(/\r?\n/).length, end + 3)
-      return { range: segment.locator + ':' + from + ':' + to, text: body.split(/\r?\n/).slice(from, to).join('\n') }
-    })() : (() => {
-      const [first, last] = locatorRange(evidence.locator), body = lines.slice(first - 1, last).join('\n')
-      const match = matchQuotation(body, evidence.quote)
-      const start = first - 1 + (body.slice(0, match?.start ?? 0).match(/\n/g) ?? []).length
-      const end = start + ((match?.quote ?? evidence.quote).match(/\n/g) ?? []).length
-      const from = Math.max(0, start - 2), to = Math.min(lines.length, end + 3)
-      return { range: 'lines:' + from + ':' + to, text: lines.slice(from, to).join('\n') }
-    })()
+      ? { source_context_ref: table.reference(extraction.source_id, sourceVersion, 'full', separateImages(source.text).text) } : {}), evidence: point.evidence.map((evidence, index) => {
+    const context = contexts.get(point)![index]!
     return { quote: evidence.quote, locator: evidence.locator,
       context_ref: table.reference(evidence.source_id, evidence.source_version, context.range,
         /data:image\//i.test(context.text) ? separateImages(context.text).text : context.text) }
   }) })
-  // 这是无损传输编码，保持语义核对身份，升级不使已发布要点重新提取。
+  // 这是无损传输编码；证据绑定变化只使旧结果补核，不改变提取身份。
   const reviewPrompt = jsonProtocol(extractionReviewPrompt + 'contexts 是来源版本及范围标识的原文表；context_ref 引用邻文，source_context_ref 引用全文 source_context。核对每项时完整展开对应原文，不得遗漏。', schemaJSON(reviewOutput))
   const request = (batch: Point[]) => {
     const table = reviewContextTable(), points = batch.map(point => inputPoint(point, table))
@@ -162,6 +174,42 @@ async function reviewExtractionOnce(extraction: Extraction, source: LocalSource,
     if (!batches.length || Boolean(retry(batches.at(-1)![0]!)) !== Boolean(retry(point)) || requestBytes([...batches.at(-1)!, point]) > requestLimit) batches.push([])
     batches.at(-1)!.push(point)
   }
+  return { selected, lines, parts, sourceVersion, invalid, fingerprint, fresh, retry, references, requestLimit, request, batches }
+}
+
+/** 初核制包与执行共用；只读证据和核对状态，不接受结果或派发请求。 */
+export function extractionReviewRequests(extraction: Extraction, source: LocalSource, options: BuildLayeredOptions, inputLimit: number) {
+  if (layeredSettings(options.topics || {}, options.tier).extractionReview === 'off') return []
+  const plan = extractionReviewPlan(extraction, source, options, inputLimit)
+  return plan.batches.filter(batch => !batch.some(plan.retry) || (extraction.correction_batches?.semantic ?? 0) < 2)
+    .map(batch => { const request = plan.request(batch); return { system: request.prompt, input: request.input } })
+}
+
+async function reviewExtractionOnce(extraction: Extraction, source: LocalSource, options: BuildLayeredOptions, inputLimit: number, checkpoint: () => Promise<void>): Promise<number> {
+  const settings = layeredSettings(options.topics || {}, options.tier), policy = reviewPolicy(options)
+  extraction.overview_limits = overviewLimits(options)
+  const syncGaps = () => {
+    extraction.gaps = (extraction.gaps ?? []).filter(gap => gap.kind !== 'unverified_claim')
+    for (const segment of extraction.segments) for (const point of segment.points) if (point.verification?.status === 'unverified') {
+      extraction.gaps.push({ kind: 'unverified_claim', segment_hashes: [segment.text_hash],
+        item: { source_id: extraction.source_id, point_id: point.point_id, reason: point.verification.missing },
+        reasons: [{ rule: 'semantic-support', expected: '引文完整支撑主张', actual: point.verification.missing }] })
+    }
+  }
+  if (settings.extractionReview === 'off') { syncGaps(); extraction.review_policy = policy; return 0 }
+  let plan = extractionReviewPlan(extraction, source, options, inputLimit)
+  for (const [point, missing] of plan.invalid) point.verification = { status: 'unverified', missing, fingerprint: plan.fingerprint(point) }
+  if (plan.invalid.size) await checkpoint()
+  // 提取核对独立按本阶段模型制包；旧客户端没有预算接口时沿用传入上限。
+  if (plan.fresh.length && options.client.inputBudget) {
+    const reviewLimit = await options.client.inputBudget('ingest', options.signal, 'extractionReview', 0)
+    if (reviewLimit !== undefined) {
+      if (!Number.isFinite(reviewLimit) || reviewLimit <= 0) throw Object.assign(new Error('extractionReview 阶段没有可用输入预算，已暂停。'), { stagePause: true })
+      inputLimit = Math.min(reviewLimit, settings.extractMaxInputBytes, options.maxInputBytes ?? Infinity)
+      plan = extractionReviewPlan(extraction, source, options, inputLimit)
+    }
+  }
+  const { selected, lines, parts, sourceVersion, invalid, fingerprint, retry, references, requestLimit, request, batches } = plan
   let count = 0
   const signal = options.signal ?? new AbortController().signal
   // 并发调用仍按批序号记录，落盘与成本顺序不受完成先后影响。
@@ -174,7 +222,7 @@ async function reviewExtractionOnce(extraction: Extraction, source: LocalSource,
     const usage = modelUsage(options.client)
     let raw: string
     try {
-      raw = await usage.client.call('ingest', prompt, input, activeSignal, [], { operation: 'extract', structuredSchemaKind: 'review', structuredSchema: { name: 'layered_support_review', schema: schemaJSON(schema) } })
+      raw = await usage.client.call('ingest', prompt, input, activeSignal, [], { operation: 'extractionReview', structuredSchemaKind: 'review', structuredSchema: { name: 'layered_support_review', schema: schemaJSON(schema) } })
     } finally {
       extraction.models = mergeModels(extraction.models, usage.models)
     }
@@ -198,7 +246,7 @@ async function reviewExtractionOnce(extraction: Extraction, source: LocalSource,
       const verdicts = checkedVerdicts(response.raw, batch.map(point => references.alias(point.point_id)), true)
       for (const point of batch) {
         const result = verdicts.find(item => item.id === references.alias(point.point_id))!
-        point.verification = { status: result.support === '完整支撑' ? 'verified' : 'unverified', missing: result.missing, fingerprint: reviewFingerprint(point), models: mergeModels(models) }
+        point.verification = { status: result.support === '完整支撑' ? 'verified' : 'unverified', missing: result.missing, fingerprint: fingerprint(point), models: mergeModels(models) }
       }
     } catch (error) {
       if (retries.length && (activeSignal.aborted || error && typeof error === 'object' && 'budgetPause' in error)) {
@@ -207,19 +255,18 @@ async function reviewExtractionOnce(extraction: Extraction, source: LocalSource,
         await checkpoint()
       }
       fatal(error, { ...options, signal: activeSignal })
-      for (const point of batch) point.verification = { status: 'unverified', missing: '核对未完成：' + String(error), fingerprint: reviewFingerprint(point),
+      for (const point of batch) point.verification = { status: 'unverified', missing: '核对未完成：' + String(error), fingerprint: fingerprint(point),
         models: mergeModels(models), ...(retries.includes(point) ? { retry_attempted: true } : {}) }
     }
     await checkpoint()
   })
-  const parts = source.segments.map((segment, paragraph_id) => ({ ...segment, paragraph_id, text: source.text.slice(segment.start, segment.end) }))
   const correctionPrompt = supportCorrectionPrompt
   const attempts = extraction.correction_attempts ??= {}
-  const pending = selected.filter(point => point.verification?.status === 'unverified' && !point.verification.missing.startsWith('核对未完成：'))
+  const pending = selected.filter(point => !invalid.has(point) && point.verification?.status === 'unverified' && !point.verification.missing.startsWith('核对未完成：'))
     .map(point => {
-      const fingerprint = hash(JSON.stringify(['semantic', reviewPromptHash(), extraction.source_hash, point.point_id, point.text, point.section]))
+      const correctionFingerprint = hash(JSON.stringify(['semantic', fingerprint(point), point.point_id]))
       const paragraphs = correctionContext(parts, { evidence: point.evidence })
-      return { point, fingerprint, paragraphs }
+      return { point, fingerprint: correctionFingerprint, paragraphs }
     }).filter(item => !attempts[item.fingerprint]?.semantic && item.paragraphs.length)
   const correctionRequest = (batch: typeof pending) => JSON.stringify({ review_stage: 'extraction-correction', source_id: extraction.source_id,
     items: batch.map(({ point, paragraphs }) => ({ id: references.alias(point.point_id),
@@ -276,7 +323,7 @@ async function reviewExtractionOnce(extraction: Extraction, source: LocalSource,
           point.evidence = located.map(item => item.evidence); point.locator = point.evidence[0]!.locator
           const models = mergeModels(point.verification?.models, response.models)
           point.models = mergeModels(point.models, response.models)
-          point.verification = { status: 'verified', missing: '', fingerprint: reviewFingerprint(point), models }
+          point.verification = { status: 'verified', missing: '', fingerprint: fingerprint(point), models }
         } catch (error) { fatal(error, options) }
       }
     } catch (error) {

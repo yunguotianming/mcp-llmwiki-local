@@ -13,7 +13,7 @@ const response: typeof fetch = async (_url, init) => new Response(JSON.stringify
   embeddings: (JSON.parse(String(init!.body)).input as string[]).map(() => [1, 0]),
 }))
 
-it('重试用尽才暂停且指针不变，成功批次持久化，续跑提取零调用并只补失败批次', async () => {
+it('熔断超时才暂停且指针不变，成功批次持久化，续跑提取零调用并只补失败批次', async () => {
   const f = await layeredIncrementalFixture()
   await writeFile(path.join(f.knowledgeRoot, 'a.md'), '甲组旧证据。')
   await buildLayeredLibrary(f.options)
@@ -27,7 +27,8 @@ it('重试用尽才暂停且指针不变，成功批次持久化，续跑提取�
   f.options.topics = settings; f.options.embeddingClient = new OllamaEmbeddingClient(settings, request)
   vi.spyOn(f.options.embeddingClient, 'identity').mockResolvedValue('fixture-weights-v1')
   f.topicRequests.length = 0
-  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+  vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] })
+  vi.spyOn(console, 'warn').mockImplementation(() => {})
   let settled = false
   const running = buildLayeredLibrary(f.options).then(() => undefined, error => error).finally(() => { settled = true })
   await failed.promise
@@ -36,8 +37,12 @@ it('重试用尽才暂停且指针不变，成功批次持久化，续跑提取�
   await vi.advanceTimersByTimeAsync(3999); expect(request).toHaveBeenCalledTimes(3); expect(settled).toBe(false)
   expect(await readFile(currentPath, 'utf8')).toBe(current)
   await vi.advanceTimersByTimeAsync(1)
+  expect(settled).toBe(false)
+  await vi.advanceTimersByTimeAsync(8000)
+  expect(request).toHaveBeenCalledTimes(5); expect(settled).toBe(false)
+  await vi.advanceTimersByTimeAsync(600000)
   expect(await running).toMatchObject({ message: '本地向量模型不可用，主题聚类已暂停。' })
-  expect(request).toHaveBeenCalledTimes(4); expect(f.topicRequests).toHaveLength(0)
+  expect(request.mock.calls.length).toBeGreaterThan(5); expect(f.topicRequests).toHaveLength(0)
   expect(await readFile(currentPath, 'utf8')).toBe(current)
   const cache = JSON.parse(await readFile(path.join(f.root, 'state/embeddings.json'), 'utf8'))
   expect(Object.keys(cache.vectors)).toHaveLength(2)

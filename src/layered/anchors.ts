@@ -22,6 +22,7 @@ export const sectionBlockId = (id: string): string => id.replace(/[^a-zA-Z0-9-]/
 // 同一版本号只在来源导航保存一次；正文、定位、证据链接均逐字保留。
 export function compactCitationVersions(content: string): string {
   if (!content.includes('## 来源导航\n')) return content
+  content = expandCitationVersions(content).replace(/^- 来源版本：[^\n]+\n?/gm, '')
   const bySource = new Map<string, Set<string>>()
   for (const match of content.matchAll(/\[((?:S-\d+|\d{14}-[a-z0-9]{7}))@([^\]#]+)#/g)) {
     const versions = bySource.get(match[1]!) ?? new Set<string>(); versions.add(match[2]!); bySource.set(match[1]!, versions)
@@ -49,6 +50,23 @@ export function expandCitationVersions(content: string): string {
       if (!version) throw new Error('主题引用缺少来源版本映射。')
       return `[${source}@${version}#${locator}]${link}`
     })
+}
+
+// 检查点缺失映射时，只按本页成员的来源、块锚点和定位恢复；不能用来源当前版本猜测。
+export function restoreCitationVersions(content: string, members: Point[], anchors = evidenceBlockIds(members)): string {
+  const mapped = new Set([...content.matchAll(/^- 来源版本：((?:S-\d+|\d{14}-[a-z0-9]{7}))@[^\n]+$/gm)].map(match => match[1]!))
+  const byAnchor = new Map(members.flatMap(point => (anchors.get(point.point_id) ?? [])
+    .map(anchor => [point.point_id.split(':')[0] + '#^' + anchor, point] as const)))
+  const restored = content.replace(/\[((?:S-\d+|\d{14}-[a-z0-9]{7}))#(L\d+-L\d+|block:\d{14}-[a-z0-9]{7})\]\(([^\n)]+)\)/g,
+    (citation, source: string, locator: string, link: string) => {
+      if (mapped.has(source)) return citation
+      const target = /^(?:\.\.\/)+sources\/([^/]+)\.md#(\^[a-zA-Z0-9-]+)$/.exec(link)
+      const point = target?.[1] === source ? byAnchor.get(source + '#' + target[2]) : undefined
+      const versions = new Set(point?.evidence.filter(item => item.source_id === source && item.locator === locator).map(item => item.source_version))
+      if (versions.size !== 1) throw new Error('主题引用缺少可唯一恢复的成员证据。')
+      return `[${source}@${[...versions][0]}#${locator}](${link})`
+    })
+  return expandCitationVersions(restored)
 }
 
 export function readBlock(content: string, anchor: string): string | undefined {

@@ -89,7 +89,7 @@ describe('Obsidian 设置执行语义补齐', () => {
       await f.put('concepts/a.md', '# 测试方法\n\n方法的适用条件是虚构场景。')
       await f.policy({ maxConversationHistory: 2, queryInstructions: '先给简短结论', wikiLanguage: 'zh-CN' })
       let input = '', system = ''
-      const model = runtime(options => { input = JSON.stringify(options.messages); system = String(options.system); return '{"answer":"适用于虚构场景 [1]","citations":[1]}' })
+      const model = runtime(options => { input = JSON.stringify(options.messages); system = String(options.system); return '{"units":[{"block":"paragraph","text":"适用于虚构场景","citationIds":[1]}]}' })
       const result = await askWiki(f.store, f.library.id, '测试方法', [{ question: '旧问题', answer: '旧答案' }, { question: '新问题', answer: '新答案' }], model)
       expect(result.historyUsed).toBe(1); expect(input).not.toContain('旧问题'); expect(input).toContain('新问题')
       expect(system).toContain('先给简短结论'); expect(system).toContain('zh-CN')
@@ -103,11 +103,11 @@ describe('Obsidian 设置执行语义补齐', () => {
     const f = await fixture()
     try {
       let calls = 0
-      const model = runtime(() => { calls++; return '{"answer":"编造 [9]","citations":[9]}' })
+      const model = runtime(() => { calls++; return '{"units":[{"block":"paragraph","text":"编造","citationIds":[9]}]}' })
       expect((await askWiki(f.store, f.library.id, '没有证据', [], model)).citations).toEqual([]); expect(calls).toBe(0)
       await f.put('concepts/a.md', '# 测试方法\n\n测试依据。')
       await expect(askWiki(f.store, f.library.id, '测试方法', [], model)).rejects.toThrow(); expect(calls).toBe(2)
-      const changed = runtime(async () => { await f.put('concepts/a.md', '# 测试方法\n\n已变更。'); return '{"answer":"测试 [1]","citations":[1]}' })
+      const changed = runtime(async () => { await f.put('concepts/a.md', '# 测试方法\n\n已变更。'); return '{"units":[{"block":"paragraph","text":"测试","citationIds":[1]}]}' })
       await expect(askWiki(f.store, f.library.id, '测试方法', [], changed)).rejects.toThrow('已变化')
     } finally { await f.cleanup() }
   })

@@ -1,5 +1,9 @@
+import { buildModelsSchema } from './route-schema.js'
+import type { BuildModels } from './route-schema.js'
 export interface LibraryPolicy {
   version: 1
+  libraryFormat?: '0.3.0' | undefined
+  buildModels?: BuildModels | undefined
   wikiLanguage: string
   useCustomWikiLanguage: boolean
   concurrencyLimit: number
@@ -56,6 +60,11 @@ export function defaultPolicy(): LibraryPolicy {
 }
 export function validatePolicy(policy: LibraryPolicy): string[] {
   const errors: string[] = []
+  if (policy.libraryFormat !== undefined && policy.libraryFormat !== '0.3.0') errors.push('libraryFormat 必须为 0.3.0。')
+  if (policy.buildModels !== undefined) {
+    const result = buildModelsSchema.safeParse(policy.buildModels)
+    if (!result.success) errors.push(...result.error.issues.map(issue => `buildModels.${issue.path.join('.')}: ${issue.message}`))
+  }
   const integer = (key: keyof LibraryPolicy, min: number, max: number) => {
     const value = policy[key]
     if (typeof value !== 'number' || !Number.isInteger(value) || value < min || value > max) errors.push(`${key} 应为 ${min}～${max} 的整数。`)
@@ -82,7 +91,7 @@ export function resetAdvanced(policy: LibraryPolicy): LibraryPolicy {
     extractionTemperature: defaults.extractionTemperature, chatTemperature: defaults.chatTemperature, reasoningEffort: '' }
 }
 export function processingPolicy(policy:LibraryPolicy) {
-  const {concurrencyLimit:_limit,analysisConcurrency:_sources,pageGenerationConcurrency:_calls,batchDelayMs:_delay,contextWindowTokens,...processing}=policy
+  const {libraryFormat:_format,buildModels:_models,concurrencyLimit:_limit,analysisConcurrency:_sources,pageGenerationConcurrency:_calls,batchDelayMs:_delay,contextWindowTokens,...processing}=policy
   // 自动模式沿用旧处理签名，旧作业和提取缓存可继续核验。
   return contextWindowTokens ? {...processing,contextWindowTokens} : processing
 }

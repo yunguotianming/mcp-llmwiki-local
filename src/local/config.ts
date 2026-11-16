@@ -45,6 +45,12 @@ export class LocalConfigStore {
     return this.snapshot()
   }
   snapshot(): LocalConfig { return structuredClone(this.value) }
+  secrets(): string[] {
+    const registry = this.value?.registry
+    return [...Object.values(registry?.compatibleProviders ?? {}), registry?.embeddingService]
+      .flatMap(config => [config?.apiKey, config?.apiKeyEnv ? process.env[config.apiKeyEnv] : undefined])
+      .filter((value): value is string => !!value?.trim()).map(value => value.trim())
+  }
   registry = (): Registry => this.snapshot().registry
   writeRegistry: RegistryWriter = async (next, expected) => {
     const lock = path.join(this.home, 'config.lock')

@@ -133,6 +133,10 @@ export class LibraryStore {
     const library = this.registration(id)
     if (library.mode === 'shared') await this.sharedCompatibility(library, await actualPath(library.wikiPath), true)
     const root = await this.root(id, true)
+    // 默认资料目录取 Wiki 父目录（D-64）；新库先建出 Wiki 目录，父目录随之存在，再校验来源边界。
+    // 显式填写但不存在的资料目录仍在校验中报错。
+    const implicit = library.sourceRoots.length === 1 && path.resolve(library.sourceRoots[0]!) === path.dirname(path.resolve(library.wikiPath))
+    if (implicit) await mkdir(root, { recursive: true })
     await validateRoots(root, library.sourceRoots)
     await mkdir(root, { recursive: true })
     if ((library.kind === 'local' || library.kind === 'siyuan') && !await isLayeredRoot(root)) await initializeStateLayout(root)
@@ -157,7 +161,13 @@ export class LibraryStore {
     }
     let metadata: Metadata | undefined
     try { metadata = await this.metadata(root, id) }
-    catch (error) { if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error }
+    catch (error) {
+      if (error instanceof Error && 'code' in error && error.code === 'ENOENT') { /* 未初始化 */ }
+      // 只读接入不使用随库策略；身份不符只提示，不阻断查询和其他库的设置。
+      else if (!isWritable(library)) return { policy: defaultPolicy(), revision: '', initialized: false, writable: false,
+        message: '只读接入，查询不受影响。库目录记录的身份与本登记不一致，如需改为生成维护，请移除登记后用“登记已有 Wiki”重新登记该目录。' }
+      else throw error
+    }
     if (!metadata) return { policy: defaultPolicy(), revision: '', initialized: false, writable: false,
       message: sharedMessage ?? (isWritable(library) ? '尚未初始化随库状态。初始化只创建状态区，不生成 Wiki 页面。' : '只读接入，不在原库创建状态区。') }
     const file = await safePath(root, '.llmwiki/policy.json')

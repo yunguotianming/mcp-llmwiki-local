@@ -2,7 +2,6 @@ import { pageRelevance, searchConfidence } from './relevance.js'
 import { readVectorRecord, vectorUnavailable } from '../layered/vectors.js'
 import { hasVectorMode, identityKey, libraryVectorState, lockedEmbeddingSettings, queryInput, recordIdentity, sameIdentity } from '../layered/vector-identity.js'
 import path from 'node:path'
-import { parse } from 'yaml'
 import { layeredSettings } from '../domain/config.js'
 import type { LibraryRegistration } from '../domain/config.js'
 import { signature } from '../storage/files.js'
@@ -19,12 +18,13 @@ import type { LayeredReadOptions, LayeredReadResult, LayeredReadView } from '../
 import { terms } from './identity-search.js'
 import type { WikiPage } from './query.js'
 import { excerpts, fuseRanks, stripBlockIds } from './page-search.js'
-import type { PageExcerpt, SearchNotice, SearchOptions } from './page-search.js'
+import type { EvidenceSegment, PageExcerpt, SearchNotice, SearchOptions } from './page-search.js'
 import { browsePages } from './browse.js'
 import type { BrowseOptions } from './browse.js'
 import { readExtraction } from '../layered/publication.js'
 import { evidenceBlockIds } from '../layered/anchors.js'
 import type { PointMatch } from './page-search.js'
+import { PageMetadataError, pageMetadata } from './page-metadata.js'
 
 export interface LayeredLibrary { root: string; card: Omit<LibraryCard, 'origin_type'> & { origin_type: 'local' | 'siyuan' } }
 export interface PageReadOptions extends LayeredReadOptions { offset?: number | undefined }
@@ -35,7 +35,7 @@ interface IndexedPage extends WikiPage {
   sourceDate: string; sourceType: string; credibility: string; version: string; currentVersion: string; vector: number[]
   pointVectors: number[][]; vectorIds: string[]; pointVectorIds: string[]
 }
-export type LayeredSearchHit = Omit<IndexedPage, 'content' | 'hash' | 'links' | 'vector' | 'pointVectors' | 'vectorIds' | 'pointVectorIds'> & { score: number; relevance: number; snippet: string; anchor: string; page_ref: string; topic_path: string; score_channels: Record<string, number>; excerpts: PageExcerpt[]; status: 'ok'; retrieval: 'fts' | 'vector' | 'hybrid' }
+export type LayeredSearchHit = Omit<IndexedPage, 'content' | 'hash' | 'links' | 'vector' | 'pointVectors' | 'vectorIds' | 'pointVectorIds'> & { score: number; relevance: number; snippet: string; snippetSegments: EvidenceSegment[]; anchor: string; page_ref: string; topic_path: string; score_channels: Record<string, number>; excerpts: PageExcerpt[]; status: 'ok'; retrieval: 'fts' | 'vector' | 'hybrid' }
 export type SearchDegradation = SearchNotice
 type StoredPage = Pick<IndexedPage, 'path' | 'hash' | 'title' | 'type' | 'aliases' | 'id' | 'vectorIds' | 'pointVectorIds'> & { topic_path: string }
 function storedPage(page: IndexedPage): StoredPage {
@@ -66,11 +66,10 @@ export function paginate(result: LayeredReadResult, maxChars: number, offset = 0
   return { ...result, content: result.content.slice(offset, end), truncated: end < result.content.length, next_offset: end < result.content.length ? end : null }
 }
 function pageValue(library: LibraryRegistration, view: LayeredReadView, relative: string, raw: string): IndexedPage {
-  const match = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(raw), header = match ? parse(match[1]!) as Record<string, unknown> : {}
-  const content = match ? raw.slice(match[0].length) : raw, sources = (view.deps.pages[relative] ?? view.deps.pages[relative.split('#')[0]!])?.sources ?? []
+  const { header, content } = pageMetadata(raw, relative), sources = (view.deps.pages[relative] ?? view.deps.pages[relative.split('#')[0]!])?.sources ?? []
   const type = relative === 'index.md' ? 'navigation' : relative.includes('#') ? relative.startsWith('sources/') ? 'source' : 'term'
     : header.page_type === 'index' && relative.startsWith('terms/index-') ? 'term-index' : text(header.page_type)
-  if (!['source', 'topic', 'term', 'term-index', 'navigation'].includes(type)) throw new Error('分层页面类型无效：' + relative)
+  if (!['source', 'topic', 'term', 'term-index', 'navigation'].includes(type)) throw new PageMetadataError(relative)
   return { library: library.name, path: relative, type: type as IndexedPage['type'], id: text(header.id), title: text(header.title) || /^#\s+(.+)$/m.exec(content)?.[1] || relative,
     aliases: strings(header.aliases), tags: strings(header.tags), updated: text(header.updated), content, summary: stripBlockIds(content).replace(/^#+\s*/gm, '').replace(/\s+/g, ' ').trim().slice(0, 240),
     hash: signature(raw), links: [], sources, ...(view.warning ? { warning: view.warning } : {}), sourceVersions: sources.map(sourceId => ({ sourceId, sourceVersion: view.manifest.sources.find(source => source.source_id === sourceId)?.source_version ?? '' })),
@@ -192,6 +191,17 @@ export class LayeredQuery {
       const rows = await layeredIndex<{ path: string; stamp: string; data: string }[]>(layered.root, 'index-read', {}, view.version, view.generation)
       // 单次读取视图内复用已校验的 Markdown；跨次查询仍必须重新回读并核对哈希。
       const documents = new Map<string, IndexedPage>()
+      const invalidMetadata = new Set<string>()
+      const readablePage = (relative: string, content: string) => {
+        try { return pageValue(library, view, relative, content) }
+        catch (error) {
+          if (!(error instanceof PageMetadataError)) throw error
+          if (!invalidMetadata.has(relative)) notices.push({ library: library.name, stage: 'index', reason: 'page-metadata-invalid',
+            message: error.message + '；本次跳过该页，格式错误不代表内容无依据，其他来源及原文仍可读取。' })
+          invalidMetadata.add(relative)
+          return undefined
+        }
+      }
       let pages: IndexedPage[]
       if (rows.length && rows.every(row => row.stamp === stamp)) pages = rows.map(row => ({ ...JSON.parse(row.data), content: '', vector: undefined, pointVectors: undefined }) as IndexedPage)
       else {
@@ -200,7 +210,8 @@ export class LayeredQuery {
           signal?.throwIfAborted()
           const result = await view.document(relative)
           if (result.status !== 'ok') continue
-          const page = pageValue(library, view, relative, result.content), dependency = view.deps.pages[relative]!
+          const page = readablePage(relative, result.content), dependency = view.deps.pages[relative]!
+          if (!page) continue
           documents.set(relative, page)
           const pointIds = dependency.points.flatMap(point => pointReference(point.point_id) ? [pointReference(point.point_id)!] : [])
           const derived = vectorState?.page_vectors?.[relative]
@@ -211,7 +222,7 @@ export class LayeredQuery {
         }
         const tokenize = (value: string) => [...terms(value)].join(' ')
         // 索引只存页面和向量引用，服务离线不改变它；冲突仍强制重建，并保留可解析的代次。
-        const storedStamp = view.conflicts.size ? JSON.stringify([...JSON.parse(stamp), 'conflicts']) : stamp
+        const storedStamp = view.conflicts.size || invalidMetadata.size ? JSON.stringify([...JSON.parse(stamp), view.conflicts.size ? 'conflicts' : 'metadata-invalid']) : stamp
         const updates: IndexRow[] = pages.map(page => ({ path: page.path, stamp: storedStamp, data: JSON.stringify(storedPage(page)), title: tokenize(page.title), aliases: tokenize(page.aliases.join(' ')), identity: tokenize(page.id + ' ' + storedPage(page).topic_path), body: tokenize(stripBlockIds(page.content)) }))
         await layeredIndex(layered.root, 'index-save', { pages: updates, removed: rows.filter(row => !pages.some(page => page.path === row.path)).map(row => row.path) }, view.version, view.generation)
       }
@@ -276,7 +287,8 @@ export class LayeredQuery {
         if (!currentPage) {
           const result = await view.document(page.path)
           if (result.status !== 'ok') continue
-          currentPage = pageValue(library, view, page.path, result.content)
+          currentPage = readablePage(page.path, result.content)
+          if (!currentPage) continue
         }
         if (currentPage.hash !== page.hash) {
           stale = true; notices.push({ library: library.name, stage: 'index', reason: 'stale-index', message: '页面索引哈希已过期，已跳过；下次查询前重建：' + page.path }); continue
@@ -291,7 +303,7 @@ export class LayeredQuery {
         const { content, hash: _hash, links: _links, vector: _vector, pointVectors: _pointVectors, vectorIds: _vectorIds, pointVectorIds: _pointVectorIds, ...value } = currentPage
         // 短片段同样从命中窗口取文；900 字节与原三百汉字的容量相当。
         const block = excerpts(currentPage, queries, 900, matches)[0], snippet = block?.content ?? ''
-        results.push({ ...value, relevance: pageRelevance(query, { ...value, snippet }), ...scores.get(page.path)!, page_ref: page.path, topic_path: storedPage(page).topic_path, anchor: block?.anchor ?? '', snippet, excerpts: [], status: 'ok', retrieval: lexical.has(page.path) ? vectors.has(page.path) ? 'hybrid' : 'fts' : 'vector' })
+        results.push({ ...value, relevance: pageRelevance(query, { ...value, snippet }), ...scores.get(page.path)!, page_ref: page.path, topic_path: storedPage(page).topic_path, anchor: block?.anchor ?? '', snippet, snippetSegments: block?.segments ?? [], excerpts: [], status: 'ok', retrieval: lexical.has(page.path) ? vectors.has(page.path) ? 'hybrid' : 'fts' : 'vector' })
       }
       if (stale) await layeredIndex(layered.root, 'index-save', { removed: pages.map(page => page.path) }, view.version, view.generation)
       results.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path))
@@ -320,7 +332,9 @@ export class LayeredQuery {
       else for (const candidate of Object.keys(view.deps.pages).filter(page => !page.includes('#'))) {
         const result = await view.document(candidate)
         if (result.status !== 'ok') continue
-        const page = pageValue(library, view, candidate, result.content)
+        let page: IndexedPage
+        try { page = pageValue(library, view, candidate, result.content) }
+        catch (error) { if (error instanceof PageMetadataError) continue; throw error }
         if ([page.id, page.title, path.posix.basename(candidate), ...page.aliases].some(value => normalize(value) === normalize(ref))) { relative = candidate; break }
       }
       if (!relative) return undefined

@@ -5,13 +5,23 @@ import type { LibraryPolicy } from '../domain/policy.js'
 import { CallGate, modelGate, providerGate } from './scheduler.js'
 import { jsonProtocol, registerStructuredSchema, strictSchema } from './protocol.js'
 import { contextWindowLimit, topicInputBudget } from './context.js'
+import { callDetailed } from './detailed-client.js'
+import type { DetailedCallOptions, ResponseMetadata } from './detailed-client.js'
+import type { CallDetailedResult } from './execution.js'
+export type { DetailedCallOptions } from './detailed-client.js'
+export type { CallDetailedResult, DetailedExecution, DetailedAttempt } from './execution.js'
 export type ModelRuntime = Pick<LlmRuntime, 'resolveModelInfo' | 'stream'> & {
+  resolveBuildModel?: import('../domain/stage-policy.js').ResolveCandidateModel
   supportsStructuredOutput?: (provider: string, model: string) => boolean
   supportsCacheMode?: (provider: string, model: string) => boolean
+  responseMetadata?: (event: import('@deepseek-ai/dsh-llm').StreamChunk) => ResponseMetadata | undefined
 }
-export interface ModelCallOptions { operation?: LayeredModelTask; reasoningEffort?: string; structuredSchema?: { name: string; schema: unknown }; structuredSchemaKind?: 'extraction' | 'correction' | 'review' | 'summary' | 'topic' | 'term' | 'tag' | 'query'; beforeAttempt?: () => void; onAttempt?: (attempt: ModelAttempt) => void }
+export interface ModelCallOptions { operation?: LayeredModelTask; reasoningEffort?: string; structuredSchema?: { name: string; schema: unknown }; structuredSchemaKind?: 'extraction' | 'correction' | 'review' | 'summary' | 'topic' | 'term' | 'tag' | 'query'; beforeAttempt?: () => void; onAttempt?: (attempt: ModelAttempt) => void
+  /** 旧路由保持原调度，在实际派发边界等待持久化回调。 */
+  lifecycle?: { dispatch(attempt: ModelAttempt, info: LlmResolvedModelInfo, options: GenerateOptions): Promise<void>; settled(attempt: ModelAttempt): Promise<void> }
+}
 export interface ModelFailureOutput { rawOutput: string; diagnostics?: string; outputPath?: string }
-export interface ModelAttempt { route: ModelRef; startedAt: string; durationMs: number; queuedAt?: string; queueMs?: number; executionMs?: number; inputBytes?: number; outputBytes?: number; firstTextMs?: number; finish: string; usage?: TokenUsage; estimatedInputTokens?: number; structuredSchemaKind?: ModelCallOptions['structuredSchemaKind']; error?: string; status?: number; failure?: ModelFailureOutput }
+export interface ModelAttempt { route: ModelRef; startedAt: string; durationMs: number; queuedAt?: string; queueMs?: number; executionMs?: number; inputBytes?: number; outputBytes?: number; firstTextMs?: number; finish: string; usage?: TokenUsage; estimatedInputTokens?: number; structuredSchemaKind?: ModelCallOptions['structuredSchemaKind']; error?: string; status?: number; reportedModel?: string; requestId?: string; failure?: ModelFailureOutput }
 export class ModelCallError extends Error {
   constructor(message: string, readonly code: string, readonly status?: number, readonly failure?: ModelFailureOutput) { super(message) }
 }
@@ -120,7 +130,12 @@ export class ModelClient {
     return context === undefined ? undefined : safetyRatio === 0.1
       ? topicInputBudget(context, output) : Math.max(0, context - output - Math.ceil(context * safetyRatio))
   }
+  async callDetailed(_task: Task, system: string, input: string, signal: AbortSignal | undefined, images: ImageBlock[], options: DetailedCallOptions): Promise<CallDetailedResult> {
+    const backoffs = Object.fromEntries(options.execution.stagePlan.candidates.map(candidate => [candidate.provider, providerProfile(this.library.models, candidate.provider).backoffMs]))
+    return callDetailed(this.runtime, this.library.id, this.policy, system, input, signal, images, options, undefined, backoffs)
+  }
   concurrency(): number { return this.policy.pageGenerationConcurrency }
+  legacyConfiguration() { return { library: this.library, policy: this.policy } }
   private async perform(task: Task, system: string, input: string, signal?: AbortSignal, images:ImageBlock[]=[], callOptions: ModelCallOptions = {}): Promise<string> {
     const primary = callOptions.operation ? resolveLayeredModel(this.library.models, callOptions.operation) : resolveModel(this.library.models,task)
     if (!primary.provider || !primary.model) throw new Error('请先选择宿主供应商与模型。')
@@ -158,6 +173,7 @@ export class ModelClient {
           ...(this.policy.maxTokensPerCall > 0 ? {maxTokens:this.policy.maxTokensPerCall} : {}),
           ...(cacheMode ? { cacheMode } : {}),
           ...(structured ? { responseFormat: { type: 'json_schema', json_schema: { name: callOptions.structuredSchema!.name, strict: true, schema: strictSchema(callOptions.structuredSchema!.schema) } } } : {}) } as GenerateOptions
+        await callOptions.lifecycle?.dispatch(attempt, info, options)
         const iterator = this.runtime.stream(options)[Symbol.asyncIterator]()
         let finished = false
         try {
@@ -165,6 +181,9 @@ export class ModelClient {
             const item = await abortable(iterator.next(),callSignal)
             if (item.done) break
             const event = item.value
+            const metadata = this.runtime.responseMetadata?.(event)
+            if (metadata?.reportedModel) attempt.reportedModel = metadata.reportedModel
+            if (metadata?.requestId) attempt.requestId = metadata.requestId
             if (event.type === 'text-delta') {
               if (event.text && attempt.firstTextMs === undefined) attempt.firstTextMs = Date.now() - started
               output += event.text
@@ -191,6 +210,7 @@ export class ModelClient {
           Math.min(this.policy.pageGenerationConcurrency, profile.concurrency), callOptions.operation ? this.policy.batchDelayMs : 0)
         return output
       } catch(error) {
+        if (error && typeof error === 'object' && ('storageFailure' in error || 'stagePause' in error || 'budgetPause' in error && error.budgetPause === true)) throw error
         if (!(error instanceof ModelCallError) && error instanceof Error && 'code' in error && typeof error.code === 'string') {
           error = new ModelCallError(error.message, error.code, 'status' in error && typeof error.status === 'number' ? error.status : undefined)
         }
@@ -214,6 +234,7 @@ export class ModelClient {
         attempt.inputBytes = Buffer.byteLength(system + input); attempt.outputBytes = Buffer.byteLength(output)
         // 失败后的退避不属于模型执行；记录在运行体退出时，避免并入重试等待。
         if (started !== undefined) attempt.durationMs = attempt.executionMs ?? Date.now() - started
+        await callOptions.lifecycle?.settled(attempt)
       }
       }
     }

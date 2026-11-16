@@ -40,7 +40,7 @@ it.skipIf(!(existsSync(new URL('./fixtures/real20k/source-selection-expanded-s14
   const { points } = JSON.parse(readFileSync(new URL('./fixtures/real20k/source-selection-expanded-s14.json', import.meta.url), 'utf8')) as { points: Point[] }
   const selected = selectSourcePoints(points, 200, [])
   expect(selected.size).toBe(200)
-  const required = points.filter(point => point.evidence.some(evidence => /Other fictional providers|fictional participants, and households/.test(evidence.quote)))
+  const required = points.filter(point => point.evidence.some(evidence => /Fictional archivists|fictional records, and collections/.test(evidence.quote)))
   expect(required).toHaveLength(2)
   for (const point of required) expect(selected.has(point.point_id)).toBe(true)
 })

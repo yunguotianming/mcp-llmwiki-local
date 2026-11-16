@@ -13,13 +13,13 @@ const targets: Record<string, string[]> = {
 }
 // 中英文等价表述来自锁定题集及发布页；数值、关系和限定词分别断言。
 const facts: Record<string, RegExp[]> = {
-  'Q-011': [/虚构档案样例条件50/i, /虚构档案样例条件51/i, /虚构档案样例条件52/i, /虚构档案样例条件53/i],
-  'Q-020': [/虚构档案样例条件59/i, /虚构档案样例条件59/, /虚构档案样例条件59/, /虚构档案样例条件59/, /虚构档案样例条件59/i],
-  'Q-170': [/虚构档案样例条件59/i, /虚构档案样例条件59/, /虚构档案样例条件59/, /虚构档案样例条件59/, /虚构档案样例条件59/i],
-  'C-021': [/虚构档案样例条件59/i, /虚构档案样例条件60/i],
-  'C-011': [/虚构档案样例条件61/i, /虚构档案样例条件62/, /虚构档案样例条件63/],
-  'Q-113': [/虚构档案样例条件64/, /虚构档案样例条件65/, /虚构档案样例条件66/,
-    /虚构档案样例条件67/, /虚构档案样例条件68/],
+  'Q-011': [/虚构档案条件d3f1ed20e4/i, /虚构档案条件8e12ef7caa/i, /虚构档案条件feb4452961/i, /虚构档案条件2366f5760f/i],
+  'Q-020': [/虚构档案条件54ba8fb65c/i, /虚构档案条件386c2f3f1f/, /虚构档案条件9a5350554c/, /虚构档案条件d1c3bb6ec3/, /虚构档案条件8fa37c76c6/i],
+  'Q-170': [/虚构档案条件54ba8fb65c/i, /虚构档案条件386c2f3f1f/, /虚构档案条件9a5350554c/, /虚构档案条件d1c3bb6ec3/, /虚构档案条件8fa37c76c6/i],
+  'C-021': [/虚构档案条件bab8523d01/i, /虚构档案条件b0018f58e6/i],
+  'C-011': [/虚构档案条件17ef9b2ea7/i, /虚构档案条件17cd793f85/, /虚构档案条件bc3f91f8de/],
+  'Q-113': [/虚构档案条件d7c6fd7b10/, /虚构档案条件6e2da749f5/, /虚构档案条件7162bf7fef/,
+    /虚构档案条件492598ddcd/, /虚构档案条件9284cceaba/],
 }
 const page = (id: string) => {
   const path = (id.startsWith('S') ? 'sources/' : 'topics/') + id + '.md'
@@ -54,7 +54,7 @@ it.skipIf(!(existsSync(new URL('./fixtures/excerpt-r2/pages.json', import.meta.u
   expect(reference).toMatch(/Administrative Science Quarterly/)
   expect(reference).toContain('#L364-L364')
   const answer = excerpts(source, ['Nicholson 四阶段是什么？'], 900)[0]!.content
-  expect(answer).toContain('归档、分类、检查和入库')
+  expect(answer).toContain('准备、遭遇、调整和稳定')
   expect(answer).not.toMatch(/参考文献列出|ORCID/)
 })
 

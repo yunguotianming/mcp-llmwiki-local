@@ -3,16 +3,3 @@ dist/
 coverage/
 .llmwiki*/
 *.tsbuildinfo
-
-# 含第三方论文原文的夹具不随公开仓库发布。
-test/fixtures/correction-20h-output.txt
-test/fixtures/correction-20h-request.json
-test/fixtures/quality-fix1-dev.json
-test/fixtures/real20j/520.input.json
-test/fixtures/real20j/520.output.json
-test/fixtures/real20k/query-excerpts.json
-test/fixtures/real20k/source-selection-expanded-s14.json
-test/fixtures/real20k/source-selection.json
-test/fixtures/real20k/topic-evidence-context.json
-test/fixtures/topic-guard-review.json
-test/fixtures/excerpt-r2/pages.json

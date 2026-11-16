@@ -10,9 +10,9 @@ import { fullSentenceTopicFixture, referentialTopicFixture } from './fixtures/to
 interface ReviewRequest {
   review_stage: string
   topic_id: string
-  sentences: { id: string; text: string; original_text?: string; previous_sentence?: { id: string; text: string } | null }[]
+  sentences: { id: string; text: string; point_ids?: string[]; original_text?: string; previous_sentence?: { id: string; text: string } | null }[]
   members: { point_id: string; text: string; source_title?: string;
-    evidence: { source_id: string; locator: string; quote: string; context?: string }[] }[]
+    evidence: { source_id: string; source_version: string; locator: string; quote: string; context?: string }[] }[]
   validationFeedback?: { id: string; missing: string }[]
 }
 
@@ -46,11 +46,11 @@ function noCorrection(input: ReviewRequest) {
   })) }
 }
 
-it('L227 引文附所在完整句，跨软换行但不扩成邻句或改写原引文', () => {
+it('L227 引文附所在完整原段，跨软换行且保留段内邻句，不改写原引文', () => {
   const fixture = fullSentenceTopicFixture(), evidence = fixture.point.evidence[0]!
   const before = structuredClone(evidence)
-  expect(topicEvidenceContext(evidence, fixture.source)).toBe(fixture.fullSentence)
-  expect(topicEvidenceContext(evidence, fixture.source)).not.toContain('Another study')
+  expect(topicEvidenceContext(evidence, fixture.source)).toBe(fixture.fullSentence + ' Another study reported a different outcome.')
+  expect(topicEvidenceContext(evidence, fixture.source)).toContain('Another study')
   expect(fixture.source.text.split(/\r?\n/)[226]).toContain(fixture.quote)
   expect(evidence).toEqual(before)
   expect(() => topicEvidenceContext({ ...evidence, quote: '原文没有的引文' }, fixture.source))
@@ -60,7 +60,7 @@ it('L227 引文附所在完整句，跨软换行但不扩成邻句或改写原�
   const blockLocator = 'block:20261110000000-abcdefg'
   expect(topicEvidenceContext({ ...evidence, locator: blockLocator }, {
     ...fixture.source, segments: fixture.source.segments.map(segment => ({ ...segment, locator: blockLocator })),
-  })).toBe(fixture.fullSentence)
+  })).toBe(fixture.fullSentence + ' Another study reported a different outcome.')
 })
 
 it('删去 S3 至 S7 后重新核对 S8，不把原研究身份机械承接到 S2', async () => {
@@ -75,9 +75,9 @@ it('删去 S3 至 S7 后重新核对 S8，不把原研究身份机械承接到 S
   // 旧流程仅核对及纠正共 2 次；本反例新增 S8 复判及纠正，精确为 4 次，不改既有测试断言。
   expect(result.calls).toBe(4)
   expect(result.failure).toBeUndefined()
-  const followup = model.requests.find(request => request.input.sentences[0]?.previous_sentence)
+  const followup = model.requests.find(request => request.input.review_stage === 'topic' && request.input.sentences[0]?.previous_sentence)
   expect(followup?.input.sentences).toEqual([{
-    id: 'S8', text: fixture.dependentText, previous_sentence: { id: 'S2', text: fixture.priorText },
+    id: 'S8', text: fixture.dependentText, point_ids: ['P1'], previous_sentence: { id: 'S2', text: fixture.priorText },
   }])
   expect(JSON.stringify(followup?.input)).not.toContain('已证明治疗具有普遍因果效果')
   expect(result.content).not.toContain('该研究的随访结果')
@@ -101,7 +101,7 @@ it('删句承接复判得到完整支撑时保留原句，不由指代词规则�
   expect(result.failure).toBeUndefined()
   expect(result.content).toContain(fixture.dependentText)
   expect(result.review?.removed).toHaveLength(5)
-  expect(model.requests.filter(request => request.input.sentences[0]?.previous_sentence)).toHaveLength(1)
+  expect(model.requests.filter(request => request.input.review_stage === 'topic' && request.input.sentences[0]?.previous_sentence)).toHaveLength(1)
   expect(model.requests.filter(request => request.input.review_stage === 'topic-correction')).toHaveLength(1)
 })
 
@@ -153,7 +153,7 @@ it('核对与纠正均传完整句上下文，原引文不变且上下文变化�
   for (const request of model.requests) {
     expect(request.input.members[0]!.source_title).toBe(fixture.source.title)
     expect(request.input.members[0]!.evidence).toEqual([{
-      source_id: 'S-0012', locator: 'L227-L227', quote: fixture.quote, context: fixture.fullSentence,
+      source_id: 'S-0012', source_version: 'v1', locator: 'L227-L227', quote: fixture.quote, context: fixture.fullSentence + ' Another study reported a different outcome.',
     }])
     expect(request.prompt).toContain(topicStudyRule)
     expect(request.prompt).toContain(topicEvidenceContextRule)

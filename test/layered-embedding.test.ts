@@ -72,6 +72,7 @@ it('请求中取消与预先取消均保留取消原因，不重试也不发送�
   const request = vi.fn<typeof fetch>(waitForAbort), client = new OllamaEmbeddingClient({ embeddingBatchSize: 1 }, request)
   const pending = client.embed(['甲', '乙'], controller.signal)
   const rejected = expect(pending).rejects.toBe(reason)
+  await vi.advanceTimersByTimeAsync(0)
   controller.abort(reason); await rejected
   await vi.advanceTimersByTimeAsync(200000)
   expect(request).toHaveBeenCalledTimes(1); expect(vi.getTimerCount()).toBe(0)

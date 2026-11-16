@@ -4,6 +4,7 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import { expect, it } from 'vitest'
 import { LocalConfigStore } from '../src/local/config.js'
 import { LocalJobs } from '../src/local/jobs.js'
+import { createLocalHost } from '../src/local/host.js'
 import { temporaryWorkspace } from './temp.js'
 import type { ModelRuntime } from '../src/llm/client.js'
 
@@ -22,15 +23,20 @@ it('运行中取消释放源协议锁与作业占用，再次扫描成功', asyn
       })
     } }
   const jobs = new LocalJobs(config, runtime)
+  const host = createLocalHost(config.registry(), { runtime, running: jobs.running, persist: config.writeRegistry })
   try {
     const start = await jobs.generate({ libraryId: library.id }); await entered.promise
+    const management = host.operations.libraries!.management, revision = management.view().registryRevision
+    await expect(management.update(library.id, { wikiPath: path.join(f.root, '另一个库') }, revision)).rejects.toMatchObject({ code: 'LIBRARY_BUSY' })
+    await expect(management.unregister(library.id, revision)).rejects.toMatchObject({ code: 'LIBRARY_BUSY' })
+    expect(host.stop(library.id)).toEqual({ stopping: true })
     await expect(jobs.generate({ libraryId: library.id })).rejects.toThrow('正在被占用')
     expect((await jobs.cancel(start.jobId)).status).toBe('cancelling')
     await jobs.close()
     expect((await jobs.status(start.jobId)).status).toBe('cancelled')
     const scan = await jobs.generate({ libraryId: library.id, action: 'scan' })
     for (let i = 0; i < 200; i++) { const status = await jobs.status(scan.jobId); if (status.status !== 'running') { expect(status.status, status.error).toBe('completed'); break }; await new Promise(resolve => setTimeout(resolve, 10)); if (i === 199) throw new Error('扫描未完成') }
-  } finally { await jobs.close(); await f.cleanup() }
+  } finally { host.dispose(); await jobs.close(); await f.cleanup() }
 }, 15000)
 
 it('服务重建后未持有的运行作业标记中断，保留回执可检查', async () => {

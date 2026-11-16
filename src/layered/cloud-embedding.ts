@@ -2,11 +2,12 @@ import { layeredSettings, type LayeredSettings } from '../domain/config.js'
 import { backoff, embeddingBatches, normalized, OllamaEmbeddingClient, similarity } from './embedding.js'
 import { hash } from './files.js'
 import type { EmbeddingClient } from './schema.js'
+import { embeddingCredential } from '../llm/credentials.js'
 
 export const cloudEmbeddingHelp = '云端向量服务不可用，请检查服务地址、模型名及宿主进程的密钥环境变量。'
-// 只读取进程环境，密钥不进入设置对象、随库身份或错误链。
+// 只读取本机凭据或进程环境，密钥不进入设置对象、随库身份或错误链。
 export function cloudEmbeddingKey(settings: LayeredSettings): string | undefined {
-  const key = process.env[settings.cloudEmbeddingKeyEnv]?.trim()
+  const key = embeddingCredential(settings.cloudEmbeddingKeyEnv, settings.cloudEmbeddingUrl, settings.cloudEmbeddingModel)?.trim()
   return key && /^[\x21-\x7e]+$/.test(key) ? key : undefined
 }
 export class OpenAICompatibleEmbeddingClient implements EmbeddingClient {
@@ -74,7 +75,7 @@ export class OpenAICompatibleEmbeddingClient implements EmbeddingClient {
     }
   }
 }
-export function createEmbeddingClient(settings: LayeredSettings, request: typeof fetch = fetch, retryLimit = 2): EmbeddingClient {
+export function createEmbeddingClient(settings: LayeredSettings, request: typeof fetch = fetch, retryLimit?: number): EmbeddingClient {
   return settings.embeddingMode === 'cloud' ? new OpenAICompatibleEmbeddingClient(settings, request, retryLimit)
     : new OllamaEmbeddingClient(settings, request, retryLimit)
 }

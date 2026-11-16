@@ -26,6 +26,8 @@ import { mergeModels, modelUsage } from './models.js'
 import { identityKey } from './vector-identity.js'
 import { validatedTask } from './extraction-cache.js'
 import { sameClaim } from './corrections.js'
+import { activeAcceptedRefs, businessValue, recoveryBudget, recoveryContext, rejectAcceptedResponse, verifyAcceptedRefs } from './accepted.js'
+import type { AcceptedRef } from './accepted.js'
 
 const prose = (value: string) => value.replace(/[\r\n]+/g, ' ').replaceAll('[', '\\[').replaceAll(']', '\\]').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
 const normalizedName = (name: string) => name.normalize('NFKC').trim().toLowerCase()
@@ -97,7 +99,7 @@ const termProtocolVersion = hash(JSON.stringify(['term-sections-v2', system, cor
 const sectionKinds = [['definition', '定义'], ['usage', '用法'], ['findings', '研究结论'], ['differences', '分歧']] as const
 const fatal = (error: unknown, signal: AbortSignal) => {
   signal.throwIfAborted()
-  if (error && typeof error === 'object' && ('budgetPause' in error || 'storageFailure' in error || error instanceof Error && error.name === 'AbortError'
+  if (error && typeof error === 'object' && ('budgetPause' in error || 'stagePause' in error || 'storageFailure' in error || error instanceof Error && error.name === 'AbortError'
     || 'code' in error && ['EIO', 'ENOSPC', 'EACCES', 'EPERM', 'ENOENT', 'ENOTDIR', 'EISDIR', 'EROFS', 'EMFILE', 'ENFILE', 'EBUSY'].includes(String(error.code)))) throw error
 }
 // 术语索引分页：类别不超过上限时一类一页；超过后按类别排序、定量分页，避免模型自由命名的类别撑出上千页。
@@ -121,12 +123,13 @@ export async function prepareTerms(root: string, pending: PendingBuild, committe
   if (options.topics === false) return { changed: false, modelCalls: 0 }
   const settings = layeredSettings(options.topics, options.tier)
   let budget: Promise<number> | undefined
-  const inputBudget = () => budget ??= topicBudget(options, 'term', Math.min(settings.termInputBudget, inputLimit ?? Infinity))
+  const inputBudget = () => budget ??= recoveryBudget('term', () => topicBudget(options, 'term', Math.min(settings.termInputBudget, inputLimit ?? Infinity)), Math.min(settings.termInputBudget, inputLimit ?? Infinity))
   const deps = committed.version ? (await readVersion(root, committed.version)).deps : { pages: {}, reverse: {} }
   if (!deps) throw new Error('术语依赖表缺失。')
   await hydrateVectors(root, deps, true)
   const previous = Object.values(deps.pages).flatMap(page => page.terms ?? []).sort((a, b) => a.id.localeCompare(b.id))
   const retained = pending.terms?.records ?? previous
+  await verifyAcceptedRefs(pending.terms, true)
   const endpoint = embeddingEndpoint(settings)
   const embedding = options.vectorIdentity ? identityKey(options.vectorIdentity) : JSON.stringify([endpoint.url, endpoint.model, settings.vectorPrecision])
   const oldContributions = new Map(retained.flatMap(record => record.contributions.map(item => [item.key, item] as const)))
@@ -258,9 +261,9 @@ export async function prepareTerms(root: string, pending: PendingBuild, committe
     const history = record.sections.length ? record.sections : old?.sections ?? []
     const historyKeys = history.flatMap(section => section.keys)
     const reusable = history.length > 0 && historyKeys.length === byKey.size && new Set(historyKeys).size === byKey.size
-      && history.every(section => !section.queued && section.keys.length > 0 && section.keys.every(key => byKey.has(key)
+      && history.every(section => (!section.queued || recoveryContext()) && section.keys.length > 0 && section.keys.every(key => byKey.has(key)
         && section.topic_id === (record.split ? leafFor(byKey.get(key)!) : 'all'))
-        && section.fingerprint === signatureFor(section.id, section.keys.map(key => byKey.get(key)!)))
+        && (section.queued && recoveryContext() || section.fingerprint === signatureFor(section.id, section.keys.map(key => byKey.get(key)!))))
     let planned: TermSection[] = []
     const used = new Set<string>(), reserved = new Set(history.map(section => section.id))
     if (reusable) planned = structuredClone(history)
@@ -279,7 +282,7 @@ export async function prepareTerms(root: string, pending: PendingBuild, committe
         planned.push({ ...section, keys }); keys.forEach(key => used.add(key))
       }
       for (const item of items.filter(item => !used.has(item.key))) {
-        let section = planned.find(section => section.topic_id === topicId && fits(section.id, [...section.keys.map(key => byKey.get(key)!), item]))
+        let section = planned.find(section => (!recoveryContext() || section.queued) && section.topic_id === topicId && fits(section.id, [...section.keys.map(key => byKey.get(key)!), item]))
         if (!section) {
           let number = 1, id = topicId
           while (reserved.has(id)) id = `${topicId}-${++number}`
@@ -287,6 +290,7 @@ export async function prepareTerms(root: string, pending: PendingBuild, committe
           section = { id, topic_id: topicId, keys: [], fingerprint: '', content: '', queued: true, calls: [] }; planned.push(section)
         }
         if (!fits(section.id, [item])) {
+          if (recoveryContext()) throw Object.assign(new Error('单条完整术语贡献超过当前阶段预算。'), { stagePause: true, stage: 'term', code: 'INPUT_TOO_LARGE' })
           section.keys.push(item.key); section.content = '生成缺口：单条完整术语贡献超出输入预算，完整说明保留在术语索引。'
           record.sections = planned
           await appendLog(root, '\n### 完整术语贡献分块（输入预算截断已停用）\n- 页面：' + page + '#' + section.id
@@ -298,6 +302,7 @@ export async function prepareTerms(root: string, pending: PendingBuild, committe
     }
     }
     record.sections = planned
+    await writeJson(root, 'work/pending.json', pending)
     for (let sectionIndex = 0; sectionIndex < record.sections.length; sectionIndex++) {
       const section = record.sections[sectionIndex]!
       const items = section.keys.map(key => byKey.get(key)!), request = requestFor(section.id, items), inputBytes = Buffer.byteLength(system + request)
@@ -315,9 +320,16 @@ export async function prepareTerms(root: string, pending: PendingBuild, committe
           quota--
           section.calls = []
           section.models = []
-          const sectionLimit = await inputBudget(), usage = modelUsage(options.client)
+          let sectionLimit = recoveryContext() ? Infinity : await inputBudget()
+          const usage = modelUsage(options.client)
           try {
           const receipt = await validatedTask({ ...options, signal }, 'term', { request, protocol: termProtocolVersion, sources: items, sectionLimit }, async signal => {
+          sectionLimit = await inputBudget()
+          if (inputBytes > sectionLimit) {
+            if (items.length > 1) throw Object.assign(new Error('未完成术语分节需要按新窗口细分。'), { termNeedsSplit: true })
+            if (recoveryContext()) throw Object.assign(new Error('单条完整术语贡献超过当前阶段预算。'), { stagePause: true, stage: 'term', code: 'INPUT_TOO_LARGE' })
+            throw new Error('单条完整术语贡献超出输入预算。')
+          }
           const messages: string[] = []
           const references = localReferences(items.map(item => item.key), 'R')
           const invoke = async (prompt: string, input: string, schema: z.ZodType) => {
@@ -338,15 +350,16 @@ export async function prepareTerms(root: string, pending: PendingBuild, committe
             // 一次纠正只包含坏引用条目；正常主张和引文不进入纠正，也不受失败影响。
             const correction = JSON.stringify({ ...JSON.parse(request), validationFeedback: { reasons: [{ rule: 'term-reference' }] }, items: invalid.map(({ id, item }) => ({ id, ...item,
               validationFeedback: referenceFeedback })) })
-            let repaired: unknown[] = []
-            try { repaired = z.object({ items: z.array(z.unknown()) }).parse(parseModelJson(await invoke(correctionSystem, correction, correctionSchema))).items }
+            let repaired: unknown[] = [], correctedRaw: string | undefined, retainedCorrection = false
+            try { correctedRaw = await invoke(correctionSystem, correction, correctionSchema); repaired = z.object({ items: z.array(z.unknown()) }).parse(parseModelJson(correctedRaw)).items }
             catch (error) { fatal(error, signal); messages.push('引用纠正未完成：' + String(error)) }
             for (const entry of invalid) {
               const matches = repaired.filter(item => item && typeof item === 'object' && 'id' in item && item.id === entry.id)
               const checked = matches.length === 1 ? correctionSchema.shape.items.element.safeParse(matches[0]) : undefined
-              if (checked?.success && sameClaim(entry.item.text, checked.data.text) && checked.data.keys.every(key => references.has(key))) entry.item.keys = checked.data.keys
+              if (checked?.success && sameClaim(entry.item.text, checked.data.text) && checked.data.keys.every(key => references.has(key))) { entry.item.keys = checked.data.keys; retainedCorrection = true }
               else { discarded.add(entry.id); messages.push('已隔离引用无效的术语条目：' + entry.id) }
             }
+            if (correctedRaw !== undefined && !retainedCorrection) await rejectAcceptedResponse(correctedRaw, 'rejected', 'TERM_CORRECTION_INVALID')
           }
           const parts: string[] = []
           for (const [key, title] of sectionKinds) {
@@ -361,7 +374,17 @@ export async function prepareTerms(root: string, pending: PendingBuild, committe
           if (!Object.values(output).some(statements => statements.length)) throw new Error('术语分节缺少可引用内容。')
           const content = parts.join('\n\n') + (discarded.size ? '\n\n生成缺口：引用纠正后仍无效的条目已隔离。' : '')
           return { content, messages, models: mergeModels(usage.models) }
-          }, value => !value.messages.length && Boolean(value.content) && value.content.length <= settings.termMaxChars)
+          }, value => !value.messages.length && Boolean(value.content) && value.content.length <= settings.termMaxChars, {
+            unitId: `term:${record.id}:${section.id}`, operation: 'synthesizeSection',
+            sourceRefs: items.map(item => ({ sourceId: item.source_id, sourceVersion: item.source_version })),
+            input: businessValue({ request, contributions: items.map(({ key, logical_source_id, source_id, source_version, locator }) => ({ key, logical_source_id, source_id, source_version, locator })) }),
+            prompt: [system, correctionSystem, referenceFeedback], schema: [schemaJSON(outputSchema), schemaJSON(correctionSchema)],
+            validatorVersion: termProtocolVersion, semanticVersion: options.promptVersion ?? 'layered-default-v1',
+            groupPlan: { sectionId: section.id, keys: section.keys, maxSources: settings.termMaxSources },
+            dependencies: activeAcceptedRefs(pending.manifest.sources.filter(source => items.some(item => item.source_id === source.source_id))
+              .flatMap(source => (source as typeof source & { acceptedRef?: AcceptedRef }).acceptedRef ?? [])),
+          })
+          if (receipt.acceptedRef) (section as TermSection & { acceptedRef?: AcceptedRef }).acceptedRef = receipt.acceptedRef
           section.content = receipt.value.content
           for (const message of receipt.value.messages) gap(record.id, section.id, message)
           usage.models.splice(0, usage.models.length, ...mergeModels(usage.models, receipt.value.models))
@@ -388,6 +411,18 @@ export async function prepareTerms(root: string, pending: PendingBuild, committe
           }
           } catch (error) {
             fatal(error, signal)
+            if (error && typeof error === 'object' && 'termNeedsSplit' in error) {
+              const middle = Math.ceil(section.keys.length / 2), remaining = section.keys.slice(middle)
+              section.keys = section.keys.slice(0, middle); section.content = ''; section.fingerprint = ''; section.queued = true
+              delete (section as TermSection & { acceptedRef?: AcceptedRef }).acceptedRef
+              let number = 1, id = section.topic_id
+              while (reserved.has(id)) id = `${section.topic_id}-${++number}`
+              reserved.add(id)
+              record.sections.splice(sectionIndex + 1, 0, { ...section, id, keys: remaining, calls: [], models: [] })
+              quota++; sectionIndex--
+              await writeJson(root, 'work/pending.json', pending)
+              continue
+            }
             gap(record.id, section.id, String(error))
             section.content = '生成缺口：本节未完成，原始术语贡献保留在术语索引。'
           }
@@ -397,7 +432,8 @@ export async function prepareTerms(root: string, pending: PendingBuild, committe
           await writeJson(root, 'work/pending.json', pending)
         }
       }
-      build.section_dependencies[`${page}#^${sectionBlockId(section.id)}`] = { ...dependency(items), calls: section.calls, models: mergeModels(section.models ?? []) }
+      build.section_dependencies[`${page}#^${sectionBlockId(section.id)}`] = { ...dependency(items), calls: section.calls, models: mergeModels(section.models ?? []),
+        ...((section as TermSection & { acceptedRef?: AcceptedRef }).acceptedRef ? { acceptedRef: (section as TermSection & { acceptedRef?: AcceptedRef }).acceptedRef } : {}) }
     }
     record.models = mergeModels(...record.contributions.map(item => item.models ?? []), ...record.sections.map(section => section.models ?? []))
     const content = header(record.id, record.name, record.contributions, false, record.models) + record.sections.map(section => `## ${section.topic_id === 'all' ? '综合' : section.topic_id} ^${sectionBlockId(section.id)}\n\n${section.content}`).join('\n\n') + '\n'

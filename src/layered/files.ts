@@ -120,6 +120,7 @@ async function writeAtomic(root: string, relative: string, value: string): Promi
   // 目标已解析到库内真实路径；同目录随机临时文件以 wx 独占创建，无需再解析不存在的路径。
   const temporary = target + '.' + randomUUID() + '.tmp'
   let renamed = false
+  let failure: unknown
   try {
     const handle = await openTemporary(temporary)
     try { await handle.writeFile(value, 'utf8'); await handle.sync() } finally { await handle.close() }
@@ -127,14 +128,15 @@ async function writeAtomic(root: string, relative: string, value: string): Promi
       try { await rename(temporary, target); break }
       catch (error) {
         if (!(error instanceof Error && 'code' in error && ['EPERM', 'EACCES', 'EBUSY'].includes(String(error.code)))) throw error
-        const windowsReader = process.platform === 'win32' && error.code !== 'EBUSY'
-        if (attempt >= (windowsReader ? 9 : 2)) throw error
-        // Windows 读者短暂占用目标时保留旧文件，仅失败后退避；成功路径不等待、不重写字节。
-        await new Promise(resolve => setTimeout(resolve, windowsReader ? Math.min(2 ** (attempt + 1), 64) : 20 * (attempt + 1)))
+        failure ??= error
+        if (attempt >= 9) throw failure
+        // 三类短暂占用共用 6.5 秒退避；始终保留旧文件，由 rename 原子替换。
+        await new Promise(resolve => setTimeout(resolve, Math.min(100 * 2 ** attempt, 1000)))
       }
     }
     renamed = true
-  } finally { if (!renamed) await unlink(temporary).catch(error => { if (error.code !== 'ENOENT') throw error }) }
+  } catch (error) { failure ??= error; throw failure }
+  finally { if (!renamed) await unlink(temporary).catch(error => { if (!failure && error.code !== 'ENOENT') throw error }) }
 }
 async function openTemporary(file: string): Promise<Awaited<ReturnType<typeof open>>> {
   // 检查点通常复用已有目录；只在首次创建或目录被删除时补建，省去每次写入的目录操作。

@@ -48,9 +48,9 @@ it('内容修改只提变化段、保留未变要点 ID；反向依赖重建并�
   await writeFile(file, '甲组新增加的一段。\n\n甲组保留结论。\n\n甲组又增加一段。\n\n乙组独立结论。')
   const built = await buildLayeredLibrary(f.options), next = (await snapshotManifest(f.root)).sources[0]!
   const after = JSON.parse(await readFile(path.join(f.root, next.extract.path), 'utf8')) as Extraction
-  // 新增一次来源核对和一次受影响主题核对。
-  expect(built.modelCalls).toBe(2 + 2); expect(f.call).toHaveBeenCalledTimes(2 + 2) // 向量模式默认关闭补标，按其余文本阶段精确计数。
-  expectModelCalls(f.call, { extraction: 1, review: 2, topic: 1 })
+  // 新增一次来源核对和受影响主题 T-0001 的核对；T-0002 正文未变，但成员实际来源版本更新，核对指纹按来源版本失效，补核一次来源导航。
+  expect(built.modelCalls).toBe(2 + 3); expect(f.call).toHaveBeenCalledTimes(2 + 3) // 向量模式默认关闭补标，按其余文本阶段精确计数。
+  expectModelCalls(f.call, { extraction: 1, review: 3, topic: 1 })
   expect(f.requests.map(request => request.input.paragraphs.map(part => part.text))).toEqual([['甲组新增加的一段。', '甲组又增加一段。']])
   expect(after.segments[1]!.points[0]!.point_id).toBe(before.segments[0]!.points[0]!.point_id)
   expect(after.segments[1]!.points[0]).toMatchObject({ locator: 'L3-L3', source_version: next.source_version })

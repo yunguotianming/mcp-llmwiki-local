@@ -15,20 +15,20 @@ interface Case {
 const hasFixture = existsSync(new URL('./fixtures/real20k/query-excerpts.json', import.meta.url))
 const fixtures = (hasFixture ? JSON.parse(readFileSync(new URL('./fixtures/real20k/query-excerpts.json', import.meta.url), 'utf8')) : [{"id": "Q-003", "question": "Q-003"}, {"id": "Q-005", "question": "Q-005"}, {"id": "Q-006", "question": "Q-006"}, {"id": "Q-007", "question": "Q-007"}, {"id": "Q-008", "question": "Q-008"}, {"id": "Q-009", "question": "Q-009"}, {"id": "Q-010", "question": "Q-010"}]) as Case[]
 const facts: Record<string, string[]> = {
-  'Q-003': ['虚构样例Q-003的条件1', '虚构样例Q-003的条件2', '虚构样例Q-003的条件3', '虚构样例Q-003的条件4', '虚构样例Q-003的条件5'],
-  'Q-005': ['虚构样例Q-005的条件1', '虚构样例Q-005的条件2', '虚构样例Q-005的条件3'],
-  'Q-006': ['虚构样例Q-006的条件1', '虚构样例Q-006的条件2', '虚构样例Q-006的条件3', '虚构样例Q-006的条件4'],
-  'Q-007': ['虚构样例Q-007的条件1', '虚构样例Q-007的条件2', '虚构样例Q-007的条件3', '虚构样例Q-007的条件4'],
-  'Q-008': ['虚构样例Q-008的条件1', '虚构样例Q-008的条件2', '虚构样例Q-008的条件3'],
-  'Q-009': ['虚构样例Q-009的条件1', '虚构样例Q-009的条件2', '虚构样例Q-009的条件3'],
-  'Q-010': ['虚构样例Q-010的条件1', '虚构样例Q-010的条件2'],
+  'Q-003': ['虚构档案条件e440c80296', '虚构档案条件1d57b55a16', '虚构档案条件675fb87c2a', '虚构档案条件c17e24bc52', '虚构档案条件df5b332683'],
+  'Q-005': ['虚构档案条件980b22f854', '虚构档案条件bd07268a9e', '虚构档案条件9bd0424586'],
+  'Q-006': ['虚构档案条件cf05239aea', '虚构档案条件602c699177', '虚构档案条件21906ff409', '虚构档案条件23f00d6702'],
+  'Q-007': ['虚构档案条件6d96434ad2', '虚构档案条件7a58193f16', '虚构档案条件e2cb83aa1e', '虚构档案条件5c44579c9c'],
+  'Q-008': ['虚构档案条件b69884778a', '虚构档案条件5f48a92c7b', '虚构档案条件374dfe2aa1'],
+  'Q-009': ['虚构档案条件08422603ba', '虚构档案条件6c1d966064', '虚构档案条件17793ff9a2'],
+  'Q-010': ['虚构档案条件60bb525750', '虚构档案条件4c726985ea'],
 }
 it.skipIf(!hasFixture).each(fixtures)('$id 现场原响应对应的答案事实进入连续摘录（夹具含第三方论文原文，未随公开仓库发布）', item => {
   expect(item.originalResponse.response.groups.flatMap(group => group.results).some(hit => hit.path === item.page.path)).toBe(true)
   const result = excerpts(item.page, [item.originalResponse.query], 1333, item.pointMatches)
   const content = result.map(quote => quote.content).join('\n')
   for (const fact of facts[item.id]!) {
-    const equivalents: Record<string, string> = { '虚构样例Q-005的条件1': '轮子中的枢纽', '虚构样例Q-005的条件2': '伦理罗盘', '虚构样例Q-005的条件3': '没有真正权力' }
+    const equivalents: Record<string, string> = { '车轮的中心': '轮子中的枢纽', '伦理指南针': '伦理罗盘', '没有真正的权力': '没有真正权力' }
     if (equivalents[fact]) expect(content.includes(fact) || content.includes(equivalents[fact]!)).toBe(true)
     else expect(content).toContain(fact)
   }

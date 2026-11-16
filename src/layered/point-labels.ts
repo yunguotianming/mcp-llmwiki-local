@@ -1,3 +1,5 @@
+import { recoveryTask } from './extraction-cache.js'
+import { activeAcceptedRefs, businessValue, recoveryContext, rejectAcceptedResponse } from './accepted.js'
 import { z } from 'zod'
 import { layeredSettings } from '../domain/config.js'
 import { defaultPolicy } from '../domain/policy.js'
@@ -39,16 +41,15 @@ export async function preparePointLabels(root: string, pending: PendingBuild, op
   const reusable = new Map(Object.values(labels).map(value => [value.fingerprint, value]))
   let modelCalls = 0
   const active = new Set<string>(), settings = layeredSettings(options.topics || {}, options.tier)
-  const limit = Math.min(settings.extractMaxInputBytes, options.maxInputBytes ?? Infinity,
-    await options.client.inputBudget?.('ingest', options.signal, 'extract') ?? Infinity)
+  let limit: number | undefined
   const jobs: PointLabelBatch[] = []
   let checkpointWrite = Promise.resolve()
   const checkpoint = () => {
     checkpointWrite = checkpointWrite.then(() => writeJson(root, 'work/pending.json', pending))
     return checkpointWrite
   }
-  const recordTruncation = (sourceId: string, pointId: string, value: PointLabels) => {
-    if (value.keyword_truncation) gaps.push({ source_id: sourceId, point_ids: [pointId],
+  const recordTruncation = (sourceId: string, pointId: string, value: PointLabels, target = gaps) => {
+    if (value.keyword_truncation) target.push({ source_id: sourceId, point_ids: [pointId],
       message: `要点补标返回 ${value.keyword_truncation.received} 个关键词，已保留前 ${value.keyword_truncation.retained} 个；未修改提取事实。` })
   }
   for (const source of [...pending.manifest.sources].sort((left, right) => left.source_id.localeCompare(right.source_id))) {
@@ -74,6 +75,9 @@ export async function preparePointLabels(root: string, pending: PendingBuild, op
       gaps.push({ ...gap, point_ids: still })
     }
     const missing = stale.filter(point => !kept.has(point.point_id))
+    if (!missing.length) continue
+    limit ??= Math.min(settings.extractMaxInputBytes, options.maxInputBytes ?? Infinity,
+      await options.client.inputBudget?.('ingest', options.signal, 'extract') ?? Infinity)
     const request = (items: Point[]) => {
       const references = localReferences(items.map(point => point.point_id))
       return { references, input: JSON.stringify({ label_stage: 'point-labels', source_id: source.source_id, vocabulary,
@@ -93,70 +97,85 @@ export async function preparePointLabels(root: string, pending: PendingBuild, op
   // 所有来源的批次共用一个并发池，单个大来源也能并行，且不会产生嵌套并发。
   await mapConcurrent(jobs, options.client.concurrency?.() ?? defaultPolicy().pageGenerationConcurrency,
     options.signal ?? new AbortController().signal, async (job, signal) => {
-    let items: unknown[] = [], actualModel = '', failed = false
-    try {
-      for (let attempt = 0; attempt < 2; attempt++) {
+    const process = async (signal: AbortSignal, labels: Record<string, PointLabels>, gaps: NonNullable<PendingBuild['manifest']['point_label_gaps']>, checkpoint: () => Promise<void>) => {
+      let items: unknown[] = [], actualModel = '', failed = false
+      try {
+        for (let attempt = 0; attempt < 2; attempt++) {
+          signal.throwIfAborted()
+          actualModel = ''
+          modelCalls++
+          const raw = await options.client.call('ingest', pointLabelsPrompt, job.input, signal, [], { operation: 'extract', structuredSchemaKind: 'tag',
+            structuredSchema: { name: 'layered_point_labels', schema }, onAttempt: attempt => { if (attempt.finish === 'stop' && !attempt.error) actualModel = `${attempt.route.provider}/${attempt.route.model}` } })
+          items = raw.trim() ? responseSchema.parse(parseModelJson(raw)).items : []
+          if (items.length) break
+          await rejectAcceptedResponse(raw, 'rejected', 'EMPTY_POINT_LABELS')
+        }
         signal.throwIfAborted()
-        actualModel = ''
-        modelCalls++
-        const raw = await options.client.call('ingest', pointLabelsPrompt, job.input, signal, [], { operation: 'extract', structuredSchemaKind: 'tag',
-          structuredSchema: { name: 'layered_point_labels', schema }, onAttempt: attempt => { if (attempt.finish === 'stop') actualModel = `${attempt.route.provider}/${attempt.route.model}` } })
-        items = raw.trim() ? responseSchema.parse(parseModelJson(raw)).items : []
-        if (items.length) break
+        // 没有可靠终态时保留未知，不能把当前主线路冒充实际作者。
+      } catch (error) {
+        signal.throwIfAborted()
+        if (error && typeof error === 'object' && ('storageFailure' in error || 'stagePause' in error || recoveryContext() && 'budgetPause' in error && error.budgetPause === true)) throw error
+        if (error && typeof error === 'object' && 'budgetPause' in error && pending.paused?.reason === 'budget') delete pending.paused
+        failed = true
       }
-      signal.throwIfAborted()
-      if (items.length && !actualModel) {
-        const info = await options.client.info('ingest', signal, undefined, 'extract')
-        actualModel = `${info.provider}/${info.id}`
-      }
-    } catch (error) {
-      signal.throwIfAborted()
-      if (error && typeof error === 'object' && 'storageFailure' in error) throw error
-      if (error && typeof error === 'object' && 'budgetPause' in error && pending.paused?.reason === 'budget') delete pending.paused
-      failed = true
-    }
-    if (failed || !items.length) {
-      gaps.push({ source_id: job.sourceId, point_ids: job.points.map(point => point.point_id),
-        message: failed ? '要点补标未完成，已保留缺口供后续重试。' : '要点补标连续两次返回空结果，已保留缺口供后续重试。' })
-      await checkpoint()
-      return
-    }
-    const candidates = new Map<string, unknown[]>()
-    let unknownRecords = 0
-    for (const item of items) {
-      const alias = item && typeof item === 'object' && 'point_id' in item ? item.point_id : undefined
-      if (typeof alias !== 'string' || !job.references.has(alias)) { unknownRecords++; continue }
-      const values = candidates.get(alias) ?? []
-      values.push(item); candidates.set(alias, values)
-    }
-    if (unknownRecords) gaps.push({ source_id: job.sourceId, point_ids: [],
-      message: `要点补标含 ${unknownRecords} 条未知或缺失短编号的记录，已拒绝，不映射到持久化要点。` })
-    for (const point of job.points) {
-      signal.throwIfAborted()
-      const alias = job.references.alias(point.point_id), values = candidates.get(alias) ?? []
-      if (values.length !== 1) {
-        gaps.push({ source_id: job.sourceId, point_ids: [point.point_id],
-          message: values.length ? '要点补标记录重复，已保留该项缺口供后续重试。' : '要点补标响应遗漏该项，已保留缺口供后续重试。' })
+      if (failed || !items.length) {
+        gaps.push({ source_id: job.sourceId, point_ids: job.points.map(point => point.point_id),
+          message: failed ? '要点补标未完成，已保留缺口供后续重试。' : '要点补标连续两次返回空结果，已保留缺口供后续重试。' })
         await checkpoint()
-        continue
+        return
       }
-      const parsed = acceptedItemSchema.safeParse(values[0])
-      if (!parsed.success) {
-        gaps.push({ source_id: job.sourceId, point_ids: [point.point_id], message: '要点补标单项校验失败，已保留该项缺口供后续重试。' })
+      const candidates = new Map<string, unknown[]>()
+      let unknownRecords = 0
+      for (const item of items) {
+        const alias = item && typeof item === 'object' && 'point_id' in item ? item.point_id : undefined
+        if (typeof alias !== 'string' || !job.references.has(alias)) { unknownRecords++; continue }
+        const values = candidates.get(alias) ?? []
+        values.push(item); candidates.set(alias, values)
+      }
+      if (unknownRecords) gaps.push({ source_id: job.sourceId, point_ids: [],
+        message: `要点补标含 ${unknownRecords} 条未知或缺失短编号的记录，已拒绝，不映射到持久化要点。` })
+      for (const point of job.points) {
+        signal.throwIfAborted()
+        const alias = job.references.alias(point.point_id), values = candidates.get(alias) ?? []
+        if (values.length !== 1) {
+          gaps.push({ source_id: job.sourceId, point_ids: [point.point_id],
+            message: values.length ? '要点补标记录重复，已保留该项缺口供后续重试。' : '要点补标响应遗漏该项，已保留缺口供后续重试。' })
+          await checkpoint()
+          continue
+        }
+        const parsed = acceptedItemSchema.safeParse(values[0])
+        if (!parsed.success) {
+          gaps.push({ source_id: job.sourceId, point_ids: [point.point_id], message: '要点补标单项校验失败，已保留该项缺口供后续重试。' })
+          await checkpoint()
+          continue
+        }
+        const item = parsed.data
+        // 先取模型返回的前十二项，再规范化去重；不能排序后再截断而改变保留范围。
+        const value: PointLabels = { fingerprint: job.fingerprints.get(point.point_id)!,
+          labels: [...new Set(item.labels.map(text => text.normalize('NFKC').trim()))].sort(),
+          keywords: [...new Set(item.keywords.slice(0, 12).map(text => text.normalize('NFKC').trim()))].sort(), model: actualModel,
+          ...(item.keywords.length > 12 ? { keyword_truncation: { received: item.keywords.length, retained: 12 } } : {}) }
+        labels[job.references.original(item.point_id)] = value
+        recordTruncation(job.sourceId, point.point_id, value, gaps)
+        // 每项独立提交；持久化失败仍向上传播，不能伪装成模型记录缺口。
         await checkpoint()
-        continue
       }
-      const item = parsed.data
-      // 先取模型返回的前十二项，再规范化去重；不能排序后再截断而改变保留范围。
-      const value: PointLabels = { fingerprint: job.fingerprints.get(point.point_id)!,
-        labels: [...new Set(item.labels.map(text => text.normalize('NFKC').trim()))].sort(),
-        keywords: [...new Set(item.keywords.slice(0, 12).map(text => text.normalize('NFKC').trim()))].sort(), model: actualModel,
-        ...(item.keywords.length > 12 ? { keyword_truncation: { received: item.keywords.length, retained: 12 } } : {}) }
-      labels[job.references.original(item.point_id)] = value
-      recordTruncation(job.sourceId, point.point_id, value)
-      // 每项独立提交；持久化失败仍向上传播，不能伪装成模型记录缺口。
-      await checkpoint()
     }
+    if (!recoveryContext()) return process(signal, labels, gaps, checkpoint)
+    const source = pending.manifest.sources.find(source => source.source_id === job.sourceId)!
+    const input = businessValue({ input: job.input, points: job.points.map(point => [point.point_id, job.fingerprints.get(point.point_id)]) })
+    const receipt = await recoveryTask({ ...options, signal }, 'extract', input, async signal => {
+      const labels: Record<string, PointLabels> = {}, gaps: NonNullable<PendingBuild['manifest']['point_label_gaps']> = []
+      await process(signal, labels, gaps, async () => {})
+      return { labels, gaps }
+    }, value => Object.keys(value.labels).length > 0, {
+      unitId: 'pointLabels:' + hash(job.points.map(point => point.point_id).join('\0')), sourceRefs: [{ sourceId: source.source_id, sourceVersion: source.source_version }],
+      operation: 'pointLabels', input, prompt: pointLabelsPrompt, schema, validatorVersion: 'pointLabels-v1', semanticVersion: 'pointLabels-v1',
+      dependencies: activeAcceptedRefs(source.acceptedRef ? [source.acceptedRef] : []),
+    })
+    for (const [id, value] of Object.entries(receipt.value.labels)) labels[id] = { ...value, ...(receipt.acceptedRef ? { acceptedRef: receipt.acceptedRef } : {}) }
+    gaps.push(...receipt.value.gaps)
+    await checkpoint()
   })
   pending.manifest.point_labels = Object.fromEntries(Object.entries(labels).filter(([id]) => active.has(id)).sort(([a], [b]) => a.localeCompare(b)))
   pending.manifest.point_label_gaps = gaps.sort((left, right) => left.source_id.localeCompare(right.source_id)

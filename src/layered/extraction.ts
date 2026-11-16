@@ -26,11 +26,13 @@ import { layeredSettings } from '../domain/config.js'
 import { bodyCharacters, chapterMinimum, coveragePurpose, longdocFingerprint, sourceChapters, sourceQuotas, synthesizeSourceSummary } from './longdoc.js'
 import path from 'node:path'
 import { canonicalTags, personalTag, tagStatus } from './tags.js'
-import { shareExtraction, validExtractionCache, validatedTask } from './extraction-cache.js'
+import { recoveryTask, shareExtraction, validExtractionCache, validatedTask } from './extraction-cache.js'
 import { explanationRule, nullableExplanation, jsonProtocol, schemaJSON } from '../llm/protocol.js'
 import { correctionBatches, correctionContext, evidenceParagraph, repairParagraphs, sameClaim } from './corrections.js'
 import { mergeModels, modelUsage } from './models.js'
 import type { ModelRef } from './models.js'
+import { activeAcceptedRefs, aliasAcceptedResponse, businessValue, recoveryBudget, recoveryContext, rejectAcceptedResponse, verifyAcceptedRefs, withAcceptedCall } from './accepted.js'
+import type { AcceptedRef } from './accepted.js'
 
 export const pointPriority = (section: unknown, text = '') => {
   if (section === '主要发现') return 0
@@ -53,7 +55,8 @@ export function selectSourcePoints(points: Point[], limit: number, floors: { ids
   })
   const selected = new Set<string>()
   for (const floor of floors) {
-    const candidates = [...distinct.filter(point => floor.ids.has(point.point_id)), ...priority.filter(point => floor.ids.has(point.point_id) && !distinct.includes(point))]
+    // 底线不能靠已去重的同主张凑数；真实不足由后续章节缺口说明。
+    const candidates = distinct.filter(point => floor.ids.has(point.point_id))
     for (const point of candidates.slice(0, floor.minimum)) if (selected.size < limit) selected.add(point.point_id)
   }
   for (const point of distinct) if (selected.size < limit) selected.add(point.point_id)
@@ -125,7 +128,7 @@ class ExtractionFailure extends Error {
 function globalFailure(error: unknown, signal: AbortSignal): boolean {
   if (signal.aborted) return true
   if (!error || typeof error !== 'object') return false
-  return 'budgetPause' in error || error instanceof Error && error.name === 'AbortError'
+  return 'budgetPause' in error || 'stagePause' in error || 'storageFailure' in error || error instanceof Error && error.name === 'AbortError'
     || 'code' in error && ['EIO', 'ENOSPC', 'EACCES', 'EPERM', 'ENOENT', 'ENOTDIR', 'EISDIR', 'EROFS', 'EMFILE', 'ENFILE', 'EBUSY'].includes(String(error.code))
 }
 function lengthFailure(error: unknown): boolean {
@@ -160,8 +163,10 @@ const extractionPromptDigest = hash(JSON.stringify([extractionProtocol, 'source-
 export function extractionPromptHash(): string {
   return extractionPromptDigest
 }
+const customPointLimitDigest = hash(JSON.stringify([extractionPromptDigest, 'custom-book-hard-limit-v1']))
+const processingPromptHash = (processing: Processing) => processing.granularity === 'custom' ? customPointLimitDigest : extractionPromptHash()
 export function extractionProcessing(processing: Processing): Processing {
-  return { tier: processing.tier, prompt_version: processing.prompt_version, prompt_hash: extractionPromptHash(),
+  return { tier: processing.tier, prompt_version: processing.prompt_version, prompt_hash: processingPromptHash(processing),
     ...(processing.granularity === undefined ? {} : { granularity: processing.granularity }),
     ...(processing.image_policy === undefined ? {} : { image_policy: processing.image_policy }) }
 }
@@ -171,7 +176,10 @@ export function processingFingerprint(processing: Processing, resources: string[
   return hash(JSON.stringify([extractionProtocol, content, processing.image_policy ? resources : []]))
 }
 export function sameProcessing(left: Processing | undefined, right: Processing | undefined): boolean {
-  return Boolean(left?.prompt_hash && right?.prompt_hash && processingFingerprint(left) === processingFingerprint(right))
+  // 旧自定义成功组的逐字证据仍可复用；计划和最终限额另行按新上限校验。
+  const compatible = (value: Processing) => value.granularity === 'custom' && value.prompt_hash === extractionPromptHash()
+    ? { ...value, prompt_hash: customPointLimitDigest } : value
+  return Boolean(left?.prompt_hash && right?.prompt_hash && processingFingerprint(compatible(left)) === processingFingerprint(compatible(right)))
 }
 export function extractionFingerprint(source: LocalSource, processing: Processing, resources: string[][] = [], grouping?: string): string {
   const segments = source.segments.length ? source.segments.map((_, index) => processingFingerprint(processing, resources[index])) : [processingFingerprint(processing)]
@@ -257,7 +265,7 @@ export function publishedExtractionUnchanged(previous: Extraction | undefined, s
   options: BuildLayeredOptions, settings = layeredSettings(options.topics || {}, options.tier)): boolean {
   if (!previous || previous.in_progress || !reusableExtraction(previous) || !previous.chunk_plan
     || previous.source_id !== sourceId || previous.source_hash !== source.contentHash
-    || previous.plan_config_fingerprint !== extractionPlanConfigFingerprint(options, settings)) return false
+    || !recoveryContext() && previous.plan_config_fingerprint !== extractionPlanConfigFingerprint(options, settings)) return false
   const requested = (value: Processing) => [value.tier, value.granularity, value.prompt_version, value.image_policy]
   if (JSON.stringify(requested(previous.processing)) !== JSON.stringify(requested(processing))) return false
   return previous.grouping_fingerprint === groupingFingerprint(previous.chunk_plan, settings)
@@ -288,7 +296,6 @@ export function reusableExtractionPlan(previous: Extraction | undefined, sourceI
   processing = extractionProcessing(processing)
   if (!previous || !reusableExtraction(previous) || !sameProcessing(previous.processing, processing)
     || previous.source_id !== sourceId || previous.source_hash !== source.contentHash || !(inputLimit > 0)
-    || previous.plan_config_fingerprint !== extractionPlanConfigFingerprint(options, settings)
     || typeof previous.plan_book !== 'boolean' || typeof previous.plan_longdoc !== 'boolean'
     || !previous.chunk_plan || !previous.plan_quotas || !previous.chapters) return undefined
   const plan = previous.chunk_plan
@@ -299,8 +306,10 @@ export function reusableExtractionPlan(previous: Extraction | undefined, sourceI
     || previous.plan_longdoc !== (previous.plan_book && isLongdoc(plan))) return undefined
   const whole = paragraphs(source)
   const wholeChars = whole.reduce((sum, part) => sum + Array.from(part.text).length, 0)
-  const hardLimit = previous.plan_book ? undefined : packPointLimit(wholeChars, processing.tier, processing.granularity)
-  if (previous.plan_hard_limit !== hardLimit || previous.plan_quotas.length !== plan.length
+  const hardLimit = previous.plan_book && processing.granularity !== 'custom' ? undefined : packPointLimit(wholeChars, processing.tier, processing.granularity)
+  const compatibleBookLimit = previous.plan_book && processing.granularity === 'custom' && previous.plan_hard_limit === undefined
+    && previous.point_limit === hardLimit
+  if (previous.plan_hard_limit !== hardLimit && !compatibleBookLimit || previous.plan_quotas.length !== plan.length
     || previous.plan_quotas.some(quota => !Number.isSafeInteger(quota) || quota < 0)) return undefined
   let allocation: ReturnType<typeof sourceQuotas>
   try { allocation = sourceQuotas(source, plan, processing.tier, settings, hardLimit) }
@@ -312,20 +321,21 @@ export function reusableExtractionPlan(previous: Extraction | undefined, sourceI
   const selectLimit = hardLimit === undefined ? allocation.limit : Math.max(allocation.limit, ordinaryPointLimit(wholeChars, processing.tier, processing.granularity, settings))
   if (previous.point_limit !== selectLimit || plan.length && previous.plan_quotas.reduce((sum, quota) => sum + quota, 0) !== allocation.limit
     || JSON.stringify(chapters(previous.chapters)) !== JSON.stringify(chapters(allocation.chapters))) return undefined
-  for (const [index, parts] of plan.entries()) {
+  if (!recoveryContext()) for (const [index, parts] of plan.entries()) {
     const request = extractionRequest(previous.plan_longdoc ? longdocSystem : system,
       extractionInput(sourceId, source, processing, parts, previous.plan_quotas[index]!,
         previous.plan_longdoc ? settings.sourceSummaryMaxPoints : undefined, previous.chapters, vocabulary),
       previous.plan_longdoc ? longdocOutput : wireOutput)
     if (Buffer.byteLength(request.prompt + request.request) > inputLimit) return undefined
   }
+  // 接受协议冻结成功组；旧路径仍按当前预算校验整个候选计划。
   return structuredClone(plan)
 }
 export function planExtraction(sourceId: string, source: LocalSource, processing: Processing, inputLimit: number, settings = layeredSettings({}, processing.tier), vocabulary?: BuildLayeredOptions['vocabulary']): Paragraph[][] {
   let plan = planExtractionAtBudget(sourceId, source, processing, inputLimit, settings, vocabulary)
   if (!settings.sourcePackRatio || source.text.length < settings.sourcePointBaseChars) return plan
   const whole = paragraphs(source), book = sourceChapters(source).length > 0 && Buffer.byteLength(system + extractionInput(sourceId, source, processing, whole, processing.tier)) > inputLimit
-  const hardLimit = book ? undefined : packPointLimit(whole.reduce((sum, part) => sum + Array.from(part.text).length, 0), processing.tier, processing.granularity)
+  const hardLimit = book && processing.granularity !== 'custom' ? undefined : packPointLimit(whole.reduce((sum, part) => sum + Array.from(part.text).length, 0), processing.tier, processing.granularity)
   // 只拆高输出额度的大包；低配额长章不因正文长而增加调用。篇级总额保持不变。
   let limit = inputLimit
   while (limit > 32768) {
@@ -455,16 +465,26 @@ export async function extractSource(...args: Parameters<typeof extractSourceOnce
   // 兼容旧调用方的本轮计数视图，不能修改回执中用于封存和哈希的成果。
   return receipt.reused ? { ...receipt.value, calls: [] } : receipt.value
 }
-export async function extractSourceReceipt(...args: Parameters<typeof extractSourceOnce>): Promise<{ value: Extraction; reused: boolean }> {
-  const [root, sourceId, source, requestedProcessing, options, inputLimit, , resources, , planned] = args
+export async function extractSourceReceipt(...args: Parameters<typeof extractSourceOnce>): Promise<{ value: Extraction; reused: boolean; acceptedRef?: AcceptedRef }> {
+  const [root, sourceId, source, requestedProcessing, options, inputLimit, , resources, , planned, checkpointSuffix = ''] = args
   const processing = extractionProcessing(requestedProcessing)
   const key = JSON.stringify([path.resolve(root), sourceId, source.contentHash, source.sourceVersion, processingFingerprint(processing), inputLimit, resources, planned,
-    options.topics, options.vocabulary, options.tagVocabulary, options.defaultCredibility])
+    options.topics, options.vocabulary, options.tagVocabulary, options.defaultCredibility, options.retrySources ?? null, checkpointSuffix])
   const execute = async (signal: AbortSignal) => {
     const receipt = await validatedTask({ ...options, signal }, 'extract', { key, source, protocol: extractionPromptHash(), resources,
-      previous: args[6], imagePolicy: options.imagePolicy }, signal =>
-        extractSourceOnce(root, sourceId, source, processing, { ...options, signal }, inputLimit, args[6], resources, args[8], planned),
-      value => reusableExtraction(value) && !value.in_progress && !value.gaps?.length)
+      previous: args[6], imagePolicy: options.imagePolicy }, async signal => {
+        const limit = Number.isFinite(inputLimit) ? inputLimit : await recoveryBudget('extract', async () => inputLimit,
+          Math.min(options.maxInputBytes ?? Infinity, layeredSettings(options.topics || {}, options.tier).extractMaxInputBytes))
+        return extractSourceOnce(root, sourceId, source, processing, { ...options, signal }, limit, args[6], resources, args[8], planned, checkpointSuffix)
+      },
+      value => reusableExtraction(value) && !value.in_progress && !value.gaps?.length, {
+        unitId: sourceId + '/extraction', sourceRefs: [{ sourceId, sourceVersion: source.sourceVersion ?? source.contentHash }], operation: 'extract',
+        input: businessValue({ source: { text: source.text, contentHash: source.contentHash, sourceVersion: source.sourceVersion ?? source.contentHash,
+          metadata: source.metadata, segments: source.segments }, processing, resources: resources ?? [], vocabulary: options.vocabulary ?? null,
+          tagVocabulary: options.tagVocabulary ?? [], defaultCredibility: options.defaultCredibility ?? null,
+          contentRules: longdocFingerprint(layeredSettings(options.topics || {}, options.tier)), ...(options.retrySources ? { retrySources: options.retrySources } : {}) }),
+        prompt: extractionPromptHash(), schema: schemaJSON(wireOutput), validatorVersion: extractionProtocol, semanticVersion: extractionProtocol,
+      })
     // 回执保留封存成果的原始调用记录；本轮调用数由编排层单独统计。
     return receipt
   }
@@ -472,17 +492,19 @@ export async function extractSourceReceipt(...args: Parameters<typeof extractSou
   return path.isAbsolute(options.knowledgeRoot) ? execute(options.signal ?? new AbortController().signal) : shareExtraction(key, options.signal, execute)
 }
 async function extractSourceOnce(root: string, sourceId: string, source: LocalSource, processing: Processing, options: BuildLayeredOptions, inputLimit: number,
-  savedPrevious?: Extraction, resources: string[][] = [], images?: (indices: number[]) => Promise<Parameters<BuildLayeredOptions['client']['call']>[4]>, planned?: Paragraph[][]): Promise<Extraction> {
+  savedPrevious?: Extraction, resources: string[][] = [], images?: (indices: number[]) => Promise<Parameters<BuildLayeredOptions['client']['call']>[4]>, planned?: Paragraph[][], checkpointSuffix = ''): Promise<Extraction> {
   const previous = reusableExtraction(savedPrevious) ? savedPrevious : undefined
+  if (previous) await verifyAcceptedRefs(previous, true)
   const settings = layeredSettings(options.topics === false ? {} : options.topics, options.tier)
   const vocabulary = options.vocabulary ?? { tags: options.tagVocabulary ?? [], terms: [] }
   const whole = paragraphs(source)
-  const reusablePlan = reusableExtractionPlan(previous, sourceId, source, processing, options, inputLimit, settings, vocabulary)
+  // 定向补缺冻结旧计划；输入预算只约束本次摘要，不得因此重分已接受的组。
+  const reusablePlan = reusableExtractionPlan(previous, sourceId, source, processing, options, options.retrySources ? Infinity : inputLimit, settings, vocabulary)
   const plan = planned ?? reusablePlan ?? planExtraction(sourceId, source, processing, inputLimit, settings, vocabulary)
   const retainedPlan = reusablePlan !== undefined && JSON.stringify(plan) === JSON.stringify(reusablePlan)
   const book = retainedPlan ? previous!.plan_book! : sourceChapters(source).length > 0 && Buffer.byteLength(system + extractionInput(sourceId, source, processing, whole, processing.tier)) > inputLimit
   const wholeChars = whole.reduce((sum, part) => sum + Array.from(part.text).length, 0)
-  const hardLimit = book ? undefined : packPointLimit(wholeChars, processing.tier, processing.granularity)
+  const hardLimit = book && processing.granularity !== 'custom' ? undefined : packPointLimit(wholeChars, processing.tier, processing.granularity)
   const grouping = groupingFingerprint(plan, settings)
   const groupIdentity = (hashes: string[]) => JSON.stringify([...new Set(hashes)].sort())
   const gapKey = (gap: ExtractionGap) => {
@@ -497,8 +519,9 @@ async function extractSourceOnce(root: string, sourceId: string, source: LocalSo
   const longdoc = retainedPlan ? previous!.plan_longdoc! : book && isLongdoc(plan), prompt = longdoc ? longdocSystem : system
   const input = (parts: Paragraph[], quota: number) => extractionInput(sourceId, source, processing, parts, quota, longdoc ? settings.sourceSummaryMaxPoints : undefined, allocation.chapters, vocabulary)
   const progressPath = (grouping: string) => 'work/extractions/' + sourceId + '/' + hashName(source.contentHash) + '/extract/' + hashName(extractionFingerprint(source, processing, resources, grouping))
-    + (source.sourceVersion ? '-' + hashName(hash(source.sourceVersion)) : '') + '-progress.json'
+    + (source.sourceVersion ? '-' + hashName(hash(source.sourceVersion)) : '') + checkpointSuffix + '-progress.json'
   const finish = (result: Extraction) => {
+    delete (result as Extraction & { reextractGeneration?: number }).reextractGeneration
     delete result.in_progress; delete result.completed_chunks; delete result.chunk_results; delete result.chunk_calls
     delete result.chunk_quotas; delete result.pending_chunk_plan; delete result.summary_pending
     result.models = mergeModels(result.models)
@@ -515,6 +538,73 @@ async function extractSourceOnce(root: string, sourceId: string, source: LocalSo
     for (const group of Object.values(result.group_cache ?? {})) group.gaps?.sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))
     return result
   }
+  const retrySummary = async (result: Extraction, key: string, ids: string[], call: (prompt: string, request: string, schema: z.ZodType) => Promise<{ raw: string; models: ModelRef[] }>) => {
+    const schema = z.object({ point_ids: z.array(z.string()).min(1).max(settings.sourceSummaryMaxPoints) })
+    const prompt = jsonProtocol('从本组已校验要点选择摘要。只返回输入中的 point_ids，不修改要点或证据，数量不超过 point_limit。', schemaJSON(schema))
+    const members = new Map(result.segments.flatMap(segment => segment.points).filter(point => ids.includes(point.point_id)).map(point => [point.point_id, point]))
+    const request = JSON.stringify({ source_id: sourceId, summary_id: key, point_limit: settings.sourceSummaryMaxPoints,
+      children: [{ id: key, points: [...members.values()].map(point => ({ point_id: point.point_id, text: point.text })) }] })
+    const valid = (selected: string[]) => selected.length > 0 && selected.length <= settings.sourceSummaryMaxPoints
+      && new Set(selected).size === selected.length && selected.every(id => members.has(id))
+    const receipt = await recoveryTask(options, 'extract', { request, prompt }, async () => {
+      if (Buffer.byteLength(prompt + request) > inputLimit) throw Object.assign(new Error('完整组摘要输入超过预算，保留已校验要点。'),
+        recoveryContext() || options.retrySources ? { stagePause: true, stage: 'extract', code: 'NO_COMPATIBLE_CANDIDATE' } : {})
+      const response = await call(prompt, request, schema)
+      try {
+        const selected = schema.parse(parseModelJson(response.raw, schemaJSON(schema))).point_ids
+        if (!valid(selected)) throw new Error('组摘要引用了未校验要点。')
+        return { ids: selected, models: response.models }
+      } catch (error) { await rejectAcceptedResponse(response.raw); throw error }
+    }, value => valid(value.ids), {
+      unitId: sourceId + '/group-summary/' + key, sourceRefs: [{ sourceId, sourceVersion: source.sourceVersion ?? source.contentHash }],
+      operation: 'sourceSummary', input: { request }, prompt, schema: schemaJSON(schema), validatorVersion: 'source-summary-v1', semanticVersion: 'source-summary-v1',
+      dependencies: activeAcceptedRefs([(result.group_cache?.[key] as { acceptedRef?: AcceptedRef } | undefined)?.acceptedRef]
+        .filter((ref): ref is AcceptedRef => Boolean(ref))),
+    })
+    return { ...receipt.value, ...(receipt.acceptedRef ? { acceptedRef: receipt.acceptedRef } : {}) }
+  }
+  // 摘要独立补缺：已封存的点、术语、核对结论和 raw 都保留，失败也不重新提取。
+  if (previous && (!previous.in_progress || previous.summary_pending) && previous.source_hash === source.contentHash && retainedPlan
+    && previous.grouping_fingerprint === grouping && sameProcessing(previous.processing, processing) && !previous.gaps?.some(gap => gap.kind === 'group')
+    && previous.segments.every((segment, index) => JSON.stringify(segment.resource_hashes) === JSON.stringify(resources[index] ?? []))
+    && Object.values(previous.group_cache ?? {}).some(group => group.missing_summary)) {
+    const result = structuredClone(previous)
+    let summariesChanged = false
+    result.in_progress = true
+    result.summary_pending = Object.keys(result.group_summaries ?? {})
+    for (const [key, group] of Object.entries(result.group_cache ?? {})) {
+      if (!group.missing_summary) continue
+      const raw = outputSchema.parse(parseModelJson(group.raw, schemaJSON(outputSchema)))
+      const members = result.segments.flatMap(segment => segment.points).filter(point => raw.points.some(item =>
+        item.text === point.text && item.evidence.every(evidence => point.evidence.some(saved => saved.quote === evidence.quote && saved.locator === evidence.locator))))
+      if (options.retrySources && !members.length) {
+        group.missing_summary = false
+        group.summary_excluded_reason = '无可用摘要依据：原组在现有已校验要点中没有匹配成员。'
+        result.gaps = result.gaps?.filter(gap => gap.kind !== 'summary' || !gap.segment_hashes.length || !gap.segment_hashes.every(hash => group.parts.some(part => part.text_hash === hash))) ?? []
+        await writeJson(root, progressPath(grouping), result)
+        continue
+      }
+      try {
+        const selected = await retrySummary(result, key, members.map(point => point.point_id), async (prompt, request, schema) => {
+          const usage = modelUsage(options.client)
+          const raw = await usage.client.call('ingest', prompt, request, options.signal, [], { operation: 'extract', structuredSchemaKind: 'extraction', structuredSchema: { name: 'layered_group_summary', schema: schemaJSON(schema) } })
+          const record = { input_bytes: Buffer.byteLength(prompt + request), input_limit: inputLimit }
+          result.calls.push(record); (result.summary_calls ??= []).push(record)
+          return { raw, models: mergeModels(usage.models) }
+        })
+        group.missing_summary = false
+        summariesChanged = true
+        group.summary_models = selected.models
+        result.group_summaries![key] = { id: key, point_ids: selected.ids, models: selected.models, missing: [], level: 0, children: [], fingerprint: hash(JSON.stringify([key, selected.ids])),
+          ...(selected.acceptedRef ? { acceptedRef: selected.acceptedRef } : {}) }
+        result.gaps = result.gaps?.filter(gap => gap.kind !== 'summary' || !gap.segment_hashes.length || !gap.segment_hashes.every(hash => group.parts.some(part => part.text_hash === hash))) ?? []
+      } catch (error) { if (globalFailure(error, options.signal ?? new AbortController().signal)) throw error }
+      await writeJson(root, progressPath(grouping), result)
+    }
+    if (!options.retrySources || summariesChanged) await synthesizeSourceSummary(result, Object.keys(result.group_summaries ?? {}), options, settings, inputLimit,
+      () => writeJson(root, progressPath(grouping), result), globalFailure)
+    return finish(result)
+  }
   if (previous?.in_progress && previous.summary_pending && !previous.gaps?.some(gap => gap.segment_hashes.length && (gap.kind === 'group' || gap.kind === 'summary'))
     && previous.source_hash === source.contentHash && previous.grouping_fingerprint === grouping && retainedPlan && sameProcessing(previous.processing, processing)) {
     const result = structuredClone(previous)
@@ -523,6 +613,7 @@ async function extractSourceOnce(root: string, sourceId: string, source: LocalSo
       () => writeJson(root, progressPath(result.grouping_fingerprint!), result), globalFailure)
     return finish(result)
   }
+  if (options.retrySources) throw new Error('来源摘要补缺无法复用已发布计划或成果，已停止，未重新提取。')
   const headings: { start: number; end: number; text: string }[] = []
   const sourceLines = source.text.split(/\r?\n/)
   const visit = (node: Nodes): void => {
@@ -614,6 +705,10 @@ async function extractSourceOnce(root: string, sourceId: string, source: LocalSo
   }
   const pendingChunks = chunks.filter(parts => !completedChunks.has(keyFor(parts)))
   const result: Extraction = { format_version: 1, tag_version: 1, tags: [], source_id: sourceId, source_hash: source.contentHash, processing: { ...processing }, metadata: { ...source.metadata }, calls: partial ? structuredClone(previous?.calls ?? []) : [],
+    ...Object.fromEntries(['summary_plans', 'summary_blocks'].flatMap(field => {
+      const value = (previous as unknown as Record<string, unknown> | undefined)?.[field]
+      return value && sameProcessing(previous?.processing, processing) ? [[field, structuredClone(value)]] : []
+    })),
     models: mergeModels(partial || reused.size ? previous?.models : undefined,
       ...[...reused.values()].flatMap(segment => [...segment.points.map(point => point.models), ...segment.terms.map(term => term.models)])),
     correction_attempts: sameProcessing(previous?.processing, processing) && previous?.source_hash === source.contentHash && previous.grouping_fingerprint === grouping ? structuredClone(previous.correction_attempts ?? {}) : {},
@@ -636,6 +731,20 @@ async function extractSourceOnce(root: string, sourceId: string, source: LocalSo
     ...(partial ? { in_progress: true, completed_chunks: [...completedChunks], chunk_results: structuredClone(previous.chunk_results ?? {}) } : {}) }
   const ranks = ['unknown', 'low', 'medium', 'high']
   const cachedPoints = result.segments.reduce((sum, segment) => sum + segment.points.length, 0)
+  const paragraphChapters = new Map(allocation.chapters.flatMap(chapter => chapter.paragraph_ids.map(id => [id, chapter.id] as const)))
+  const evidenceChapters = new WeakMap<Point, Set<string>>()
+  const pointsInChapter = (chapter: SourceChapter) => result.segments.flatMap(segment => segment.points).filter(point => {
+    let chapters = evidenceChapters.get(point)
+    if (!chapters) {
+      // 覆盖来自可定位的本章原文；跨章联合证据可同时覆盖各章，主段号不作证据。
+      chapters = new Set(point.evidence.flatMap(evidence => {
+        const owner = evidenceParagraph(whole, evidence), id = owner && paragraphChapters.get(owner.paragraph_id)
+        return id ? [id] : []
+      }))
+      evidenceChapters.set(point, chapters)
+    }
+    return chapters.has(chapter.id)
+  })
   const reservedQuota = Object.values(result.chunk_results ?? {}).reduce((sum, value) => sum + value.quota, 0)
   const available = Math.max(0, allocation.limit - (partial ? reservedQuota : cachedPoints))
   const fresh = pendingChunks.filter(parts => !result.chunk_results?.[keyFor(parts)])
@@ -676,7 +785,8 @@ async function extractSourceOnce(root: string, sourceId: string, source: LocalSo
   }
   const checkpoint = async () => {
     result.in_progress = true; refresh()
-    await writeJson(root, progressPath(grouping), result)
+    await writeJson(root, progressPath(grouping), { ...result, reextractGeneration: recoveryContext()?.pending.reextractGenerations?.[sourceId]
+      ?? (options.taskModelIdentity as { reextractJob?: number } | undefined)?.reextractJob ?? 0 })
   }
   const signal = options.signal ?? new AbortController().signal
   type PointOutput = z.infer<typeof outputSchema>['points'][number]
@@ -709,6 +819,7 @@ async function extractSourceOnce(root: string, sourceId: string, source: LocalSo
     models: ModelRef[]
     initialModels: ModelRef[]
     itemModels: Record<string, ModelRef[]>
+    acceptedRef?: AcceptedRef
   }
   type CoverageTask = { state: ChunkState; chapter: SourceChapter; chapterParts: Paragraph[]; floor: number; target: number; coverageKey: string; coverageInput: string; extra?: z.infer<typeof groupSchema>; candidates?: Candidate[]; models?: ModelRef[]; error?: unknown }
   const rejected = (rule: string, expected: string, actual: string): ExtractionRejection => ({ rule, expected, actual: actual.slice(0, 240) })
@@ -802,8 +913,11 @@ async function extractSourceOnce(root: string, sourceId: string, source: LocalSo
     const usage = modelUsage(options.client)
     let raw = '', cause: unknown, failed = false
     const attachments = await images?.(parts.map(part => part.paragraph_id))
-    try { raw = await callGate.run(() => usage.client.call('ingest', prompt, request, signal, attachments,
-      { operation: 'extract', structuredSchemaKind: schema === correctionSchema ? 'correction' : 'extraction', onAttempt: attempt => attempts.push(attempt), structuredSchema: { name: schema === coverageBatchOutput ? 'layered_coverage_batch' : 'layered_extraction', schema: schemaJSON(schema) } }), signal) }
+    try { raw = await withAcceptedCall({ unitId: sourceId + '/group/' + state.chunkKey,
+      operation: schema === coverageBatchOutput ? 'coverage' : schema === wireOutput || schema === longdocOutput || schema === correctionSchema ? 'extract' : 'sourceSummary',
+      dependencyTaskIds: state.acceptedRef ? [state.acceptedRef.taskId] : [] },
+      () => callGate.run(() => usage.client.call('ingest', prompt, request, signal, attachments,
+        { operation: 'extract', structuredSchemaKind: schema === correctionSchema ? 'correction' : 'extraction', onAttempt: attempt => attempts.push(attempt), structuredSchema: { name: schema === coverageBatchOutput ? 'layered_coverage_batch' : 'layered_extraction', schema: schemaJSON(schema) } }), signal)) }
     catch (error) { failed = true; cause = error }
     state.models = mergeModels(state.models, usage.models)
     result.models = mergeModels(result.models, usage.models)
@@ -823,8 +937,10 @@ async function extractSourceOnce(root: string, sourceId: string, source: LocalSo
     if (result.models[0]) result.actual_model = `${result.models[0].provider}/${result.models[0].model}`
     if (evidenceIds.length) {
       try {
+        const original = raw
         raw = JSON.stringify(parseModelJson(raw, schemaJSON(schema)), (key, value) => key === 'evidence_ref' && typeof value === 'string'
           ? evidenceRefs.has(value) ? evidenceRefs.original(value) : '未知证据短编号：' + value : value)
+        aliasAcceptedResponse(original, raw)
       } catch { /* 非法 JSON 保留原文，交由已有组级校验处理。 */ }
     }
     return { raw, models: mergeModels(usage.models) }
@@ -983,8 +1099,12 @@ async function extractSourceOnce(root: string, sourceId: string, source: LocalSo
     try {
       const candidate = result.group_cache![chunkKey]
       const parsedCandidate = candidate && cachedGroup(candidate.raw, true)
-      const saved = candidate && parsedCandidate && Math.max(candidate.quota, parsedCandidate.points.length) >= quota && !candidate.missing_summary ? candidate : undefined
+      const saved = candidate && parsedCandidate && (!candidate.missing_summary || !candidate.gaps?.some(gap => gap.kind !== 'summary'))
+        && Math.max(candidate.quota, parsedCandidate.points.length) >= quota ? candidate : undefined
       state.saved = saved
+      const savedRef = activeAcceptedRefs([(cached as { acceptedRef?: AcceptedRef } | undefined)?.acceptedRef
+        ?? (saved as { acceptedRef?: AcceptedRef } | undefined)?.acceptedRef].filter((ref): ref is AcceptedRef => Boolean(ref)))[0]
+      if (savedRef) state.acceptedRef = savedRef
       if (!cached && saved) {
         state.models = mergeModels(saved.models)
         state.initialModels = mergeModels(saved.summary_models)
@@ -1026,9 +1146,30 @@ async function extractSourceOnce(root: string, sourceId: string, source: LocalSo
         state.models = []
         state.initialModels = []
         state.itemModels = {}
-        const response = await callFor(state)(prompt, request)
+        const prepared = extractionRequest(prompt, request, longdoc ? longdocOutput : wireOutput)
+        const receipt = await recoveryTask({ ...options, signal }, 'extract', { request, prompt },
+          async () => {
+            if (recoveryContext() && Buffer.byteLength(prepared.prompt + prepared.request) > inputLimit) {
+              if (parts.length > 1) throw new ExtractionFailure(new Error('未完成组需要按新窗口细分。'), true)
+              throw Object.assign(new Error('单个完整提取成员超过新窗口，已保留成功组和原始证据。'), { stagePause: true, stage: 'extract', code: 'NO_COMPATIBLE_CANDIDATE' })
+            }
+            return callFor(state)(prompt, request)
+          }, value => {
+            const output = cachedGroup(value.raw, true)
+            if (!output) return false
+            const validator = contextFor(state)
+            return [...output.points.map((item, index) => ({ kind: 'point' as const, item, index, key: 'point:' + index })),
+              ...output.terms.map((item, index) => ({ kind: 'term' as const, item, index, key: 'term:' + index }))]
+              .every(candidate => !validator.inspectCandidate(candidate).reasons.length)
+          }, { unitId: sourceId + '/group/' + chunkKey, sourceRefs: [{ sourceId, sourceVersion: source.sourceVersion ?? source.contentHash }], operation: 'extract',
+            input: businessValue({ request, resources: parts.map(part => resources[part.paragraph_id] ?? []) }), prompt,
+            schema: schemaJSON(longdoc ? longdocOutput : wireOutput), validatorVersion: extractionProtocol, semanticVersion: extractionProtocol,
+            groupPlan: { members: parts, quota } })
+        const response = receipt.value
+        if (receipt.acceptedRef) state.acceptedRef = receipt.acceptedRef
         raw = response.raw
         state.initialModels = response.models
+        state.models = mergeModels(state.models, response.models)
       }
       result.models = mergeModels(result.models, state.models)
       state.raw = raw
@@ -1036,11 +1177,13 @@ async function extractSourceOnce(root: string, sourceId: string, source: LocalSo
       try {
         output = groupSchema.parse(parseModelJson(raw, schemaJSON(wireOutput)))
       } catch (error) {
+        await rejectAcceptedResponse(raw)
         await record(system, request, raw, [rejected('output-schema', '合法 JSON 与提取结构', String(error))])
         throw new ExtractionFailure(error, true)
       }
       const progress = (result.chunk_results ??= {})[chunkKey] ??= { raw, quota, completed_items: [], correction_batches: 0 }
       state.progress = progress; state.output = output
+      if (state.acceptedRef) Object.assign(progress, { acceptedRef: state.acceptedRef })
       progress.models = mergeModels(progress.models, state.models)
       progress.initial_models = mergeModels(state.initialModels)
       progress.item_models = state.itemModels
@@ -1103,9 +1246,22 @@ async function extractSourceOnce(root: string, sourceId: string, source: LocalSo
         .sort((a, b) => Number(a.point_id.split('.').at(-1)) - Number(b.point_id.split('.').at(-1)))
         .map(point => [Number(point.point_id.split('.').at(-1)), point.point_id]))
       const selectedIndices = output.summary_point_indices?.map(index => saved?.point_indices?.[index] ?? index) ?? [...accepted.keys()].slice(0, settings.sourceSummaryMaxPoints)
-      const requested = saved ? selectedIndices.filter(index => accepted.has(index)) : selectedIndices
-      const invalid = saved?.missing_summary || requested.length > settings.sourceSummaryMaxPoints || requested.some(index => !accepted.has(index))
+      const savedSummary = saved && !saved.missing_summary ? previous?.group_summaries?.[chunkKey] : undefined
+      let requested = savedSummary && !savedSummary.missing.length && savedSummary.point_ids.every(id => [...accepted.values()].includes(id))
+        ? savedSummary.point_ids.map(id => [...accepted].find(([, value]) => value === id)![0])
+        : saved ? selectedIndices.filter(index => accepted.has(index)) : selectedIndices
+      let invalid = Boolean(saved?.missing_summary) || requested.length > settings.sourceSummaryMaxPoints || requested.some(index => !accepted.has(index))
+      let summaryRef = state.acceptedRef
+      if (saved?.missing_summary && accepted.size) {
+        try {
+          const selected = await retrySummary(result, chunkKey, [...accepted.values()], callFor(state))
+          requested = selected.ids.map(id => [...accepted].find(([, pointId]) => pointId === id)![0])
+          summaryRef = selected.acceptedRef ?? summaryRef
+          state.initialModels = mergeModels(selected.models); invalid = false
+        } catch (error) { if (globalFailure(error, signal)) throw error }
+      }
       result.group_summaries![chunkKey] = { id: chunkKey, point_ids: [...new Set(requested)].filter(index => accepted.has(index)).slice(0, settings.sourceSummaryMaxPoints).map(index => accepted.get(index)!),
+        ...(summaryRef ? { acceptedRef: summaryRef } : {}),
         models: mergeModels(state.initialModels), missing: invalid || !accepted.size ? [chunkKey] : [], level: 0, children: [], fingerprint: hash(JSON.stringify([chunkKey, requested])) }
       if (invalid) result.gaps!.push({ kind: 'summary', segment_hashes: parts.map(part => part.text_hash), item: requested,
         reasons: [rejected('summary-support', '摘要只引用本组已通过逐字校验的要点', '存在未校验要点下标或超出摘要上限')] })
@@ -1121,6 +1277,7 @@ async function extractSourceOnce(root: string, sourceId: string, source: LocalSo
         return !checked.reasons.length && checked.item ? [{ item: checked.item, models: state.itemModels['term:' + index] ?? state.initialModels }] : []
       })
       state.normalizedCache = { parts, quota: Math.max(quota, saved?.quota ?? 0), selected_quota: quota, gaps: state.ownGaps, missing_summary: Boolean(invalid), point_indices: indices,
+        ...(state.acceptedRef ? { acceptedRef: state.acceptedRef } : {}),
         models: mergeModels(state.models), summary_models: mergeModels(state.initialModels),
         item_models: Object.fromEntries([
           ...candidates.map(({ point }, index) => ['point:' + index, mergeModels(point.models)] as const),
@@ -1182,7 +1339,7 @@ async function extractSourceOnce(root: string, sourceId: string, source: LocalSo
       const chapterParts = whole.filter(part => chapter.paragraph_ids.includes(part.paragraph_id))
       // 包名额只指导首提；补提兑现原章节底线，最终仍按篇级硬上限选择。
       const floor = chapterMinimum(chapter, chapterParts, settings), target = Math.min(selectLimit, floor)
-      const existingPoints = chapter.paragraph_ids.flatMap(id => result.segments[id]?.points ?? [])
+      const existingPoints = pointsInChapter(chapter)
       const coverageKey = 'coverage:' + chapter.id
       if (!target || existingPoints.length >= target || coveragePurpose(chapter.title, '') !== '研究内容'
         || leaves.some(state => state.progress?.completed_items.includes(coverageKey))) continue
@@ -1285,7 +1442,7 @@ async function extractSourceOnce(root: string, sourceId: string, source: LocalSo
       signal.throwIfAborted()
       const state = task.state, chapter = task.chapter, progress = state.progress!
       state.finalized = false
-      const existing = chapter.paragraph_ids.flatMap(id => result.segments[id]?.points ?? []).length
+      const existing = pointsInChapter(chapter).length
       if (existing < task.target && !task.error && task.extra) {
         const missing = task.target - existing, known = new Set(result.segments.flatMap(segment => segment.points).map(identity))
         let added = 0
@@ -1305,7 +1462,7 @@ async function extractSourceOnce(root: string, sourceId: string, source: LocalSo
         progress.raw = JSON.stringify(state.output)
       }
       if (task.extra && !task.error) progress.completed_items.push(task.coverageKey)
-      if (chapter.paragraph_ids.flatMap(id => result.segments[id]?.points ?? []).length < task.floor) {
+      if (pointsInChapter(chapter).length < task.floor) {
         const gap: ExtractionGap = { kind: 'point', segment_hashes: task.chapterParts.map(part => part.text_hash), item: { chapter: chapter.title, chapter_id: chapter.id },
           reasons: [rejected('chapter-coverage', '本章至少 ' + task.floor + ' 个要点', task.error ? String(task.error) : '补提一次后未达底线')] }
         result.gaps!.push(gap); state.ownGaps.push(gap)
@@ -1327,7 +1484,7 @@ async function extractSourceOnce(root: string, sourceId: string, source: LocalSo
   const allPoints = result.segments.flatMap(segment => segment.points)
   // 先兑现已分配的章节名额，补提不挤占其他章名额；余量保留首提的有效事实。
   const selected = selectSourcePoints(allPoints, selectLimit, allocation.chapters.map(chapter => ({
-    ids: new Set(chapter.paragraph_ids.flatMap(id => result.segments[id]!.points.map(point => point.point_id))),
+    ids: new Set(pointsInChapter(chapter).map(point => point.point_id)),
     minimum: Math.max(chapter.quota, chapterMinimum(chapter, whole, settings)),
   })))
   const droppedPoints = allPoints.filter(point => !selected.has(point.point_id))
@@ -1351,12 +1508,12 @@ async function extractSourceOnce(root: string, sourceId: string, source: LocalSo
       details: { truncated_points: overflow, points: droppedPoints } })
   }
   for (const chapter of allocation.chapters) {
-    if (!chapter.quota && !chapter.paragraph_ids.some(id => result.segments[id]!.points.length) && coveragePurpose(chapter.title, '') === '研究内容'
+    if (!chapter.quota && !pointsInChapter(chapter).length && coveragePurpose(chapter.title, '') === '研究内容'
       && whole.some(part => chapter.paragraph_ids.includes(part.paragraph_id) && bodyCharacters(part.text) > 0)) result.gaps!.push({
       kind: 'point', segment_hashes: chapter.paragraph_ids.map(id => source.segments[id]!.text_hash), item: { chapter: chapter.title, chapter_id: chapter.id },
       reasons: [{ rule: 'chapter-quota', expected: '本章至少分配 1 个名额', actual: '章节配额不足：篇级上限已分完' }],
     })
-    const floor = chapterMinimum(chapter, plan.flat(), settings), count = chapter.paragraph_ids.flatMap(id => result.segments[id]!.points).length
+    const floor = chapterMinimum(chapter, plan.flat(), settings), count = pointsInChapter(chapter).length
     if (count < floor && !result.gaps!.some(gap => (gap.item as { chapter_id?: string } | null)?.chapter_id === chapter.id)) result.gaps!.push({ kind: 'point',
       segment_hashes: chapter.paragraph_ids.map(id => source.segments[id]!.text_hash), item: { chapter: chapter.title, chapter_id: chapter.id },
       reasons: [{ rule: 'chapter-coverage', expected: '本章至少 ' + floor + ' 个要点', actual: '硬上限保留后为 ' + count + ' 个' }] })
@@ -1411,6 +1568,8 @@ export function renderSource(entry: SourceEntry, extraction: Extraction): string
     }).filter(Boolean).join('\n') || '暂无通过校验的摘要要点。')
       + (summary.missing.length ? '\n\n摘要覆盖缺口：' + [...new Set(summary.missing.map(id => extraction.chapters?.find(chapter => id.startsWith(chapter.id))?.title ?? id))].join('、') + '。' : ''))
   }
+  const summaryExclusions = Object.values(extraction.group_cache ?? {}).filter(group => group.summary_excluded_reason)
+  if (summaryExclusions.length) blocks.push(`摘要补缺排除：${summaryExclusions.length} 组无可用摘要依据，原组在现有已校验要点中没有匹配成员。已有要点保留。`)
   if (extraction.chapters?.length) {
     const label = (title: string) => title.replace(/[\[\]<>]/g, '')
     blocks.push('## 章节导航\n\n' + extraction.chapters.map(chapter => `- [${label(chapter.title)}](#^${chapterBlockId(chapter.id)})`).join('\n'))

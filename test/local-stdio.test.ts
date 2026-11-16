@@ -2,12 +2,13 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { expect, it, vi } from 'vitest'
 import path from 'node:path'
+import { readFile } from 'node:fs/promises'
 import { LocalConfigStore } from '../src/local/config.js'
 import { fixture } from './query-pages-audit-fixture.js'
 import { cleanupLayeredFixtures } from './layered-fixture.js'
 
 vi.mock('node:fs/promises', async original => ({ ...await original<typeof import('node:fs/promises')>() }))
-it('构建产物 stdio 握手、列出九工具并成功查询一次', async () => {
+it('构建产物 stdio 握手、列出十九工具并成功查询一次', async () => {
   const f = await fixture(), config = new LocalConfigStore(path.join(f.temp, 'home'))
   await config.load(); f.library.layered = { embeddingMode: 'none' }
   await config.writeRegistry(f.registry, config.registry())
@@ -18,7 +19,9 @@ it('构建产物 stdio 握手、列出九工具并成功查询一次', async () 
   let diagnostics = ''; transport.stderr?.on('data', chunk => { diagnostics += String(chunk) })
   try {
     await client.connect(transport)
-    const tools = await client.listTools(); expect(tools.tools).toHaveLength(9)
+    const metadata = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'))
+    expect(client.getServerVersion()?.version).toBe(metadata.version)
+    const tools = await client.listTools(); expect(tools.tools).toHaveLength(19)
     const result = await client.callTool({ name: 'wiki_search', arguments: { query: '审查证据', variants: ['审查'], include: 'hits' } })
     expect(result.isError, diagnostics).not.toBe(true)
     const value = JSON.parse((result.content as { text: string }[])[0]!.text)

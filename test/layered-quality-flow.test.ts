@@ -26,8 +26,8 @@ function extraction(input: LocalSource, points: Point[]): Extraction {
   return { format_version: 1, source_id: 'S-0001', source_hash: input.contentHash, processing, metadata: input.metadata, calls: [],
     segments: input.segments.map((segment, index) => ({ ...segment, processing_fingerprint: '', resource_hashes: [], points: index ? [] : points, terms: [] })) }
 }
-function point(id: string, text: string, quote: string, locator = 'L1-L1'): Point {
-  return { point_id: id, text, section: '主要发现', locator, text_hash: '', source_version: 'v', evidence: [{ source_id: 'S-0001', source_version: 'v', locator, quote }] }
+function point(id: string, text: string, quote: string, locator = 'L1-L1', sourceVersion = 'v'): Point {
+  return { point_id: id, text, section: '主要发现', locator, text_hash: '', source_version: sourceVersion, evidence: [{ source_id: 'S-0001', source_version: sourceVersion, locator, quote }] }
 }
 
 it('章节包保持顺序且不为短章单独首提，同篇并发，漏章只补一次并记缺口', async () => {
@@ -78,11 +78,12 @@ it('普通短文硬上限按结果优先截断留痕，超长文仍按同一长�
 
 it('提取核对只发引文邻近行，补证不改主张，失败降级，未变化跳过且多篇并发', async () => {
   const input = source('设计A。\n结果20%。\n条件B。\n未支持其他结论。\n第五行。\n第六行。')
-  const make = () => extraction(input, [point('p1', '设计A的结果20%。', '设计A。'), point('p2', '不存在的结论。', '设计A。')])
+  const sourceVersion = input.sourceVersion ?? input.contentHash
+  const make = () => extraction(input, [point('p1', '设计A的结果20%。', '设计A。', 'L1-L1', sourceVersion), point('p2', '不存在的结论。', '设计A。', 'L1-L1', sourceVersion)])
   let active = 0, peak = 0
   const requests: any[] = []
   const config = options(async (_task, _system, raw, _signal, _images, route) => {
-    expect(route?.operation).toBe('extract')
+    expect(route?.operation).toBe('extractionReview')
     const data = JSON.parse(raw); requests.push(data); active++; peak = Math.max(peak, active); await setImmediate(); active--
     if (data.review_stage === 'extraction') return JSON.stringify({ items: data.points.map((p: any) => ({ id: p.id, support: '部分支撑', missing: '补充结果行' })) })
     return JSON.stringify({ items: data.items.map((item: any) => { const before = item.validationFeedback.item

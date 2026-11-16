@@ -42,11 +42,11 @@ it('检查和智能修复跳过生成区，只修复人工区坏链接并保留�
   } finally { await f.cleanup() }
 })
 
-it('问答拒绝正文未出现证据编号的回答', async () => {
+it('问答拒绝缺少证据编号的事实单元', async () => {
   const f = await fixture()
   try {
     await f.put('concepts/a.md', '# 测试方法\n\n虚构依据。')
-    await expect(askWiki(f.store, f.library.id, '测试方法', [], runtime('{"answer":"没有引用编号","citations":[1]}'))).rejects.toThrow('正文必须使用引用编号')
+    await expect(askWiki(f.store, f.library.id, '测试方法', [], runtime('{"units":[{"block":"paragraph","text":"没有引用编号","citationIds":[]}]}'))).rejects.toMatchObject({ name: 'ModelOutputValidationError' })
   } finally { await f.cleanup() }
 })
 
@@ -56,7 +56,7 @@ it('问答通过既有图排序获取间接相连的 Wiki 依据', async () => {
     await f.put('concepts/a.md', '# 测试方法\n\n[[concepts/b]]')
     await f.put('concepts/b.md', '# 桥接\n\n[[concepts/c]]')
     await f.put('concepts/c.md', '# 最终条件\n\n必须核对实际出处。')
-    const answer = await askWiki(f.store, f.library.id, '测试方法', [], runtime('{"answer":"核对出处 [3]","citations":[3]}'))
+    const answer = await askWiki(f.store, f.library.id, '测试方法', [], runtime('{"units":[{"block":"paragraph","text":"核对出处","citationIds":[3]}]}'))
     expect(answer.citations[0]?.path).toBe('concepts/c.md')
   } finally { await f.cleanup() }
 })
@@ -65,7 +65,7 @@ it('问答预算不足时移除旧历史后缩短证据，返回实际使用的�
   const f = await fixture()
   try {
     await f.put('concepts/a.md', '# 测试方法\n\n' + '虚构知识依据。'.repeat(1000))
-    const answer = await askWiki(f.store, f.library.id, '测试方法', [{ question: '旧问题', answer: '旧答案'.repeat(1000) }], runtime('{"answer":"依据 [1]","citations":[1]}', 3500))
+    const answer = await askWiki(f.store, f.library.id, '测试方法', [{ question: '旧问题', answer: '旧答案'.repeat(1000) }], runtime('{"units":[{"block":"paragraph","text":"依据","citationIds":[1]}]}', 5000))
     expect(answer.historyUsed).toBe(0)
     expect(answer.citations[0]!.excerpt.length).toBeLessThan(1000)
   } finally { await f.cleanup() }
@@ -79,7 +79,7 @@ it('问答尊重 Obsidian 共享清单的名称及参与查询开关', async () 
     f.library.kind = 'obsidian'; f.library.mode = 'readonly'; f.library.vaultPath = f.root
     const manifest = { version: 1, databases: [{ name: '清单中的名称', description: '清单简介', wikiFolder: 'wiki', dshEnabled: true }] }
     await writeFile(path.join(f.root, '.llm-wiki-databases.json'), JSON.stringify(manifest))
-    expect((await askWiki(f.store, f.library.id, '测试方法', [], runtime('{"answer":"依据 [1]","citations":[1]}'))).citations[0]?.path).toBe('concepts/a.md')
+    expect((await askWiki(f.store, f.library.id, '测试方法', [], runtime('{"units":[{"block":"paragraph","text":"依据","citationIds":[1]}]}'))).citations[0]?.path).toBe('concepts/a.md')
     manifest.databases[0]!.dshEnabled = false
     await writeFile(path.join(f.root, '.llm-wiki-databases.json'), JSON.stringify(manifest))
     await expect(askWiki(f.store, f.library.id, '测试方法', [], runtime(''))).rejects.toThrow('查询开关')

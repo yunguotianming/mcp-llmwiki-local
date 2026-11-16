@@ -1,4 +1,5 @@
 import { expandCitationVersions } from './anchors.js'
+import { persistTopicRecovery, topicGapDiagnostics } from './topic-recovery.js'
 import { preparePageVectors } from './vector-build.js'
 import type { BuildLayeredOptions } from './schema.js'
 import { matchQuotation } from './quotation.js'
@@ -19,7 +20,7 @@ import { locatorRange, processingFingerprint, renderSource, resultFingerprint, s
 import { formatVersion } from './schema.js'
 import type { Dependencies, Extraction, LibraryCard, PendingBuild, Point, SnapshotManifest } from './schema.js'
 import { checkGeneration, indexDependencies, readRevocations, revocationLog } from './revocations.js'
-import { topicHeader, topicInputFingerprint, topicPointHashes } from './topics.js'
+import { previousState, topicHeader, topicInputFingerprint, topicPointHashes } from './topics.js'
 import { topicReviewFingerprint } from './topic-review.js'
 import { citedTopicPoints } from './topic-metadata.js'
 import type { TopicEvidenceSource } from './topic-metadata.js'
@@ -30,6 +31,11 @@ import { validSourceId } from './revocations.js'
 import { validateSiyuanSnapshot } from './siyuan.js'
 import { prepareTags, mergedTags, personalTag, tagStatus } from './tags.js'
 import { publicationCreated, publicationMetadata } from './frontmatter.js'
+import { isProductionFormat, publicationProvenance, readProvenance, writeProvenance, readProtocol, protocolError, sidecarPath } from './models.js'
+import { readVersionCosts, writeVersionCosts } from './costs.js'
+import { storageJson } from './vectors.js'
+import { upgradeLibrary } from './upgrade.js'
+import type { UpgradeOptions } from './upgrade.js'
 
 export { readLayeredPage } from './revocations.js'
 export { readCurrent, readManifest } from './objects.js'
@@ -52,7 +58,7 @@ function rootLinks(text: string, sourcePage: string, exists: (page: string) => b
   })
 }
 
-export async function initializeLibrary(knowledgeRoot: string, card: LibraryCard, takeoverToken?: string, legacyLibraryAction?: 'backup', selectedRoot?: string): Promise<string> {
+export async function initializeLibrary(knowledgeRoot: string, card: LibraryCard, takeoverToken?: string, legacyLibraryAction?: 'backup', selectedRoot?: string, upgradeOptions?: UpgradeOptions): Promise<string> {
   const root = selectedRoot ?? (card.origin_type === 'siyuan' ? knowledgeRoot : await libraryRoot(knowledgeRoot))
   let exists = false, compatible = false, backupPath: string | undefined
   try { exists = (await lstat(root)).isDirectory(); if (!exists) throw new Error('Wiki 路径不是目录。') }
@@ -64,7 +70,14 @@ export async function initializeLibrary(knowledgeRoot: string, card: LibraryCard
       compatible = saved?.format_version === formatVersion
     }
     catch (error) { if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error }
-    if (compatible) await checkWriter(root, takeoverToken)
+    if (compatible) {
+      await checkWriter(root, takeoverToken)
+      const policy = await readOptional(await safePath(root, '.llmwiki/policy.json'))
+      if (policy) {
+        const upgrade = await upgradeLibrary(root, upgradeOptions)
+        if (upgrade?.status === 'paused') throw Object.assign(new Error(upgrade.reason ?? '旧库升级已暂停。'), { budgetPause: true, upgrade })
+      }
+    }
     if (!compatible) {
       if (card.origin_type === 'siyuan' && (await readdir(root)).some(name => name !== '.llmwiki-build.lock')) throw new Error('思源库目录已有不兼容内容，请选择空目录。')
       const entries = await readdir(root, { recursive: true, withFileTypes: true })
@@ -81,7 +94,7 @@ export async function initializeLibrary(knowledgeRoot: string, card: LibraryCard
       const timestamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`
       let suffix = 0, backup: string
       for (;;) {
-        backup = await safePath(knowledgeRoot, `.llmwiki.bak-${timestamp}${suffix ? '-' + suffix : ''}`)
+        backup = await safePath(path.dirname(root), `.llmwiki.bak-${timestamp}${suffix ? '-' + suffix : ''}`)
         try { await lstat(backup); suffix++ }
         catch (error) { if (error instanceof Error && 'code' in error && error.code === 'ENOENT') break; throw error }
       }
@@ -100,6 +113,7 @@ export async function initializeLibrary(knowledgeRoot: string, card: LibraryCard
   await Promise.all(['wiki', 'objects', 'versions', 'state', 'work', 'logs'].map(async name => mkdir(await safePath(root, name), { recursive: true })))
   if (backupPath) await writeJson(root, 'state/legacy-backup.json', { backupPath })
   if (!compatible) await atomicWrite(root, 'library.yaml', stringify(card))
+  if (!compatible && upgradeOptions?.initialPolicy) await writeJson(root, '.llmwiki/policy.json', { ...upgradeOptions.initialPolicy, libraryFormat: '0.3.0' })
   if (!await readOptional(await safePath(root, 'state/revocations.json'))) {
     if (await readCurrent(root)) throw new Error('撤权表缺失，不能为已发布库重置撤权代次。')
     await writeJson(root, 'state/revocations.json', { generation: 0, sources: [] })
@@ -238,10 +252,13 @@ export async function validatePublication(root: string, version: string): Promis
   await checkGeneration(root, manifest.revocation_generation)
 }
 export async function finishPublication(root: string, pending: PendingBuild): Promise<void> {
+  await verifyPublicationRefs(root, pending)
   await checkGeneration(root, pending.manifest.revocation_generation)
   const current = await readCurrent(root)
   if (!pending.version || current?.version !== pending.version) throw new Error('不能清理尚未发布的待更新清单。')
   const manifest = await readVersion(root, pending.version)
+  // 简介刷新独立于知识发布；B6b 在释放库写锁后消费，失败或重启仍可重试。
+  await writeJson(root, 'state/summary-refresh.json', { version: pending.version, generation: manifest.revocation_generation })
   await withRevocationLock(root, async () => {
     await checkGeneration(root, pending.manifest.revocation_generation)
     await refreshReadingCopy(root, manifest)
@@ -328,7 +345,8 @@ export async function publishLibrary(root: string, pending: PendingBuild, signal
     }
   }
   // 失败的发布尝试不确定首次发布时间；只继承已发布版本固化的时间。
-  pending.manifest.page_created = pending.base_version ? (await readVersion(root, pending.base_version)).page_created ?? {} : {}
+  const previous = pending.base_version ? await readVersion(root, pending.base_version) : undefined
+  pending.manifest.page_created = previous?.page_created ?? {}
   const publishRoot = await safePath(root, 'versions')
   await mkdir(publishRoot, { recursive: true })
   const versions = (await readdir(publishRoot)).filter(name => /^v\d{6,}\.json$/.test(name)).map(name => Number(name.slice(1, -5)))
@@ -339,7 +357,8 @@ export async function publishLibrary(root: string, pending: PendingBuild, signal
   const files: [string, string][] = [], allPoints: Point[] = []
   const publicationTags = pending.terms ? prepareTags(pending.terms.records) : undefined
   const gaps: string[] = (pending.manifest.gaps ?? []).map(gap => `- 导出缺口 ${gap.source_id}：${hash(JSON.stringify(gap))}`)
-  const topicGaps = (pending.manifest.topic_gaps ?? []).map(gap => `- 主题缺口 ${gap.topic_id}：${gap.message.replace(/[\r\n]/g, ' ')}；${gap.point_ids.length} 条成员要点保留在来源页。`)
+  persistTopicRecovery(pending)
+  const topicGaps = topicGapDiagnostics(pending.manifest, pending.topics ? { ...pending.topics, gaps: pending.manifest.topic_gaps ?? pending.topics.gaps ?? [] } : undefined).map(gap => `- 主题缺口 ${gap.topic_id} [${gap.category}／${gap.effect}／${gap.stage}]：${gap.message.replace(/[\r\n]/g, ' ')}；${gap.point_ids.length} 条成员要点保留在来源页。`)
   gaps.push(...topicGaps)
   const deps: Dependencies = { pages: {}, reverse: {} }
   for (let offset = 0; offset < pending.manifest.sources.length; offset += 8) {
@@ -370,9 +389,18 @@ export async function publishLibrary(root: string, pending: PendingBuild, signal
   for (const [page, topic] of Object.entries(pending.topics?.pages ?? {}).sort(([a], [b]) => a.localeCompare(b))) { signal?.throwIfAborted(); files.push([page, topic.content]); deps.pages[page] = topic.dependencies }
   for (const [page, term] of Object.entries(pending.terms?.pages ?? {}).sort(([a], [b]) => a.localeCompare(b))) { files.push([page, term.content]); deps.pages[page] = term.dependencies }
   Object.assign(deps.pages, pending.terms?.section_dependencies ?? {})
+  // 定向补缺跳过的阶段保留基线成果；只补本轮未产出的页面，不覆盖已更新的叶页和父页。
+  const inherited = new Map<string, string>()
+  if (pending.source_scope && previous) {
+    const produced = new Set(files.map(([page]) => page))
+    for (const [page, digest] of Object.entries(previous.pages ?? {})) if (page !== 'index.md' && !page.startsWith('sources/') && !produced.has(page)) {
+      files.push([page, await versionPage(root, previous, page)]); inherited.set(page, digest)
+    }
+    for (const [page, dependency] of Object.entries(previous.deps?.pages ?? {})) if (!page.startsWith('sources/') && !deps.pages[page]) deps.pages[page] = structuredClone(dependency)
+  }
   // 旧待发布状态也只重渲染，提取对象与模型缓存不变。
   const anchors = evidenceBlockIds(allPoints)
-  for (const file of files) if (!file[0].startsWith('sources/')) file[1] = migrateAnchors(file[1], anchors)
+  for (const file of files) if (!file[0].startsWith('sources/') && !inherited.has(file[0])) file[1] = migrateAnchors(file[1], anchors)
   const blockRef = (page: string) => page.includes('#') && !page.includes('#^') ? page.split('#')[0] + '#^' + sectionBlockId(page.split('#')[1]!) : page
   deps.pages = Object.fromEntries(Object.entries(deps.pages).map(([page, dependency]) => {
     for (const child of dependency.children ?? []) child.page = blockRef(child.page)
@@ -393,9 +421,11 @@ export async function publishLibrary(root: string, pending: PendingBuild, signal
     topicPath(pending.manifest.topic_gaps![index]!.topic_id), page => files.some(([file]) => file === page), true)))
   if (pending.manifest.tag_merge_gap) navigation.push('## 标签归并缺口', pending.manifest.tag_merge_gap.message.replace(/[\r\n]/g, ' '))
   if (pending.manifest.term_gaps?.length) navigation.push('## 术语缺口', ...pending.manifest.term_gaps.map(gap => `- ${gap.term_id}${gap.section_id ? '/' + gap.section_id : ''}：${gap.message.replace(/[\r\n]/g, ' ')}`))
-  const topicNavigation = ['## 主题', ...(pending.topics?.state.topics ?? []).slice().sort((a, b) => a.id.localeCompare(b.id)).map(topic =>
+  const navigationTopics = pending.topics?.state.topics ?? (pending.source_scope && previous
+    ? (await previousState(root, previous, previous.deps!, layeredSettings(options?.topics || {}, options?.tier))).topics : [])
+  const topicNavigation = ['## 主题', ...navigationTopics.slice().sort((a, b) => a.id.localeCompare(b.id)).map(topic =>
     `${'  '.repeat(topicDepth(topic))}- [${topic.id} ${topic.title.replace(/[\r\n]+/g, ' ').replaceAll('[', '\\[').replaceAll(']', '\\]')}](${topic.path}) — ${rootLinks(topic.summary, topic.path, page => files.some(([file]) => file === page)).replace(/[\r\n]+/g, ' ')}；来源数：${topic.sources.length}`)]
-  topicNavigation.push('## 术语', ...Object.keys(pending.terms?.pages ?? {}).filter(page => page.includes('/index-')).sort().map(page => `- [${topicHeader(pending.terms!.pages[page]!.content).title}](${page})`))
+  topicNavigation.push('## 术语', ...files.filter(([page]) => page.startsWith('terms/') && page.includes('/index-')).sort(([a], [b]) => a.localeCompare(b)).map(([page, content]) => `- [${topicHeader(content).title}](${page})`))
   navigation.splice(3, 0, ...topicNavigation)
   files.push(['index.md', navigation.join('\n\n') + '\n'])
   await preparePageVectors(root, pending, files, options)
@@ -404,37 +434,49 @@ export async function publishLibrary(root: string, pending: PendingBuild, signal
     throw error
   })
   const log = previousLog
-    + `\n## [${card.updated_at}] build | ${version}\n- 新增：${pending.added.join('、') || '无'}；来源：${card.source_count}\n- 重建或修订主题：${pending.topics?.rewritten.join('、') || '无'}\n- 重写术语节：${pending.terms?.rewritten.join('、') || '无'}\n- 成本：提取 ${pending.costs?.stages['提取']?.actual_calls ?? pending.model_calls} 次；提取后核对 ${pending.costs?.stages['提取后核对']?.actual_calls ?? 0} 次；主题 ${pending.costs?.stages['主题']?.actual_calls ?? pending.topics?.model_calls ?? 0} 次；主题后核对 ${pending.costs?.stages['主题后核对']?.actual_calls ?? 0} 次；术语 ${pending.terms?.model_calls ?? 0} 次\n`
+    + `\n## [${card.updated_at}] build | ${version}\n- 新增：${pending.added.join('、') || '无'}；来源：${card.source_count}\n- 重建或修订主题：${pending.topics?.rewritten.join('、') || '无'}\n- 重写术语节：${pending.terms?.rewritten.join('、') || '无'}\n- 成本：提取 ${pending.costs?.stages['提取']?.actual_calls ?? pending.model_calls} 次；提取后核对 ${pending.costs?.stages['提取后核对']?.actual_calls ?? 0} 次；主题 ${pending.costs?.stages['主题']?.actual_calls ?? pending.topics?.current_model_calls ?? pending.topics?.model_calls ?? 0} 次；主题后核对 ${pending.costs?.stages['主题后核对']?.actual_calls ?? 0} 次；术语 ${pending.terms?.model_calls ?? 0} 次\n`
     + Object.entries(pending.changes ?? {}).map(([kind, ids]) => `- ${kind}：${ids.join('、')}\n`).join('') + gaps.join('\n') + '\n' + costMarkdown(pending.costs ?? costReport(pending.started_at))
   pending.manifest.pages = {}
   // 未发布目录内的独立文件有界并行；失败也等本批写入结束，才释放建库锁。
   for (let offset = 0; offset < files.length; offset += 8) {
     const results = await withRevocationLock(root, () => Promise.allSettled(files.slice(offset, offset + 8).map(async ([relative, value]) => {
       signal?.throwIfAborted()
-      pending.manifest.pages![relative] = await putPage(root, relative.startsWith('sources/') ? value : publicationMetadata(pending, relative, value, deps.pages[relative]?.sources, publicationTags))
+      pending.manifest.pages![relative] = inherited.get(relative) ?? await putPage(root, relative.startsWith('sources/') ? value : publicationMetadata(pending, relative, value, deps.pages[relative]?.sources, publicationTags))
     })))
     for (const result of results) if (result.status === 'rejected') throw result.reason
   }
   pending.manifest.anchor_format = 'obsidian-block-v1'
   pending.manifest.source_page_format = 'retryable-gaps-v1'
   pending.manifest.pages = Object.fromEntries(Object.entries(pending.manifest.pages).sort(([a], [b]) => a.localeCompare(b)))
-  pending.manifest.deps = deps; pending.manifest.aliases = pending.topics?.aliases ?? {}
+  pending.manifest.deps = deps; pending.manifest.aliases = pending.topics?.aliases ?? (pending.source_scope ? previous?.aliases ?? {} : {})
   if (pending.topics) { pending.topics.state.version = version; pending.manifest.topics = pending.topics.state }
   pending.manifest.card = card; pending.manifest.log = log
   pending.manifest.cost_report = costMarkdown(pending.costs ?? costReport(pending.started_at))
   await writeJson(root, 'work/pending.json', pending)
   delete pending.manifest.rebuild_pages
   await writeVersion(root, pending.manifest)
+  if (await isProductionFormat(root)) {
+    const checksum = hash(storageJson(pending.manifest))
+    const base = pending.base_version ? await readVersion(root, pending.base_version) : undefined
+    const baseChecksum = base ? hash(storageJson(base)) : undefined
+    const provenance = await publicationProvenance(root, pending, checksum, base ? await readProvenance(root, base.version!, baseChecksum!) : undefined)
+    pending.provenanceRef = await writeProvenance(root, provenance)
+    pending.costsRef = await writeVersionCosts(root, version, checksum, pending.runIds ?? (pending.runId ? [pending.runId] : []), base ? await readVersionCosts(root, base.version!, baseChecksum!) : null)
+    await writeJson(root, 'work/pending.json', pending)
+  }
   await validatePublication(root, version)
   await validateCompleteVersion(root, pending.manifest, !options?.vectorDeferred)
   if (!activate) {
-    await writeJson(root, 'work/preview.json', { version, base_version: pending.base_version })
+    await writeJson(root, 'work/preview.json', { version, base_version: pending.base_version,
+      ...(pending.provenanceRef ? { provenanceRef: pending.provenanceRef, costsRef: pending.costsRef } : {}) })
     return version
   }
   return activatePublication(root, pending, signal)
 }
 export async function activatePublication(root: string, pending: PendingBuild, signal?: AbortSignal): Promise<string> {
   const version = pending.version!
+  await verifyPublicationRefs(root, pending)
+  await validateCompleteVersion(root, await readVersion(root, version))
   const current = await readCurrent(root)
   if ((current?.version ?? null) !== pending.base_version) throw new Error('发布基线已变化，保留待更新清单。')
   signal?.throwIfAborted()
@@ -448,4 +490,16 @@ export async function activatePublication(root: string, pending: PendingBuild, s
   await finishPublication(root, pending)
   await unlink(await safePath(root, 'work/preview.json')).catch(error => { if (error.code !== 'ENOENT') throw error })
   return version
+}
+async function verifyPublicationRefs(root: string, pending: PendingBuild): Promise<void> {
+  if (!await isProductionFormat(root)) return
+  for (const kind of ['provenance', 'costs'] as const) {
+    const ref = pending[kind === 'provenance' ? 'provenanceRef' : 'costsRef']
+    if (!ref) {
+      if (pending.acceptedProtocol === 1) throw protocolError('PROVENANCE_INCOMPLETE', '新预览缺少附属记录引用。')
+      continue
+    }
+    const file = sidecarPath(pending.version!, kind), value = await readProtocol<{ checksum: string }>(root, file, 'PROVENANCE_INCOMPLETE')
+    if (ref.path !== file || ref.checksum !== value?.checksum) throw protocolError('PROVENANCE_INCOMPLETE', '发布检查点的附属摘要不一致。')
+  }
 }

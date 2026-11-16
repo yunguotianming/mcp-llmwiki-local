@@ -1,10 +1,10 @@
 import path from 'node:path'
-import { parse } from 'yaml'
 import type { LayeredReadView } from '../layered/revocations.js'
 import { readExtraction } from '../layered/publication.js'
 import { signature } from '../storage/files.js'
 import { tokenCost, tokenSlice, stripBlockIds } from './page-search.js'
 import { chapterBlockId } from '../layered/anchors.js'
+import { PageMetadataError, pageMetadata } from './page-metadata.js'
 
 export interface BrowseOptions { depth?: number | undefined; cursor?: string | undefined; limit?: number | undefined }
 // summary 是页面原文连续片段，只去掉 YAML 头部及块 ID；保留 Markdown 与空白。
@@ -13,12 +13,15 @@ export async function browsePages(view: LayeredReadView, library: string, ref: s
   const depth = options.depth ?? 1, limit = options.limit ?? 20
   if (![1, 2].includes(depth) || !Number.isSafeInteger(limit) || limit < 1 || limit > 50) throw new Error('浏览 depth 为 1～2，limit 为 1～50。')
   const nodes = new Map<string, BrowseNode>(), sources = new Map<string, string[]>(), children = new Map<string, string[]>()
+  const invalidMetadata: string[] = []
   nodes.set('index.md', { path: 'index.md', title: tokenSlice(view.manifest.card?.name ?? library, 80), summary: '', type: 'navigation', parent: '', children_count: 0, read_ref: 'index.md' })
   for (const relative of Object.keys(view.deps.pages).sort()) {
     const doc = await view.document(relative)
     if (doc.status !== 'ok') continue
-    const match = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(doc.content), header = match ? parse(match[1]!) as Record<string, unknown> : {}
-    const content = stripBlockIds(match ? doc.content.slice(match[0].length) : doc.content)
+    let metadata: ReturnType<typeof pageMetadata>
+    try { metadata = pageMetadata(doc.content, relative) }
+    catch (error) { if (error instanceof PageMetadataError) { invalidMetadata.push(relative); continue }; throw error }
+    const { header } = metadata, content = stripBlockIds(metadata.content)
     const title = typeof header.title === 'string' ? header.title : /^#{1,6}\s+(.+)$/m.exec(content)?.[1] ?? path.posix.basename(relative, '.md')
     const type = relative.includes('#') ? 'term' : typeof header.page_type === 'string' ? header.page_type : 'navigation'
     nodes.set(relative, { path: relative, title: tokenSlice(title, 80), summary: tokenSlice(content, 120), type, parent: 'index.md', children_count: 0, read_ref: relative })
@@ -70,7 +73,8 @@ export async function browsePages(view: LayeredReadView, library: string, ref: s
   const identity = signature(JSON.stringify([view.version, view.generation, current, depth])), prefix = identity + ':'
   const offset = options.cursor?.startsWith(prefix) ? Number(options.cursor.slice(prefix.length)) : options.cursor ? NaN : 0
   if (!Number.isSafeInteger(offset) || offset < 0 || offset > order.length) throw new Error('浏览游标已过期或不属于当前节点。')
-  const result = { library, version: view.version, node, children: [] as BrowseNode[], next_cursor: null as string | null }
+  const result = { library, version: view.version, node, children: [] as BrowseNode[], next_cursor: null as string | null,
+    ...(invalidMetadata.length ? { warning: `${invalidMetadata.length} 个页面元数据格式无效，本次跳过；格式错误不代表内容无依据，其他来源及原文仍可读取。页面示例：` + invalidMetadata.slice(0, 3).join('、') } : {}) }
   let next = offset
   while (next < order.length && result.children.length < limit) {
     const candidate = nodes.get(order[next]!)!

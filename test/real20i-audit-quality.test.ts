@@ -41,7 +41,11 @@ it('Q4：学生访谈方法混入岗位主题应移除，拒绝改写主张并�
     const d = JSON.parse(raw)
     if (d.review_stage === 'topic') {
       expect(system).toContain('研究者使用的访谈方法不能当作受访者岗位职责')
-      return JSON.stringify({ items: d.sentences.map((s: any) => ({ id: s.id, support: s.text.startsWith('#') ? '完整支撑' : '不支撑', missing: s.text.startsWith('#') ? null : '角色不同' })) })
+      expect(d.sentences.some((s: any) => s.text === '- P1 研究者访谈学生。')).toBe(true)
+      return JSON.stringify({ items: d.sentences.map((s: any) => {
+        const supported = s.text.startsWith('#') || s.text === '- P1 研究者访谈学生。'
+        return { id: s.id, support: supported ? '完整支撑' : '不支撑', missing: supported ? null : '角色不同' }
+      }) })
     }
     return JSON.stringify({ sentences: d.validationFeedback.map((s: any) => ({ id: s.id, text: '- 研究者访谈学生。' + link, point_ids: ['P1'], support: '完整支撑', missing: null })) })
   })

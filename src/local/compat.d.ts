@@ -5,8 +5,8 @@ declare module '@deepseek-ai/dsh-llm' {
   export interface ImageBlock { type: 'image'; attachment: unknown }
   export interface LlmResolvedModelInfo {
     provider: string; id: string; name: string; defaultMaxTokens?: number
-    inputModalities?: string[]; context?: { contextWindow?: number; maxOutputTokens?: number }
-    reasoning?: { efforts: { id: ReasoningEffortId; name: string }[] }
+    inputModalities?: string[]; context?: { contextWindow: number; maxOutputTokens?: number }
+    reasoning?: { efforts: { id: ReasoningEffortId; name: string }[]; defaultEffort?: ReasoningEffortId }
   }
   export interface GenerateOptions {
     provider: string; model: string; system?: string
@@ -16,7 +16,8 @@ declare module '@deepseek-ai/dsh-llm' {
   }
   export type LlmEvent = { type: 'text-delta'; index: number; text: string }
     | { type: 'usage'; usage: TokenUsage }
-    | { type: 'finish'; reason: { kind: 'stop' | 'length' | 'tool-calls' } | { kind: 'error' | 'aborted'; failure: { message: string; code: string; status?: number } } }
+    | { type: 'finish'; reason: { kind: 'stop' | 'length' | 'tool-calls' } | { kind: 'error' | 'aborted'; failure: { message: string; code: string; status?: number; requestId?: string; providerRetryAfterMs?: number } } }
+  export type StreamChunk = LlmEvent
   export interface LlmRuntime {
     resolveModelInfo(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo>
     stream(options: GenerateOptions): AsyncIterable<LlmEvent>

@@ -13,9 +13,18 @@ import { allocatePointQuotas } from './budget.js'
 import { mapConcurrent } from '../llm/scheduler.js'
 import { defaultPolicy } from '../domain/policy.js'
 import { mergeModels, modelUsage } from './models.js'
+import { validatedTask } from './extraction-cache.js'
+import { activeAcceptedRefs, businessValue, recoveryBudget, recoveryContext, verifyAcceptedRefs } from './accepted.js'
+import type { AcceptedRef } from './accepted.js'
 
 const sourceSummarySchema = z.object({ point_ids: z.array(z.string()).min(1) })
 const sourceSummaryRuntimeSchema = schemaJSON(sourceSummarySchema, 'source_summary')
+
+interface SummaryBlock { ids: string[]; models?: SourceSummary['models']; acceptedRef?: AcceptedRef }
+export interface SummaryRecoveryState {
+  summary_plans?: Record<string, string[][]>
+  summary_blocks?: Record<string, SummaryBlock>
+}
 
 // 只识别 Markdown 解析器确认的标题，代码围栏、引用中的伪标题不参与分章。
 export function originalSourceChapters(source: LocalSource): SourceChapter[] {
@@ -156,16 +165,27 @@ export async function synthesizeSourceSummary(result: Extraction, keys: string[]
   const summaryCalls = new Map<string, Extraction['calls'][number]>()
   const points = new Map(result.segments.flatMap(segment => segment.points).map(point => [point.point_id, point]))
   const nodes = result.summary_nodes ??= {}, active = new Set<string>()
+  const recovering = Boolean(recoveryContext()), saved = result as Extraction & SummaryRecoveryState
+  await verifyAcceptedRefs({ nodes, blocks: saved.summary_blocks, groups: result.group_summaries }, true)
+  const plans = recovering ? saved.summary_plans ??= {} : {}
+  const blocks = recovering ? saved.summary_blocks ??= {} : {}
+  const sourceRefs = [{ sourceId: result.source_id, sourceVersion: result.segments.flatMap(segment => segment.points)[0]?.source_version ?? result.source_hash }]
+  let budget: Promise<number> | undefined
+  const currentBudget = () => budget ??= recoveryBudget('extract', async () => inputLimit, options.maxInputBytes)
+  const pause = () => Object.assign(new Error('单个完整摘要要点超过当前窗口。'), { stagePause: true, stage: 'extract', code: 'NO_COMPATIBLE_CANDIDATE' })
+  const refOf = (child: SourceSummary) => activeAcceptedRefs([(child as SourceSummary & { acceptedRef?: AcceptedRef }).acceptedRef]
+    .filter((ref): ref is AcceptedRef => Boolean(ref)))[0]
   const missing = (id: string): SourceSummary => ({ id, point_ids: [], missing: [id], level: 0, children: [], fingerprint: hash(id + ':missing') })
   let current = keys.map(key => result.group_summaries?.[key] ?? missing(key))
-  const merge = async (children: SourceSummary[]): Promise<SourceSummary> => {
+  const mergeOnce = async (children: SourceSummary[]): Promise<SourceSummary> => {
     if (children.length === 1) return children[0]!
     signal.throwIfAborted()
     const id = 'summary-' + hashName(hash(JSON.stringify(children.map(child => child.id))))
     const fingerprint = hash(JSON.stringify([longdocFingerprint(settings), children.map(child => [child.fingerprint, child.missing,
       child.point_ids.map(id => [id, points.get(id)?.text])])]))
     active.add(id)
-    if (nodes[id]?.fingerprint === fingerprint && !nodes[id]!.missing.includes(id)) {
+    if (nodes[id]?.fingerprint === fingerprint && !nodes[id]!.missing.includes(id)
+      && (!recovering || !refOf(nodes[id]!) && !Object.keys(blocks).some(key => key.startsWith(id + '/block/')))) {
       result.models = mergeModels(result.models, nodes[id]!.models)
       return nodes[id]!
     }
@@ -180,7 +200,6 @@ export async function synthesizeSourceSummary(result: Extraction, keys: string[]
       node.models = mergeModels(supported[0]!.models)
     }
     else if (supported.length > 1) {
-      const usage = modelUsage(options.client)
       const aliases = new Map([...allowed].map((id, index) => [id, 'P' + (index + 1)]))
       const originals = new Map([...aliases].map(([id, alias]) => [alias, id]))
       const schema = z.object({ point_ids: z.array(z.string()).min(1).max(settings.sourceSummaryMaxPoints) })
@@ -205,10 +224,11 @@ export async function synthesizeSourceSummary(result: Extraction, keys: string[]
       }
       try {
         let candidates = [...allowed], level = 0
+        let candidateRefs = new Map([...allowed].map(pointId => [pointId, supported.flatMap(child => child.point_ids.includes(pointId) && refOf(child) ? [refOf(child)!] : [])]))
         for (;;) {
-          const groups = completeInputBlocks(candidates, ids => Buffer.byteLength(prompt + request(ids, '/budget-' + level + '-999999')) <= inputLimit)
-          const selected = await mapConcurrent(groups, concurrency, signal, async (ids, index) => {
-            const input = request(ids, groups.length === 1 ? '' : '/budget-' + level + '-' + index)
+          const planId = id + '/' + fingerprint + '/' + level
+          const run = async (ids: string[], input: string, blockId: string, limit: number): Promise<SummaryBlock> => {
+            const usage = modelUsage(options.client)
             let raw: string
             try {
               raw = await usage.client.call('ingest', prompt, input, signal, undefined,
@@ -218,20 +238,58 @@ export async function synthesizeSourceSummary(result: Extraction, keys: string[]
               result.models = mergeModels(result.models, usage.models)
             }
             signal.throwIfAborted()
-            const call = { input_bytes: Buffer.byteLength(prompt + input), input_limit: inputLimit }
-            summaryCalls.set(id + '/budget-' + level + '-' + index, call)
+            const call = { input_bytes: Buffer.byteLength(prompt + input), input_limit: limit }
+            summaryCalls.set(blockId, call)
             ;(result.summary_calls ??= []).push(call); result.calls.push(call)
             const output = schema.parse(parseModelJson(raw))
             if (output.point_ids.some(id => !originals.has(id) || !ids.includes(originals.get(id)!))) throw new Error('摘要引用了未校验或不属于实际输入的要点。')
-            return [...new Set(output.point_ids.map(id => originals.get(id)!))]
-          })
-          node.point_ids = [...new Set(selected.flat())]
-          if (groups.length === 1) break
+            return { ids: [...new Set(output.point_ids.map(id => originals.get(id)!))], models: mergeModels(usage.models) }
+          }
+          const select = async (ids: string[]): Promise<SummaryBlock> => {
+            const memberHash = hashName(hash(JSON.stringify(ids))), blockId = id + '/block/' + memberHash
+            const input = request(ids, '/block/' + memberHash)
+            const dependencies = [...new Map(ids.flatMap(pointId => candidateRefs.get(pointId) ?? []).map(ref => [ref.taskId, ref])).values()]
+            const receipt = await validatedTask(options, 'extract', { input, prompt }, async () => {
+              const limit = await currentBudget()
+              const splitId = planId + '/split/' + memberHash
+              if (plans[splitId] || Buffer.byteLength(prompt + input) > limit) {
+                if (ids.length === 1) throw pause()
+                const halves = plans[splitId] ??= [ids.slice(0, Math.ceil(ids.length / 2)), ids.slice(Math.ceil(ids.length / 2))]
+                await checkpoint()
+                const selected = await mapConcurrent(halves, concurrency, signal, select)
+                return { ids: selected.flatMap(block => block.ids), models: mergeModels(...selected.map(block => block.models)) }
+              }
+              return run(ids, input, blockId, limit)
+            }, value => value.ids.length > 0 && value.ids.every(pointId => ids.includes(pointId)), {
+              unitId: result.source_id + '/' + blockId, sourceRefs,
+              operation: 'sourceSummary', input: { input }, prompt,
+              schema: sourceSummaryRuntimeSchema, validatorVersion: 'source-summary-v1', semanticVersion: 'source-summary-v1', groupPlan: { members: ids },
+              dependencies,
+            })
+            node.models = mergeModels(node.models, receipt.value.models)
+            result.models = mergeModels(result.models, receipt.value.models)
+            const block = { ...receipt.value, ...(receipt.acceptedRef ? { acceptedRef: receipt.acceptedRef } : {}) }
+            blocks[blockId] = block
+            await checkpoint()
+            return block
+          }
+          let groups = plans[planId]
+          if (!groups) {
+            const limit = recovering ? await currentBudget() : inputLimit
+            if (recovering && candidates.some(pointId => Buffer.byteLength(prompt + request([pointId], '/block/' + hashName(hash(JSON.stringify([pointId]))))) > limit)) throw pause()
+            groups = completeInputBlocks(candidates, ids => Buffer.byteLength(prompt + request(ids, recovering ? '/block/' + hashName(hash(JSON.stringify(ids))) : '/budget-' + level + '-999999')) <= limit)
+            if (recovering) { plans[planId] = groups; await checkpoint() }
+          }
+          const selected = await mapConcurrent(groups, concurrency, signal, (ids, index) => recovering ? select(ids)
+            : run(ids, request(ids, groups.length === 1 ? '' : '/budget-' + level + '-' + index), id + '/budget-' + level + '-' + index, inputLimit))
+          node.point_ids = [...new Set(selected.flatMap(block => block.ids))]
+          if (groups.length === 1 && (!recovering || node.point_ids.length <= settings.sourceSummaryMaxPoints)) break
           if (node.point_ids.length >= candidates.length) throw new Error('完整摘要候选不能继续合并，保留来源层及摘要缺口。')
+          candidateRefs = new Map(node.point_ids.map(pointId => [pointId, selected.flatMap(block => block.ids.includes(pointId) && block.acceptedRef ? [block.acceptedRef] : [])]))
           candidates = node.point_ids; level++
         }
       } catch (error) {
-        if (globalFailure(error, signal)) throw error
+        if (globalFailure(error, signal) || error && typeof error === 'object' && ('stagePause' in error || 'storageFailure' in error)) throw error
         node.missing.push(id)
         result.gaps!.push({ kind: 'summary', segment_hashes: [], item: { id }, reasons: [{ rule: 'summary-support', expected: '仅引用子摘要内已校验要点 ID', actual: String(error) }] })
         // 合成失败时保留可回源的子摘要选点，并明确标注未完成的合成节点。
@@ -239,6 +297,24 @@ export async function synthesizeSourceSummary(result: Extraction, keys: string[]
       }
     }
     nodes[id] = node
+    await checkpoint()
+    return node
+  }
+  const merge = async (children: SourceSummary[]): Promise<SourceSummary> => {
+    if (!recovering || children.length === 1) return mergeOnce(children)
+    const id = 'summary-' + hashName(hash(JSON.stringify(children.map(child => child.id))))
+    const members = [...new Set(children.flatMap(child => child.point_ids))]
+    const receipt = await validatedTask(options, 'extract', { id }, () => mergeOnce(children),
+      value => value.point_ids.length > 0 && !value.missing.includes(id) && value.point_ids.every(id => members.includes(id)), {
+        unitId: result.source_id + '/' + id, sourceRefs,
+        operation: 'sourceSummary', input: businessValue({ children: children.map(({ id, point_ids, missing, fingerprint }) => ({ id, point_ids, missing, fingerprint })),
+          points: members.map(id => ({ id, text: points.get(id)?.text })), maxPoints: settings.sourceSummaryMaxPoints }), prompt: jsonProtocol(summaryPrompt, sourceSummaryRuntimeSchema),
+        schema: sourceSummaryRuntimeSchema, validatorVersion: 'source-summary-v1', semanticVersion: 'source-summary-v1', groupPlan: children.map(child => child.id),
+        dependencies: children.flatMap(child => refOf(child) ?? []),
+      })
+    const node = { ...receipt.value, ...(receipt.acceptedRef ? { acceptedRef: receipt.acceptedRef } : {}) }
+    active.add(id); nodes[id] = node
+    result.models = mergeModels(result.models, node.models)
     await checkpoint()
     return node
   }

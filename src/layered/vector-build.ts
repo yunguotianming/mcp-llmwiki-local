@@ -14,8 +14,11 @@ export function sameExtractionContext(left: NonNullable<PendingBuild['preview_co
   if (left.policyRevision !== right.policyRevision) return false
   const withoutVectorSettings = (key: string) => {
     const registration = JSON.parse(key)
+    // 查询设置不改变建库内容；同时兼容旧检查点内保存的查询字段。
+    delete registration.queryUnderstanding
     if (registration.layered) {
-      for (const field of ['embeddingMode', 'embeddingUnavailable', 'embeddingChangeToken', 'localEmbeddingUrl', 'localEmbeddingModel', 'cloudEmbeddingUrl', 'cloudEmbeddingModel', 'cloudEmbeddingKeyEnv', 'vectorPrecision', 'embeddingBatchSize', 'embeddingBatchBytes', 'embeddingTimeoutMs']) delete registration.layered[field]
+      for (const field of ['queryEmbeddingTimeoutMs', 'queryEmbeddingColdTimeoutMs', 'searchRelevanceThreshold']) delete registration.layered[field]
+      for (const field of ['embeddingMode', 'embeddingUnavailable', 'embeddingChangeToken', 'localEmbeddingUrl', 'localEmbeddingModel', 'cloudEmbeddingUrl', 'cloudEmbeddingModel', 'cloudEmbeddingKeyEnv', 'vectorPrecision', 'embeddingConcurrency', 'embeddingBatchSize', 'embeddingBatchBytes', 'embeddingTimeoutMs']) delete registration.layered[field]
       if (!Object.keys(registration.layered).length) delete registration.layered
     }
     return JSON.stringify(registration)

@@ -1,7 +1,8 @@
 import path from 'node:path'
 import { embeddingEndpoint, layeredSettings, type LayeredSettings } from '../domain/config.js'
 import { defaultPolicy } from '../domain/policy.js'
-import { mapConcurrent, ProviderGate } from '../llm/scheduler.js'
+import { mapConcurrent } from '../llm/scheduler.js'
+import { abortableEmbedding as abortable, embeddingBackoff as backoff, embeddingService, systemEmbeddingClock, type EmbeddingClock } from './embedding-service.js'
 import { readOptional } from '../storage/files.js'
 import { safePath } from '../storage/paths.js'
 import { hash, writeJson } from './files.js'
@@ -9,6 +10,8 @@ import { putVector, readVectorRecord, vectorUnavailable } from './vectors.js'
 import { recordIdentity, sameIdentity } from './vector-identity.js'
 import type { VectorReference } from './vectors.js'
 import type { EmbeddingClient, EmbeddingIdentity, Point, TopicState } from './schema.js'
+
+export { embeddingBackoff as backoff } from './embedding-service.js'
 
 export function normalized(vector: number[]): number[] {
   if (!Array.isArray(vector) || !vector.length || vector.some(value => typeof value !== 'number' || !Number.isFinite(value))) throw new Error('嵌入向量为空或包含无效数值。')
@@ -64,17 +67,20 @@ export function* embeddingBatches<T>(items: T[], text: (item: T) => string, sett
   }
   if (batch.length) yield batch
 }
-export function backoff(ms: number, signal?: AbortSignal): Promise<void> {
-  signal?.throwIfAborted()
-  return new Promise((resolve, reject) => {
-    const cancelled = () => { clearTimeout(timer); reject(signal!.reason) }
-    const timer = setTimeout(() => { signal?.removeEventListener('abort', cancelled); resolve() }, ms)
-    signal?.addEventListener('abort', cancelled, { once: true })
-  })
+class EmbeddingHttpError extends Error {
+  constructor(readonly status: number, readonly body: string) { super(status === 404 ? '嵌入模型缺失（HTTP 404）。' : 'HTTP ' + status + ': ' + body) }
+}
+const internalForward = /Post\s+\\?"http:\/\/127\.0\.0\.1:|\/(?:tokenize|embedding|completion)\b/i
+const connectionFailure = /connectex|actively refused|connection refused|dial tcp/i
+function transientEmbeddingError(error: unknown): boolean {
+  if (error instanceof EmbeddingHttpError) return error.status === 400 && internalForward.test(error.body) && connectionFailure.test(error.body)
+  return error instanceof TypeError || error instanceof Error && error.name === 'TimeoutError'
 }
 export class OllamaEmbeddingClient implements EmbeddingClient {
+  readonly managesEndpoint = true
   private readonly settings: LayeredSettings
-  constructor(settings: Partial<LayeredSettings>, private readonly request: typeof fetch = fetch, private readonly retryLimit = 2) { this.settings = layeredSettings(settings) }
+  constructor(settings: Partial<LayeredSettings>, private readonly request: typeof fetch = fetch, private readonly retryLimit = 3,
+    private readonly clock: EmbeddingClock = systemEmbeddingClock) { this.settings = layeredSettings(settings) }
   private modelIdentity: Promise<string> | undefined
   identity(signal?: AbortSignal): Promise<string> {
     return this.modelIdentity ??= this.resolveIdentity(signal).catch(error => { this.modelIdentity = undefined; throw error })
@@ -102,31 +108,68 @@ export class OllamaEmbeddingClient implements EmbeddingClient {
       throw new Error('本地向量模型不可用，主题聚类已暂停。', { cause })
     }
   }
-  private async embedBatch(input: string[], signal?: AbortSignal): Promise<number[][]> {
-    for (let attempt = 0; ; attempt++) {
+  private async requestBatch(input: string[], signal?: AbortSignal): Promise<number[][]> {
+    signal?.throwIfAborted()
+    const timeout = new AbortController()
+    const cancel = this.clock.schedule(() => timeout.abort(new DOMException('嵌入请求超时。', 'TimeoutError')), this.settings.embeddingTimeoutMs)
+    // 上层已中止等待时撤销请求计时器，底层即使忽略 abort 也不阻塞收尾。
+    signal?.addEventListener('abort', cancel, { once: true })
+    try {
+      const response = await this.request(this.settings.localEmbeddingUrl.replace(/\/+$/, '') + '/api/embed', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: this.settings.localEmbeddingModel, input, truncate: false }),
+        signal: signal ? AbortSignal.any([signal, timeout.signal]) : timeout.signal,
+      })
+      if (!response.ok) throw new EmbeddingHttpError(response.status, await response.text())
+      const value = await response.json() as { embeddings?: number[][] }
+      if (!Array.isArray(value?.embeddings) || value.embeddings.length !== input.length) throw new Error('嵌入结果数量不匹配。')
+      const vectors = value.embeddings.map(normalized)
+      for (const vector of vectors) similarity(vectors[0]!, vector)
+      signal?.throwIfAborted(); timeout.signal.throwIfAborted()
+      return vectors
+    } catch (cause) {
       signal?.throwIfAborted()
-      const timeout = new AbortController()
-      const timer = setTimeout(() => timeout.abort(new DOMException('嵌入请求超时。', 'TimeoutError')), this.settings.embeddingTimeoutMs)
-      try {
-        const response = await this.request(this.settings.localEmbeddingUrl.replace(/\/+$/, '') + '/api/embed', {
-          method: 'POST', headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ model: this.settings.localEmbeddingModel, input, truncate: false }),
-          signal: signal ? AbortSignal.any([signal, timeout.signal]) : timeout.signal,
-        })
-        if (!response.ok) throw new Error(response.status === 404 ? '嵌入模型缺失（HTTP 404）。' : `HTTP ${response.status}`)
-        const value = await response.json() as { embeddings?: number[][] }
-        if (!Array.isArray(value?.embeddings) || value.embeddings.length !== input.length) throw new Error('嵌入结果数量不匹配。')
-        const vectors = value.embeddings.map(normalized)
-        for (const vector of vectors) similarity(vectors[0]!, vector)
-        signal?.throwIfAborted(); timeout.signal.throwIfAborted()
-        return vectors
-      } catch (cause) {
-        signal?.throwIfAborted()
-        // fetch 的连接失败为 TypeError；HTTP 和响应校验错误不重试。
-        if (attempt >= this.retryLimit || !(timeout.signal.aborted || cause instanceof TypeError || cause instanceof Error && cause.name === 'TimeoutError')) throw cause
-      } finally { clearTimeout(timer) }
-      await backoff(2000 * 2 ** attempt, signal)
-    }
+      // 已收到 HTTP 状态的永久错误不被错误正文中的超时措辞覆盖。
+      if (!(cause instanceof EmbeddingHttpError)) timeout.signal.throwIfAborted()
+      throw cause
+    } finally { cancel(); signal?.removeEventListener('abort', cancel) }
+  }
+  private async embedBatch(input: string[], signal?: AbortSignal): Promise<number[][]> {
+    const service = embeddingService(this.settings.localEmbeddingUrl, this.clock), cap = this.settings.embeddingConcurrency
+    const probe = { model: this.settings.localEmbeddingModel, run: (probeSignal: AbortSignal) => this.requestBatch(['.'], probeSignal) }
+    let attempt = 0, waitedMs = 0
+    service.retain(probe)
+    try {
+      for (;;) {
+        if (await service.wait(signal)) attempt = 0
+        try {
+          return await service.run(async () => {
+            try {
+              const vectors = await this.requestBatch(input, signal)
+              service.success()
+              return vectors
+            } catch (cause) {
+              signal?.throwIfAborted()
+              if (transientEmbeddingError(cause)) service.failure()
+              else service.success()
+              throw cause
+            }
+          }, cap, signal)
+        } catch (cause) {
+          signal?.throwIfAborted()
+          if (!transientEmbeddingError(cause) || this.retryLimit === 0) throw cause
+          if (await service.wait(signal)) { attempt = 0; continue }
+          const delay = 2000 * 2 ** attempt
+          // 低并发可能达不到短窗阈值；退避用尽也转入共享探活，避免提前丢掉本轮建库。
+          if (attempt >= this.retryLimit || waitedMs + delay > 60_000) {
+            service.open('retry_exhausted')
+            continue
+          }
+          attempt++; waitedMs += delay
+          await backoff(delay, signal, this.clock)
+        }
+      }
+    } finally { service.release(probe) }
   }
 }
 
@@ -185,29 +228,11 @@ function persistEmbeddingCache(root: string, state: EmbeddingCacheState): Promis
   state.persist = write
   return write
 }
-// 使用通用供应商闸门；每次调用的并发上限也约束同模型的在途批次。
-const embeddingGates = new Map<string, ProviderGate>()
-function embeddingGate(key: string): ProviderGate {
-  let gate = embeddingGates.get(key)
-  if (!gate) { gate = new ProviderGate(50, { concurrency: 50 }); embeddingGates.set(key, gate) }
-  return gate
-}
-function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
-  if (!signal) return promise
-  signal.throwIfAborted()
-  return new Promise<T>((resolve, reject) => {
-    const aborted = () => reject(signal.reason)
-    signal.addEventListener('abort', aborted, { once: true })
-    promise.then(value => { signal.removeEventListener('abort', aborted); resolve(value) },
-      error => { signal.removeEventListener('abort', aborted); reject(error) })
-  })
-}
 export async function embedInputs(root: string, inputs: string[], settings: LayeredSettings, client: EmbeddingClient,
   signal?: AbortSignal, concurrency = defaultPolicy().pageGenerationConcurrency, identity?: EmbeddingIdentity): Promise<VectorReference[]> {
   if (!inputs.length) return []
-  const revision = client.identity ? await client.identity(signal) : undefined
+  const revision = identity?.revision ?? (client.identity ? await client.identity(signal) : undefined)
   if (!revision) throw new Error('嵌入客户端必须提供不可变模型身份（identity）。')
-  if (identity && revision !== identity.revision) throw new Error('向量权重与锁定身份不符。')
   const state = cacheState(root), owned = new Map<string, EmbeddingClaim>()
   const fail = (claim: EmbeddingClaim, error: unknown) => {
     if (claim.settled) return
@@ -223,7 +248,6 @@ export async function embedInputs(root: string, inputs: string[], settings: Laye
       ...(identity?.service_url ? { service_url: identity.service_url } : {}),
       ...(identity ? { query_preprocessing: identity.query_preprocessing } : {}) }
     const key = (input: string) => hash(JSON.stringify([base, hash(input), settings.vectorPrecision]))
-    const gate = embeddingGate(JSON.stringify([path.resolve(root), base, settings.vectorPrecision]))
     const results = new Map<string, VectorReference>(), waits: Promise<void>[] = []
     for (const input of new Set(inputs)) {
       signal?.throwIfAborted()
@@ -261,9 +285,18 @@ export async function embedInputs(root: string, inputs: string[], settings: Laye
     try { for (const batch of embeddingBatches(claims, claim => claim.input, settings)) batches.push(batch) }
     catch (error) { for (const claim of claims) fail(claim, error); throw error }
     if (batches.length) try {
+      if (identity && await client.identity?.(signal) !== identity.revision) throw new Error('向量权重与锁定身份不符。')
       await mapConcurrent(batches, Math.max(1, concurrency), signal ?? new AbortController().signal, async (batch, batchSignal) => {
         const queuedAt = Date.now()
-        const vectors = await gate.run(() => client.embed(batch.map(claim => claim.input), batchSignal, queuedAt), 0, batchSignal, undefined, concurrency, 0)
+        const work = () => client.embed(batch.map(claim => claim.input), batchSignal, queuedAt)
+        let vectors: number[][]
+        if (client.managesEndpoint) vectors = await work()
+        else {
+          const service = embeddingService(endpoint.url)
+          service.retain()
+          try { vectors = await service.run(work, Math.min(settings.embeddingConcurrency, concurrency), batchSignal) }
+          finally { service.release() }
+        }
         if (vectors.length !== batch.length) throw new Error('嵌入结果数量不匹配。')
         for (let index = 0; index < batch.length; index++) {
           const claim = batch[index]!, vector = normalized(vectors[index]!)
@@ -296,7 +329,6 @@ export async function embedInputs(root: string, inputs: string[], settings: Laye
     // 一轮并发结束后由磁盘重新建立派生缓存，撤权或外部清理不会被旧内存覆盖。
     if (!state.active) {
       cacheStates.delete(path.resolve(root))
-      for (const key of embeddingGates.keys()) if (JSON.parse(key)[0] === path.resolve(root)) embeddingGates.delete(key)
     }
   }
 }

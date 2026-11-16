@@ -23,7 +23,7 @@ import type { EmbeddingClient } from '../layered/schema.js'
 import type { LayeredReadView } from '../layered/revocations.js'
 import type { ModelRuntime } from '../llm/client.js'
 import { understandQuery } from './query-understanding.js'
-import { excerpts, fuseRanks, pageParagraphs } from './page-search.js'
+import { answerGuidance, excerpts, fuseRanks, pageParagraphs } from './page-search.js'
 import type { PageExcerpt, SearchNotice, SearchOptions } from './page-search.js'
 import type { BrowseOptions } from './browse.js'
 export type PageType = 'entity'|'concept'|'source'|'topic'|'term'|'term-index'|'navigation'
@@ -140,6 +140,8 @@ export class WikiQuery {
     return pages
   }
   async libraries(name?:string,onFailure?:(library:LibraryRegistration,error:unknown)=>void):Promise<LibraryRegistration[]> {
+    const requestedId=this.store.snapshot().libraries.find(item=>item.id===name)?.id
+    const matches=(library:LibraryRegistration)=>!name||(requestedId?library.id===requestedId:normalize(library.name)===normalize(name))
     const registrations=this.store.snapshot().libraries.filter(item=>item.enabled && item.kind !== 'whalefall')
     const resolved=await Promise.allSettled(registrations.map(resolveSharedRegistration)),filtered:LibraryRegistration[]=[]
     let failed=false
@@ -148,7 +150,7 @@ export class WikiQuery {
       try {
         if(result.status==='rejected')throw result.reason
         const library=result.value
-        if(!library||name&&normalize(library.name)!==normalize(name))continue
+        if(!library||!matches(library))continue
         if(library.siyuan){
           const layered=await findLayeredLibrary(library.wikiPath)
           if(!layered||layered.card.origin_type!=='siyuan')throw new Error('思源库尚未发布或库卡片不匹配，拒绝读取。')
@@ -156,7 +158,7 @@ export class WikiQuery {
         filtered.push(library)
       } catch(error) {
         if(!onFailure)throw error
-        if(!name||normalize(registration.name)===normalize(name)){onFailure(registration,error);failed=true}
+        if(matches(registration)){onFailure(registration,error);failed=true}
       }
     }
     if(name && !filtered.length&&!failed)throw new Error('未找到已启用本地 Wiki：'+name)
@@ -324,14 +326,16 @@ export class WikiQuery {
     const groups=searchedGroups.map(group=>({...group,results:hits.filter(hit=>hit.libraryId===group.libraryId).sort((a,b)=>b.score-a.score||a.page.path.localeCompare(b.page.path)).slice(0,limit).map(({page,score,layered,score_channels})=>{
       if(layered)return layered
       const block=pageParagraphs(page.content,queries)[0]
-      return {library:page.library,path:page.path,type:page.type,title:page.title,aliases:page.aliases,summary:page.summary,score,relevance:pageRelevance(query,{...page,snippet:(block?.content??'').slice(0,300)}),snippet:(block?.content??'').slice(0,300),anchor:block?.anchor??'',page_ref:page.path,topic_path:'',excerpts:legacyQuotes.get(page)??[],score_channels:score_channels??{}}
+      const snippet=(block?.content??'').slice(0,300)
+      const snippetSegments=block?[{start:0,end:snippet.length,anchor:block.anchor,locator:block.locator,contextLocator:block.locator,truncated:snippet!==block.content,unverified:/【未核实】/.test(block.content)}]:[]
+      return {library:page.library,path:page.path,type:page.type,title:page.title,aliases:page.aliases,summary:page.summary,score,relevance:pageRelevance(query,{...page,snippet}),snippet,snippetSegments,anchor:block?.anchor??'',page_ref:page.path,topic_path:'',excerpts:legacyQuotes.get(page)??[],score_channels:score_channels??{}}
     })}))
     const confidentGroups=groups.map(group=>({...group,...searchConfidence(group.results,layeredSettings(selected.find(library=>library.id===group.libraryId)?.layered).searchRelevanceThreshold)}))
     // 各库先完成自己的通道融合，跨库只比较名次，避免不同空间或通道数的分数互比。
     const results=groups.length > 1 ? groups.flatMap(group=>group.results.map((hit,index)=>({...hit,score:1/(60+index+1)})))
       .sort((a,b)=>b.score-a.score||a.library.localeCompare(b.library)||a.path.localeCompare(b.path)) : groups[0]?.results ?? []
     const confidence: 'none' | 'high' | 'low'=!results.length?'none':confidentGroups.some(group=>group.confidence==='high')?'high':'low'
-    return {query,total:results.length,results,groups:confidentGroups,confidence,...(confidence!=='high'?{message:'未找到可信匹配；候选页仅供继续检索，请勿据此断言库中有答案。'}:{}),understanding,searchedLibraries,...(skippedLibraries.length?{skippedLibraries}:{}),...(degradations.length?{degradations}:{})}
+    return {query,total:results.length,results,groups:confidentGroups,confidence,answerGuidance,...(confidence!=='high'?{message:'未找到可信匹配；候选页仅供继续检索，请勿据此断言库中有答案。'}:{}),understanding,searchedLibraries,...(skippedLibraries.length?{skippedLibraries}:{}),...(degradations.length?{degradations}:{})}
     },signal)
   }
   async browse(name:string,ref='root',options:BrowseOptions={},signal?:AbortSignal){
@@ -375,8 +379,9 @@ export class WikiQuery {
     },signal)
   }
   async sourceRead(sourceId:string,locator:string,name:string,options:SourceReadOptions={}){
-    const library=this.store.snapshot().libraries.find(item=>item.enabled&&normalize(item.name)===normalize(name))
-    if(!library)throw new Error('未找到已启用 Wiki：'+name)
+    const registrations=this.store.snapshot().libraries
+    const library=registrations.find(item=>item.id===name)??registrations.find(item=>item.enabled&&normalize(item.name)===normalize(name))
+    if(!library?.enabled)throw new Error('未找到已启用 Wiki：'+name)
     this.store.registration(library.id)
     if(library.kind==='whalefall'||library.siyuan)return {library:library.name,sourceId,locator,status:'external' as const,content:'请走 keeper_notes 回源',truncated:false,next_offset:null}
     const layered=await findLayeredLibrary(library.wikiPath)

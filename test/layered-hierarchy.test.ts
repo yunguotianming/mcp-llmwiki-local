@@ -234,10 +234,11 @@ describe('预算与恢复边界', () => {
     const f = await layeredIncrementalFixture(); await files(f, 2)
     // 短编号节省了输入空间，扩充事实使夹具仍实际触及同一个预算边界。
     for (let index = 0; index < 2; index++) await writeFile(path.join(f.knowledgeRoot, `${index}.md`), `# 资料${index}\n\n` + '甲组完整研究结论。'.repeat(5))
-    const options = { ...f.options, topics: { topicMergeMinSources: 1, leafInputBudget: 1400, topicMaxSources: 20 } }
+    // 叶主题系统提示加入逐句引用规则（约 390 字节）后，预算同步上调，仍只容纳部分成员以触发拆分。
+    const budget = 1800, options = { ...f.options, topics: { topicMergeMinSources: 1, leafInputBudget: budget, topicMaxSources: 20 } }
     await buildLayeredLibrary(options)
     expect((await state(f)).topics.length).toBeGreaterThan(1)
-    for (const request of f.topicRequests.filter(request => !request.input.children)) expect(Buffer.byteLength(request.system + JSON.stringify(request.input))).toBeLessThanOrEqual(1400)
+    for (const request of f.topicRequests.filter(request => !request.input.children)) expect(Buffer.byteLength(request.system + JSON.stringify(request.input))).toBeLessThanOrEqual(budget)
   })
   it('输出页长超限拆为子主题，叶页正文最终在上限内', async () => {
     const f = await layeredIncrementalFixture(), original = f.call.getMockImplementation()!

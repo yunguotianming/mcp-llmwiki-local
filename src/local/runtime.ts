@@ -4,6 +4,7 @@ import { createCodexCliRuntime } from '../llm/codex-cli.js'
 import type { RuntimeSettings } from './config.js'
 import { existsSync } from 'node:fs'
 import path from 'node:path'
+import { redactSecrets as redactText, redactValue as redactData } from '../llm/credentials.js'
 
 function codexExecutable(configured: string): string {
   if (configured !== 'codex' || process.platform !== 'win32') return configured
@@ -18,11 +19,13 @@ function codexExecutable(configured: string): string {
   throw new ModelCallError('未找到 Codex 原生可执行文件，请设置 runtime.codexExecutable 为 codex.exe 绝对路径。', 'MODEL_UNAVAILABLE')
 }
 
-export function redactSecrets(text: string): string {
-  for (const [name, value] of Object.entries(process.env)) {
-    if (value && /(?:KEY|TOKEN|SECRET|PASSWORD)/i.test(name)) text = text.replaceAll(value, '[已隐藏]')
-  }
-  return text
+export const redactionSecrets = (configured: readonly string[] = []) => [...configured, ...Object.entries(process.env)
+  .filter(([name]) => /(?:KEY|TOKEN|SECRET|PASSWORD)/i.test(name)).map(([, value]) => value).filter((value): value is string => !!value)]
+export function redactSecrets(text: string, configured: readonly string[] = []): string {
+  return redactText(text, redactionSecrets(configured), '[已隐藏]')
+}
+export function redactValue<T>(value: T, configured: readonly string[] = []): T {
+  return redactData(value, redactionSecrets(configured), '[已隐藏]')
 }
 
 export function createLocalRuntime(settings: RuntimeSettings): ModelRuntime {

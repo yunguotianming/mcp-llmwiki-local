@@ -1,4 +1,4 @@
-import type { ModelClient } from '../llm/client.js'
+import type { ModelAttempt, ModelClient } from '../llm/client.js'
 import type { LayeredSettings, ModelRef } from '../domain/config.js'
 import type { SiyuanAdapter } from './siyuan.js'
 import type { ImageBlock } from '@deepseek-ai/dsh-llm'
@@ -36,6 +36,9 @@ export interface SourceChapter { id: string; title: string; depth: number; paren
 export interface SourceSummary { models?: ModelRef[]; id: string; point_ids: string[]; missing: string[]; level: number; children: string[]; fingerprint: string }
 export interface TagStatus { message?: '标签不足'; count: number; minimum: number; personal_information_removed: number }
 export interface Extraction {
+  acceptedRef?: AcceptedRef
+  runId?: string
+  reextractGeneration?: number
   models?: ModelRef[]
   correction_attempts?: Record<string, { structure?: number; semantic?: number }>
   correction_batches?: { structure?: number; semantic?: number }
@@ -63,7 +66,7 @@ export interface Extraction {
   point_limit?: number; chapters?: SourceChapter[]
   group_cache?: Record<string, {
     parts: NonNullable<Extraction['chunk_plan']>[number]; raw: string; quota: number; selected_quota?: number
-    gaps?: ExtractionGap[]; missing_summary?: boolean; point_indices?: number[]
+    gaps?: ExtractionGap[]; missing_summary?: boolean; summary_excluded_reason?: string; point_indices?: number[]
     models?: ModelRef[]; summary_models?: ModelRef[]; item_models?: Record<string, ModelRef[]>
   }>
   group_summaries?: Record<string, SourceSummary>
@@ -72,6 +75,7 @@ export interface Extraction {
   segments: (Segment & { resource_hashes: string[]; processing_fingerprint: string; points: Point[]; terms: Term[] })[]
 }
 export interface SourceEntry {
+  acceptedRef?: AcceptedRef
   models?: ModelRef[]
   pending_topic_points?: string[]
   created_at?: string; tags?: string[]
@@ -85,7 +89,7 @@ export interface SourceEntry {
   siyuan?: { updated: string; raw_hash: string; references_hash: string; input: string; objects: { path: string; hash: string }[]; workspace_id: string; dependencies: string[]
     source_refs: { locator: string; target: { backend: 'siyuan'; workspace_id: string; document_id: string; block_id: string }; revision?: unknown }[] }
 }
-export interface TagMerges { models?: ModelRef[]; checked: string[]; groups: { canonical: string; tags: string[] }[] }
+export interface TagMerges { acceptedRef?: AcceptedRef; models?: ModelRef[]; checked: string[]; groups: { canonical: string; tags: string[] }[] }
 export interface SnapshotManifest {
   build_configuration?: string
   vector_state?: LibraryVectorState
@@ -101,7 +105,9 @@ export interface SnapshotManifest {
   next_term_number?: number
   topic_sequence?: { root: number; children: Record<string, number> }
   gaps?: { source_id: string; status: string; message: string }[]
-  topic_gaps?: { topic_id: string; point_ids: string[]; message: string; reasons?: TopicCorrectionReason[] }[]
+  topic_gaps?: TopicGap[]
+  /** 发布清理 pending 后仍可恢复原身份；草稿内嵌，不依赖可清理日志。 */
+  topic_recovery?: { topics: Topic[]; repairs: Record<string, TopicRepairState> }
   term_gaps?: { term_id: string; section_id: string; message: string }[]
   pages?: Record<string, string>
   /** 新发布的来源页必须包含可重试缺口提示；缺省只用于兼容旧版本。 */
@@ -120,7 +126,7 @@ export interface LibraryCard {
 }
 export interface CurrentVersion { version: string; revocation_generation: number; history?: string[] }
 // queuedAt 供观测包装器区分闸门排队与模型执行，普通嵌入实现可以忽略。
-export interface EmbeddingClient { embed(input: string[], signal?: AbortSignal, queuedAt?: number): Promise<number[][]>; identity?(signal?: AbortSignal): Promise<string> }
+export interface EmbeddingClient { readonly managesEndpoint?: boolean | undefined; embed(input: string[], signal?: AbortSignal, queuedAt?: number): Promise<number[][]>; identity?(signal?: AbortSignal): Promise<string> }
 export interface EmbeddingIdentity {
   provider: 'ollama' | 'cloud' | 'lexical'; service_url?: string; model: string; revision: string; dimensions: number; precision: 'float32' | 'float16'
   document_preprocessing: string; query_preprocessing: string
@@ -133,14 +139,33 @@ export interface LibraryVectorState {
   message?: string
 }
 export interface PointLabels {
+  acceptedRef?: AcceptedRef
   fingerprint: string; labels: string[]; keywords: string[]; model: string
   keyword_truncation?: { received: number; retained: number }
 }
 export interface PointDependency { point_id: string; text_hash: string }
 export interface TopicCorrectionReason { sentence_id: string; text: string; reason: '证据不完整' | '改变原主张' }
+export interface TopicGap {
+  topic_id: string; point_ids: string[]; message: string; reasons?: TopicCorrectionReason[]
+  kind?: 'below-threshold'
+  category?: '正常门槛' | '补跑可补' | '需改代码'
+  effect?: '来源层保留' | '质量审计通知' | '整页阻塞' | '导航降级'
+  stage?: 'generate' | 'review' | 'metadata' | 'parent'
+}
+export interface TopicRepairState {
+  protocol: string; input: string; evidence: string; content: string; member_ids: string[]
+  stage: 'review' | 'metadata' | 'generate'; run_id: string; rounds: number; total_rounds: number
+  regenerations?: number
+  max_rounds: number; deadline: number; reason?: string
+  dependencies?: PageDependencies
+  review?: PageDependencies['review']
+}
+export interface TopicClaim { text: string; point_ids: string[]; child_ids?: string[] }
 export interface PageDependencies {
+  acceptedRef?: AcceptedRef
   models?: ModelRef[]
-  review?: { fingerprint: string; removed: string[]; reasons?: TopicCorrectionReason[]; models?: ModelRef[]; aliases?: string[]; metadata_members?: string[] }
+  claims?: TopicClaim[]
+  review?: { acceptedRef?: AcceptedRef; fingerprint: string; removed: string[]; reasons?: TopicCorrectionReason[]; models?: ModelRef[]; aliases?: string[]; metadata_members?: string[] }
   sources: string[]; points: PointDependency[]; children?: { page: string; version: string }[]
   calls?: { input_bytes: number; input_limit: number; kind?: 'member-block' | 'member-merge' | 'parent-block' | 'parent-merge' }[]; revisions?: number
   terms?: TermRecord[]
@@ -149,6 +174,8 @@ export interface Dependencies {
   pages: Record<string, PageDependencies>; reverse: Record<string, string[]>; reverse_sources?: Record<string, string[]>
 }
 export interface Topic {
+  /** 构建树保留失败身份；只有 ready 子页参与父页的有效依赖。旧发布树缺省为 ready。 */
+  page_status?: 'pending' | 'ready' | 'failed'
   models?: ModelRef[]
   aliases?: string[]
   id: string; parent_id: string | null; path: string; title: string; summary: string
@@ -166,12 +193,16 @@ export interface TopicState {
   clustering_fingerprint?: string
 }
 export interface TopicBuild {
-  fingerprint: string; state: TopicState; pages: Record<string, { content: string; dependencies: PageDependencies; input_fingerprint?: string }>
+  repairs?: Record<string, TopicRepairState>
+  fingerprint: string; state: TopicState; pages: Record<string, { content: string; dependencies: PageDependencies; input_fingerprint?: string; generation_input_fingerprint?: string }>
   configuration_fingerprint?: string; point_hashes?: Record<string, string>
+  point_hash_version?: 2
   split_identity?: { root: number; children: Record<string, number>; points: string[] }
   gaps?: NonNullable<SnapshotManifest['topic_gaps']>
+  gap_inputs?: Record<string, string>
   retry_topics?: Topic[]
   rewritten: string[]; model_calls: number
+  current_model_calls?: number
   aliases?: Record<string, string>
 }
 export interface TermContribution {
@@ -197,6 +228,20 @@ export interface TermBuild {
 export interface Revocation { source_id: string; current_path: string; alias_paths?: string[]; reason: string; revoked_at: string; generation: number; deleted?: boolean }
 export interface Revocations { generation: number; sources: Revocation[] }
 export interface PendingBuild {
+  /** 来源补缺固定同一选择器；续做不得扩展为普通增量或其他来源。 */
+  source_scope?: { request: SourceGapRetry; completed: string[]; source_input: string; affected_topics: string[]; changed_points: string[] }
+  /** 定向恢复的原目标与已完成尝试；队列出空后仍不能扩大为普通全树续跑。 */
+  topic_scope?: { targets: string[]; completed: string[]; review_inputs: Record<string, string>; source_input?: string; configuration?: string }
+  runIds?: string[]
+  retry_gaps?: boolean
+  /** 显式重试尚未结束的单元；旧 retry_gaps 布尔值不重新入队已登记缺口。 */
+  retry_units?: string[]
+  acceptedProtocol?: 1
+  runId?: string
+  acceptedRef?: AcceptedRef
+  reextractGeneration?: number
+  provenanceRef?: SidecarRef
+  costsRef?: SidecarRef
   deleted_sources?: string[]
   preview_context?: { registrationKey: string; policyRevision: string }
   format_version: number; base_version: string | null; version: string | null
@@ -209,6 +254,89 @@ export interface PendingBuild {
   changes?: Record<string, string[]>
   source_ids?: Record<string, string>
 }
+
+/** IF-48～53 的持久契约；旧对象无需补字段。 */
+export type StageId = 'extract' | 'extractionReview' | 'topic' | 'parent' | 'topicReview' | 'term' | 'rewrite'
+export interface SourceRef { sourceId: string; sourceVersion: string }
+export interface TaskIdentity {
+  version: 1
+  scope: { libraryId: string; unitId: string; sourceRefs: SourceRef[] }
+  stage: StageId; operation: string
+  inputDigest: string; promptDigest: string; schemaDigest: string; validatorVersion: string
+  semanticVersion: string; groupPlanDigest: string | null
+  revocationGeneration: number; reextractGeneration: number
+}
+export interface AcceptedRef { taskId: string; path: string; digest: string }
+export interface SidecarRef { path: string; checksum: string }
+export interface ProductionRecord {
+  taskId: string; stage: StageId; operation: string; role: 'generate' | 'review' | 'correct'
+  outputDigest: string; lineId: string; provider: string; requestedModel: string; reportedModel: string | null
+  parameters: Record<string, unknown>; bindingRevision: string; capabilityRevision: string; parentProductionIds: string[]
+}
+export interface AcceptedRecord {
+  schema: 'llmwiki-accepted-v1'; taskId: string; identity: TaskIdentity
+  output: { path: string; digest: string; bytes: number; encoding: 'utf8-json' | 'utf8-text' }
+  validation: { validatorVersion: string; schemaDigest: string; status: 'accepted' }
+  productions: Record<string, ProductionRecord>
+  dependencies: { taskId: string; acceptedDigest: string; sourceRefs: SourceRef[] }[]
+  acceptedDigest: string
+}
+export interface AcceptanceRequest {
+  taskId: string; record: Omit<AcceptedRecord, 'acceptedDigest'>
+  responseAttemptId: string | null; acceptedAttemptIds: string[]
+}
+export interface AcceptanceSnapshot extends AcceptanceRequest {
+  prepareId: string; status: 'prepared' | 'bound'; acceptedDigest: string | null
+}
+export interface ProductionArtifact {
+  kind: 'extraction' | 'page' | 'metadata'; objectPath: string | null; objectDigest: string; pagePath: string | null
+  sourceRefs: SourceRef[]; status: 'recorded' | 'legacy-recorded' | 'unknown' | 'local-derived'
+  productionIds: string[]
+  inheritedFrom: { version: string; artifactId: string; productionIds: string[] } | null
+  reason?: string
+  metadata?: { target: string; fields: string[]; value: unknown }
+  legacyEvidence?: { originVersion: string; field: string; models: unknown; role: string | null }[]
+}
+export interface VersionProvenance {
+  schema: 'llmwiki-provenance-v1'; version: string; manifestChecksum: string; revocationGeneration: number
+  artifacts: Record<string, ProductionArtifact>; records: Record<string, ProductionRecord>
+}
+export interface NormalizedUsage { inputTokens: number; cacheReadTokens: number; cacheWriteTokens: number; outputTokens: number }
+export interface PriceSnapshot {
+  currency: string; unit: number; input: number; cacheRead: number; cacheWrite: number; output: number; priceRevision: string
+}
+export interface AttemptCandidate {
+  candidateId: string; lineId: string; provider: string; requestedModel: string
+  parameters: Record<string, unknown>; bindingRevision: string; capabilityRevision: string
+}
+export interface AttemptRequest {
+  runId: string; taskId: string; retryScopeId: string; attemptId: string; stage: StageId; operation: string
+  candidate: AttemptCandidate; estimatedInputTokens: number; maxOutputTokens: number; priceSnapshot: PriceSnapshot | null
+}
+export interface AttemptOutcome {
+  attemptId: string; reservationId: string; status: 'finished' | 'unknown'
+  finish: 'success' | 'transport-error' | 'cancelled' | null
+  provider: string; model: string; reportedModel: string | null; usage: NormalizedUsage | null
+  requestId: string | null; errorCategory: string | null; localExitStatus: number | null
+}
+export interface AttemptEntry {
+  charge?: { currency: string | null; amount: number | null; estimatedAmount: number | null }
+  request: AttemptRequest; reservationId: string; state: 'reserved' | 'dispatched' | 'released' | 'finished' | 'unknown'
+  reservedAt: string; dispatchedAt: string | null; finishedAt: string | null
+  outcome: AttemptOutcome | null; releaseReason: string | null
+  validation: { status: 'pending' | 'accepted' | 'rejected' | 'superseded'; reasonCode: string | null }
+  accepts: { taskId: string; acceptedDigest: string }[]
+}
+export interface ExecutionHooks {
+  beforeAttempt(request: AttemptRequest): Promise<{ status: 'reserved'; reservationId: string } | { status: 'paused'; reason: string }>
+  onDispatch(reservationId: string): Promise<void>
+  afterAttempt(outcome: AttemptOutcome): Promise<void>
+  releaseAttempt(reservationId: string, reason: string): Promise<void>
+  onValidation(result: { attemptId: string; taskId: string; status: 'rejected' | 'superseded'; reasonCode: string }): Promise<void>
+  prepareAccepted(request: AcceptanceRequest): Promise<{ prepareId: string; status: 'prepared' | 'bound' }>
+  readAcceptance(taskId: string): Promise<{ status: 'missing' } | AcceptanceSnapshot>
+  onAccepted(binding: { prepareId: string; taskId: string; acceptedDigest: string }): Promise<{ status: 'bound'; acceptedDigest: string }>
+}
 export interface StageCost {
   initial_calls?: number
   queue_ms?: number; execution_ms?: number; max_sync_ms?: number
@@ -217,11 +345,19 @@ export interface StageCost {
   duration_ms: number; unreported_calls: number
 }
 export interface CostReport {
+  calls?: { sequence: number; logical_task_id: string; unit_id: string; stage: string; input_fingerprint: string;
+    receipt_key: string | null; invalidation_reason: string; status: 'pending' | 'completed' | 'failed';
+    attempts: Pick<ModelAttempt, 'route' | 'startedAt' | 'durationMs' | 'finish' | 'usage' | 'error' | 'status'>[] }[]
   correction_rates?: Record<string, { calls: number; corrections: number; rate: number; limit: number; minimum_calls: number }>
   started_at: string; stages: Record<string, StageCost>; tasks: string[]
   first_extractions?: Record<string, { source_id: string; status: 'pending' | 'passed' | 'failed' }>
 }
+export interface SourceGapRetry { sourceIds: string[]; kinds: ('summary' | 'review')[] }
 export interface BuildLayeredOptions {
+  /** 只重试指定来源的已有摘要/核对缺口，不重新提取或补标。 */
+  retrySources?: SourceGapRetry
+  /** 本次调用为何需要执行；只用于成本关联，不参与请求回执身份。 */
+  invalidationReason?: string
   /** 调用方传入模型路由及生成参数；只参与任务回执摘要，不改变已发布提取的身份。 */
   taskModelIdentity?: unknown
   /** 明确选择同一资料根下的模型库；省略时兼容旧库，否则按模型生成目录名。 */
@@ -229,6 +365,8 @@ export interface BuildLayeredOptions {
   reextract?: 'all' | string[] | undefined
   /** 用户显式重试已发布的提取与补标缺口；传输错误产生的组级缺口在普通建库及续跑时也会自动重试。 */
   retryGaps?: boolean
+  /** 按主题或原因定向复核已有页的删句记录。 */
+  retryTopics?: { topicIds?: string[]; reasons?: string[] }
   /** 已在本次写入探针核对的身份；不参与来源提取指纹。 */
   vectorIdentity?: EmbeddingIdentity
   vectorDeferred?: boolean

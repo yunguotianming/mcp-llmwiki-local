@@ -68,8 +68,14 @@ it('主题核对删光无依据句后发布其余主题并登记缺口，补证�
   const manifest = await snapshotManifest(f.root)
   expect(manifest.pages).not.toHaveProperty('topics/T-0001.md')
   expect(manifest.pages).toHaveProperty('topics/T-0002.md')
-  expect(manifest.topic_gaps?.some(gap => gap.topic_id === 'T-0001')).toBe(true)
-  expect(inputs(f).filter(input => input.review_stage === 'topic-correction')).toHaveLength(1)
+  expect(manifest.topic_gaps?.find(gap => gap.topic_id === 'T-0001')?.message).toContain('重生成预算耗尽')
+  const targetInputs = inputs(f).filter(input => input.topic_id === 'T-0001')
+  // 首稿加两次再生，每稿均完整核对和纠正；持续无据后保持失败，不再发布该主题。
+  expect(targetInputs.filter(input => !input.review_stage).map(input => input.regeneration)).toEqual([undefined, 1, 2])
+  expect(targetInputs.filter(input => input.review_stage === 'topic')).toHaveLength(3)
+  expect(targetInputs.filter(input => input.review_stage === 'topic-correction')).toHaveLength(3)
+  expect(manifest.topic_recovery?.repairs['T-0001']).toMatchObject({ stage: 'generate', regenerations: 3 })
+  expect(manifest.topic_recovery?.topics.find(topic => topic.id === 'T-0001')?.page_status).toBe('failed')
 })
 
 it('同名且向量相同的不同指称术语保持独立', async () => {

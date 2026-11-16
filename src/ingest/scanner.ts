@@ -40,7 +40,7 @@ export async function scanSourceFiles(sourceRoots: string[], outputRoot: string,
       signal?.throwIfAborted()
       const file = path.join(current, entry.name)
       if (within(outputRoot, file)) { excluded.push({ path: file, reason: 'Wiki 输出目录不参与资料扫描。' }); continue }
-      if (entry.isSymbolicLink() || /^\.llmwiki(?:-|\.bak-|$)/i.test(entry.name) || entry.name === '.git') { excluded.push({ path: file, reason: '链接目录或插件状态不参与资料扫描。' }); continue }
+      if (entry.isSymbolicLink() || /^\.llmwiki(?:-|\.bak-|\.backup-before-|$)/i.test(entry.name) || entry.name === '.git') { excluded.push({ path: file, reason: '链接目录或插件状态不参与资料扫描。' }); continue }
       if (entry.isDirectory()) { await walk(sourceRoot, file); continue }
       if (!entry.isFile() || !/\.(md|markdown|txt|text)$/i.test(entry.name)) continue
       try {

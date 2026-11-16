@@ -5,6 +5,8 @@ import { storageJson } from './vectors.js'
 import { safePath } from '../storage/paths.js'
 import { readOptional } from '../storage/files.js'
 import type { CurrentVersion } from './schema.js'
+import { isProductionFormat, readProvenance, protocolError } from './models.js'
+import { readVersionCosts } from './costs.js'
 
 export async function readCurrent(root: string): Promise<CurrentVersion | undefined> {
   const current = await readOptional<CurrentVersion>(await safePath(root, 'state/current.json'))
@@ -37,7 +39,7 @@ export const manifestPath = (version: string): string => {
   if (!/^v\d{6,}$/.test(version)) throw new Error('版本号无效。')
   return `versions/${version}.json`
 }
-export async function readVersion(root: string, version: string): Promise<SnapshotManifest> {
+export async function readVersion(root: string, version: string, verifySidecars = true): Promise<SnapshotManifest> {
   const manifest = await readVerifiedObject(root, manifestPath(version), `manifest:${formatVersion}:${version}`, bytes => {
     const envelope = JSON.parse(bytes.toString('utf8')) as { checksum: string; manifest: SnapshotManifest }
     const manifest = envelope.manifest
@@ -45,13 +47,31 @@ export async function readVersion(root: string, version: string): Promise<Snapsh
       || hash(storageJson(manifest)) !== envelope.checksum) throw new Error('版本清单校验失败。')
     return manifest
   })
+  if (verifySidecars) await validateVersionSidecars(root, manifest)
   return structuredClone(manifest)
+}
+export async function validateVersionSidecars(root: string, manifest: SnapshotManifest): Promise<void> {
+  if (!await isProductionFormat(root)) return
+  const checksum = hash(storageJson(manifest))
+  const provenance = await readProvenance(root, manifest.version!, checksum)
+  if (provenance.revocationGeneration !== manifest.revocation_generation) throw protocolError('PROVENANCE_INCOMPLETE', '附属撤权代次不一致。')
+  for (const [page, digest] of Object.entries(manifest.pages ?? {})) if (!Object.values(provenance.artifacts).some(a => a.kind === 'page' && a.pagePath === page && a.objectDigest === digest)) throw protocolError('PROVENANCE_INCOMPLETE', '页面生产记录缺失：' + page)
+  for (const source of manifest.sources) if (!Object.values(provenance.artifacts).some(a => a.kind === 'extraction' && a.objectPath === source.extract.path)) throw protocolError('PROVENANCE_INCOMPLETE', '提取生产记录缺失：' + source.source_id)
+  for (const artifact of Object.values(provenance.artifacts)) if (artifact.objectPath) {
+    try {
+      await readVerifiedObject(root, artifact.objectPath, 'production:' + artifact.objectDigest, bytes => {
+        if (hash(bytes) !== artifact.objectDigest) throw new Error('产物摘要不符。')
+        return true
+      })
+    } catch { throw protocolError('PROVENANCE_INCOMPLETE', '生产记录引用的产物不完整：' + artifact.objectPath) }
+  }
+  await readVersionCosts(root, manifest.version!, checksum)
 }
 export async function writeVersion(root: string, manifest: SnapshotManifest): Promise<void> {
   // 序列化一次后回读，校验的是实际落盘的无向量清单。
   const plain = JSON.parse(storageJson(manifest)) as SnapshotManifest
   await immutableWrite(root, manifestPath(manifest.version!), Buffer.from(storageJson({ checksum: hash(storageJson(plain)), manifest: plain })))
-  await readVersion(root, manifest.version!)
+  await readVersion(root, manifest.version!, false)
 }
 export async function versionPage(root: string, manifest: SnapshotManifest, page: string): Promise<string> {
   const id = manifest.pages?.[page]

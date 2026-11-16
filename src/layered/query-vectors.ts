@@ -19,6 +19,9 @@ import { identityKey, probeIdentity, selection } from './vector-identity.js'
 import { clusteringVersion } from './clustering.js'
 import { buildConfiguration } from './build-configuration.js'
 import type { EmbeddingClient } from './schema.js'
+import { artifactId, isProductionFormat, readProvenance, writeProvenance } from './models.js'
+import { readVersionCosts, writeVersionCosts } from './costs.js'
+import { storageJson } from './vectors.js'
 
 const model = z.string().trim().min(1)
 export const copyEmbeddingTargetSchema = z.discriminatedUnion('embeddingMode', [
@@ -51,12 +54,15 @@ export async function copyWithEmbedding(source: string, target: CopyEmbeddingTar
         for (const entry of await readdir(sourceRoot)) await cp(path.join(sourceRoot, entry), path.join(targetRoot, entry), { recursive: true, force: false, errorOnExist: true, filter: async file => {
           options.signal?.throwIfAborted()
           const relative = path.relative(sourceRoot, file).replaceAll('\\', '/')
-          if (/^(?:data\/)?work(?:\/|$)/.test(relative) || /(?:^|\/)(?:[^/]*\.lock|inventory-lock\.sqlite(?:-.*)?)$/.test(relative)) return false
+          if (/^(?:data\/)?(?:work|logs\/model-accepts|logs\/model-runs)(?:\/|$)/.test(relative) || /(?:^|\/)(?:[^/]*\.lock|inventory-lock\.sqlite(?:-.*)?)$/.test(relative)) return false
           if ((await lstat(file)).isSymbolicLink()) throw new Error('库中含链接，无法保证独立复制，请先核对：' + relative)
           return true
         } })
         return value
       })
+      const originalChecksum = hash(storageJson(manifest))
+      const production = await isProductionFormat(targetRoot) ? await readProvenance(targetRoot, manifest.version!, originalChecksum) : undefined
+      const costs = production ? await readVersionCosts(targetRoot, manifest.version!, originalChecksum) : undefined
       const libraryId = randomUUID(), name = `${manifest.card!.name}（${standard}）`, metadata = { libraryId, formatVersion: 1, protocolVersion: 1 }
       settings = layeredSettings(selectedSettings, manifest.sources[0]?.extract.processing.tier)
       delete settings.embeddingChangeToken; delete settings.writerTakeoverToken
@@ -100,6 +106,12 @@ export async function copyWithEmbedding(source: string, target: CopyEmbeddingTar
       if (manifest.topics) manifest.topics.version = manifest.version
       for (const dependency of Object.values(manifest.deps?.pages ?? {})) for (const child of dependency.children ?? []) child.version = manifest.version
       await writeVersion(targetRoot, manifest)
+      if (production) {
+        for (const artifact of Object.values(production.artifacts)) artifact.inheritedFrom = { version: previous, artifactId: artifactId(artifact), productionIds: artifact.productionIds }
+        production.version = manifest.version; production.manifestChecksum = hash(storageJson(manifest))
+        await writeProvenance(targetRoot, production)
+        await writeVersionCosts(targetRoot, manifest.version, production.manifestChecksum, [], costs!)
+      }
       await validateCompleteVersion(targetRoot, manifest, true)
       if (manifest.topics) await writeJson(targetRoot, 'state/topics.json', manifest.topics)
       await writeJson(targetRoot, 'state/current.json', { version: manifest.version, revocation_generation: manifest.revocation_generation, history: [previous] })

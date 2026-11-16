@@ -70,3 +70,21 @@ it('取消信号不作为普通补标失败吞掉，也不重试或伪造缺口'
   expect(fixture.pending.manifest.point_labels).toEqual({})
   expect(fixture.pending.manifest.point_label_gaps).toEqual([])
 })
+
+it('补标只记录成功备用的实际作者，缺少回执时保留未知而不查询当前主模型', async () => {
+  const fixture = await pointLabelFixture(1), info = vi.spyOn(fixture.client, 'info')
+  vi.spyOn(fixture.client, 'inputBudget').mockResolvedValue(100000)
+  fixture.call.mockImplementation(async (_task, _system, input, _signal, _images, options) => {
+    options?.onAttempt?.({ finish: 'stop', error: '被拒绝', route: { provider: '主线', model: '错误模型' } } as any)
+    options?.onAttempt?.({ finish: 'stop', route: { provider: '备用', model: '实际模型' } } as any)
+    return pointLabelResponse(JSON.parse(input))
+  })
+  await preparePointLabels(fixture.root, fixture.pending, fixture.options)
+  expect(Object.values(fixture.pending.manifest.point_labels!)[0]?.model).toBe('备用/实际模型')
+  fixture.pending.manifest.point_labels = {}
+  fixture.call.mockImplementation(async (_task, _system, input) => pointLabelResponse(JSON.parse(input)))
+  info.mockClear()
+  await preparePointLabels(fixture.root, fixture.pending, fixture.options)
+  expect(Object.values(fixture.pending.manifest.point_labels!)[0]?.model).toBe('')
+  expect(info).not.toHaveBeenCalled()
+})

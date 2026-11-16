@@ -100,7 +100,8 @@ export async function hydrateVectors<T>(root: string, value: T, tolerateMissing 
     if (!item || typeof item !== 'object') return
     const record = item as Record<string, unknown>
     if (typeof record.vector_id === 'string') ids.add(record.vector_id)
-    for (const [key, child] of Object.entries(record)) if (key !== 'vector' && key !== 'centroid') collect(child)
+    // 页面检索只保存对象引用，按需读取；在这里展开会使后续状态克隆复制整库浮点数组。
+    for (const [key, child] of Object.entries(record)) if (key !== 'vector' && key !== 'centroid' && key !== 'page_vectors') collect(child)
   }
   collect(value)
   const unique = [...ids]
@@ -128,7 +129,7 @@ export async function hydrateVectors<T>(root: string, value: T, tolerateMissing 
       const { readPageObject } = await import('./objects.js')
       record.content = await readPageObject(root, record.content_id)
     }
-    for (const [key, child] of Object.entries(record)) if (key !== 'vector') await visit(child)
+    for (const [key, child] of Object.entries(record)) if (key !== 'vector' && key !== 'page_vectors') await visit(child)
     if (Array.isArray(record.topics) && record.vectors) {
       const { refreshTree } = await import('./hierarchy.js')
       refreshTree(record as unknown as import('./schema.js').TopicState)

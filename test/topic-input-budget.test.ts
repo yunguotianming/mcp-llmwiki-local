@@ -108,7 +108,11 @@ it('分块核对逐句覆盖全部成员及完整引文，并合并跨块结论�
     expect(request.blocks.flatMap((block: any) => block.member_ids).sort()).toEqual(members.map((_point, index) => 'P' + (index + 1)).sort())
     const blocks = requests.filter(input => input.review_stage === 'topic-block' && input.sentences[0].id === request.sentences[0].id)
     expect(blocks.flatMap(input => input.members)).toEqual(members.map((point, index) => ({ point_id: 'P' + (index + 1), text: point.text,
-      evidence: point.evidence.map(({ source_id, locator, quote }) => ({ source_id, locator, quote })) })))
+      evidence: point.evidence.map(({ source_id, source_version, locator, quote }) => ({ source_id, source_version, locator, quote })) })))
+    expect(request.navigation).toEqual({ sections: [], children: [] })
+    expect(request.source_versions).toEqual([{ source_id: 'S-0001', source_version: 'v1' }])
+    expect(blocks.every(block => JSON.stringify(block.navigation) === JSON.stringify(request.navigation)
+      && JSON.stringify(block.source_versions) === JSON.stringify(request.source_versions))).toBe(true)
   }
 })
 

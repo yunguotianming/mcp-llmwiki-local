@@ -8,7 +8,9 @@ import { readOptional } from '../storage/files.js'
 import { hash, withRevocationLock, writeJson } from './files.js'
 import { localDevice } from './devices.js'
 import { resumeRevocationCleanup } from './revocation-cleanup.js'
-import { pageObjectPath, readVersion, versionPage } from './objects.js'
+import { pageObjectPath, readVersion, versionPage, validateVersionSidecars } from './objects.js'
+import { modelRetentionRoots } from './costs.js'
+import { sidecarPath } from './models.js'
 import { readVectorRecord, storageJson, vectorPath, vectorUnavailable } from './vectors.js'
 import { hasVectorMode, recordIdentity, sameIdentity } from './vector-identity.js'
 import type { CurrentVersion, SnapshotManifest, SourceEntry } from './schema.js'
@@ -66,6 +68,7 @@ interface ValidationCache {
 }
 const validations = new Map<string, ValidationCache>()
 async function ensureCompleteVersion(root: string, manifest: SnapshotManifest, force: boolean): Promise<void> {
+  await validateVersionSidecars(root, manifest)
   const key = path.resolve(root)
   const metadata = await stat(key, { bigint: true }), identity = `${metadata.dev}:${metadata.ino}:${metadata.birthtimeNs}`
   let cache = validations.get(key)
@@ -100,7 +103,7 @@ async function ensureCompleteVersion(root: string, manifest: SnapshotManifest, f
     await nextTurn(); await nextTurn()
     if (cache.failed) throw new Error('版本文件监测失效，请重新读取。')
     if (revision !== cache.revision) continue
-    const files = new Set<string>([`versions/${version}.json`])
+    const files = new Set<string>([`versions/${version}.json`, sidecarPath(version, 'provenance'), sidecarPath(version, 'costs')])
     references(manifest, files, new Set())
     cache.versions.set(version, { signature, files })
     return
@@ -127,7 +130,7 @@ export function references(value: unknown, files: Set<string>, vectors: Set<stri
     if (typeof item === 'string') {
       if (key === 'vector_id') { vectors.add(item); files.add(vectorPath(item)) }
       else if (['content_id', 'new_object', 'previous_object'].includes(key) && /^sha256:[a-f0-9]{64}$/.test(item)) files.add(pageObjectPath(item))
-      else if (/^(objects\/snapshots\/|objects\/assets\/)/.test(item)) files.add(item)
+      else if (/^(objects\/snapshots\/|objects\/assets\/|work\/accepted\/objects\/)/.test(item)) files.add(item)
     } else references(item, files, vectors)
   }
   const record = value as { pages?: Record<string, unknown>; materialized?: Record<string, string>; desired?: Record<string, string> }
@@ -245,6 +248,76 @@ export async function listFiles(root: string, relative: string): Promise<string[
   const entries = await readdir(target, { recursive: true, withFileTypes: true }).catch(error => { if (error.code === 'ENOENT') return []; throw error })
   return entries.filter(entry => entry.isFile()).map(entry => path.posix.join(relative.replaceAll('\\', '/'), path.relative(target, path.join(entry.parentPath, entry.name)).replaceAll('\\', '/')))
 }
+/** 只读取得仍可读取或恢复发布的根；不延长退役宽限、不清理租约。 */
+export async function readRetentionRoots(root: string): Promise<{ versions: Set<string>; manifests: SnapshotManifest[]; files: Set<string>; objectVersions: Map<string, Set<string>> }> {
+  return withInventoryLock(root, async () => {
+    const versions = new Set<string>(pins.get(path.resolve(root))?.keys()), manifests: SnapshotManifest[] = [], files = new Set<string>(), vectors = new Set<string>()
+    const objectVersions = new Map<string, Set<string>>()
+    let pendingRoot: Record<string, unknown> | undefined, previewRoot: Record<string, unknown> | undefined, publishedReader = versions.size > 0
+    const version = (value: unknown) => {
+      if (value === null || value === undefined) return
+      if (typeof value !== 'string' || !/^v\d{6,}$/.test(value)) throw new Error('保留根的版本身份无效。')
+      versions.add(value)
+    }
+    const current = await readOptional<CurrentVersion>(await safePath(root, 'state/current.json'))
+    if (current !== undefined) {
+      if (!current || typeof current.version !== 'string' || !Number.isSafeInteger(current.revocation_generation) || current.revocation_generation < 0) throw new Error('当前保留根身份不完整。')
+      version(current.version)
+      if (current.history !== undefined && !Array.isArray(current.history)) throw new Error('保留根的历史版本列表无效。')
+      for (const value of current.history ?? []) {
+        if (typeof value !== 'string') throw new Error('历史保留根身份不完整。')
+        version(value)
+      }
+    }
+    const now = Date.now(), retired = await readOptional<Record<string, number>>(await safePath(root, 'state/retired-versions.json')) ?? {}
+    for (const [name, since] of Object.entries(retired)) {
+      if (!Number.isFinite(since)) throw new Error('退役保护时间无效。')
+      if (since <= now && now - since < readerLeaseMs) version(name)
+    }
+    for (const file of await listFiles(root, 'state/readers')) {
+      if (!file.endsWith('.json')) continue
+      const lease = await readOptional<ReaderLease>(await safePath(root, file))
+      if (!lease || !Number.isFinite(lease.expires_at)) throw new Error('读者保护记录不完整。')
+      if (lease.expires_at <= now) continue
+      if (!Number.isSafeInteger(lease.pid) || lease.pid <= 0 || !lease.device || typeof lease.version !== 'string') throw new Error('读者保护身份无效。')
+      version(lease.version)
+      publishedReader = true
+    }
+    for (const file of ['work/pending.json', 'work/preview.json', 'state/reading-copy.json', ...await listFiles(root, 'conflicts')]) {
+      if (!file.endsWith('.json')) continue
+      const value = await readOptional<Record<string, unknown>>(await safePath(root, file))
+      if (!value) continue
+      if (!file.startsWith('conflicts/')) for (const key of ['version', 'base_version', 'target']) version(value[key])
+      if (file === 'work/pending.json') {
+        pendingRoot = value
+        const manifest = value.manifest as SnapshotManifest | undefined
+        if (!manifest || !Array.isArray(manifest.sources)) throw new Error('待发布根缺少来源清单。')
+        manifests.push(manifest)
+      }
+      if (file === 'work/preview.json') previewRoot = value
+      if (file === 'state/reading-copy.json' && value.version != null) publishedReader = true
+      for (const mapping of [value.pages, value.materialized, value.desired]) if (mapping !== undefined
+        && (!mapping || typeof mapping !== 'object' || Array.isArray(mapping) || Object.values(mapping).some(id => typeof id !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(id)))) throw new Error('保留根的页面对象引用无效。')
+      for (const key of ['content_id', 'new_object', 'previous_object']) if (value[key] !== undefined && value[key] !== null
+        && (typeof value[key] !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(value[key] as string))) throw new Error('保留根的对象身份无效。')
+      if (file.startsWith('conflicts/') && typeof value.new_object === 'string' && value.version !== undefined) {
+        if (typeof value.version !== 'string' || !/^v\d{6,}$/.test(value.version)) throw new Error('冲突对象的来源版本无效。')
+        const object = pageObjectPath(value.new_object), owners = objectVersions.get(object) ?? new Set<string>()
+        owners.add(value.version); objectVersions.set(object, owners)
+      }
+      references(value, files, vectors)
+    }
+    if (current === undefined) {
+      const physical = (await listFiles(root, 'versions')).filter(file => /^versions\/v\d{6,}\.json$/.test(file))
+      // 首次未发布预览可以先落版本；已发布身份丢失不能用旁支根冒充当前库。
+      if (physical.length && (publishedReader || pendingRoot?.base_version !== null || typeof pendingRoot.version !== 'string'
+        || (pendingRoot.manifest as SnapshotManifest | undefined)?.version !== pendingRoot.version
+        || previewRoot && (previewRoot.base_version !== null || previewRoot.version !== pendingRoot.version)
+        || physical.some(file => file !== `versions/${pendingRoot.version}.json`) || [...versions].some(value => value !== pendingRoot.version))) throw new Error('物理版本存在但当前发布身份缺失。')
+    }
+    return { versions, manifests, files, objectVersions }
+  })
+}
 export async function collectGarbage(root: string, graceMs = readerLeaseMs): Promise<void> {
   await resumeRevocationCleanup(root)
   await withInventoryLock(root, async () => {
@@ -271,6 +344,7 @@ export async function collectGarbage(root: string, graceMs = readerLeaseMs): Pro
       else await unlink(await safePath(root, file)).catch(error => { if (error.code !== 'ENOENT') throw error })
     }
     const files = new Set<string>(), vectors = new Set<string>()
+    for (const file of (await modelRetentionRoots(root)).outputs) files.add(file)
     references(await readOptional(await safePath(root, 'state/topics.json')), files, vectors)
     for (const file of [...await listFiles(root, 'work'), ...await listFiles(root, 'conflicts'), 'state/reading-copy.json']) {
       if (!file.endsWith('.json')) continue
@@ -290,6 +364,10 @@ export async function collectGarbage(root: string, graceMs = readerLeaseMs): Pro
     if (building) references(cache, files, vectors)
     // 先取消历史登记，再删对象；中断后的下次清理可重复执行。
     for (const file of versions) if (!retained.has(path.posix.basename(file, '.json'))) await unlink(await safePath(root, file))
+    for (const file of await listFiles(root, 'versions')) {
+      const version = /^versions\/(v\d{6,})\.(?:provenance|costs)\.json$/.exec(file)?.[1]
+      if (version && !retained.has(version)) await unlink(await safePath(root, file))
+    }
     // 未发布对象由作业整体固定，避免正文封存与检查点引用之间的可见窗口。
     // 撤权清除独立于此宽限，仍立即删除被撤内容。
     if (!building) for (const file of await listFiles(root, 'objects')) if (!files.has(file)) await unlink(await safePath(root, file))

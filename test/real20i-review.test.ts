@@ -41,7 +41,7 @@ it('局部缺省主张送入全文核对，远处答案不能被判全篇缺失'
     const input = JSON.parse(raw)
     if (input.review_stage === 'extraction') {
       expect(system).toContain('局部没有不代表全文没有')
-      expect(input.points[0].source_context).toContain('第7题答案：C')
+      expect(input.contexts[input.points[0].source_context_ref].text).toContain('第7题答案：C')
       return JSON.stringify({ items: [{ id: 'P1', support: '不支撑', missing: '全文有答案 C' }] })
     }
     return JSON.stringify({ items: [] })
@@ -64,6 +64,6 @@ it('父主题核对携带实际子页导航，并继续核对全部句子和对�
   const body = '# 岗位研究\n范围：前后两个子页分别讨论岗位与学习。\n## 子主题导航\n- [甲岗位](甲.md) — 岗位研究\n- [乙学习](乙.md) — 学习研究'
   await reviewTopicContent('T1', body, [point()], f.options)
   const input = JSON.parse(f.call.mock.calls[0]![2])
-  expect(input.navigation).toContain('乙学习'); expect(input.sentences).toHaveLength(2)
+  expect(input.navigation.sections[0].content).toContain('乙学习'); expect(input.sentences).toHaveLength(4)
   expect(f.call.mock.calls[0]![1]).toContain('研究者使用的访谈方法不能当作受访者岗位职责')
 })

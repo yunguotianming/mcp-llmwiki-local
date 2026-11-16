@@ -4,7 +4,9 @@ import { parseMarkdown, separateImages } from '../ingest/markdown.js'
 
 export interface SearchNotice { library: string; stage: 'understanding' | 'embedding' | 'index' | 'library'; reason: string; message: string; retrieval?: 'fts' }
 export interface SearchOptions { variants?: string[] | undefined; include?: 'hits' | 'excerpts' | undefined; excerpt_budget?: number | undefined; excerpt_pages?: number | undefined }
-export interface PageExcerpt { library: string; path: string; title: string; anchor: string; locator: string; quote_hash: string; content: string; tokens: number }
+export interface EvidenceSegment { start: number; end: number; anchor: string; locator: string; contextLocator: string; truncated: boolean; unverified: boolean }
+export interface PageExcerpt { library: string; path: string; title: string; anchor: string; locator: string; quote_hash: string; content: string; tokens: number; segments?: EvidenceSegment[] }
+export const answerGuidance = '根据证据回答：检索分数和 confidence 只表示相关性，不证明事实成立。标题、别名、导航和引用行号不能代替事实正文。按 segments 的 start/end（字符串下标，end 不含）分别读取主张及其引用，不借用相邻段落或其他来源的引用。locator 按传入摘录器的页面文本计行：搜索正文已去掉 YAML 页头，补读全文可能保留页头，未核对时不能改称完整文件的物理行号。原始资料定位以正文内的来源版本及 #L 行号为准；引用 Wiki 时优先给出路径和块锚点，不把 locator 改称原文行号。truncated 表示原段被裁剪或复合要点的证据未全覆盖，unverified 表示原段标为未核实；先用 wiki_read / wiki_source_read 补读完整主张和原文，再判断支持范围。每个事实句在本句末尾写自己的引用，连续多句由同一证据支持时逐句重复编号；总结句、事实标题、列表引导句和各事实列表项也要各自引用，不能借下一句或列表末尾的编号。保留对象、条件、数量、否定、可能性及观点归属；建议、推测、测验选项不能改称研究结论，单人观点不能推广到群体。来源冲突分别说明，不合并成共同结论。先回答有据部分，对缺失部分继续检索或明确说明本次证据不足，不把未检索到说成全库没有，也不因局部缺口拒答整题。先检查全部本次 evidence，保留其中已支持的相关内容；材料尚未明确某个对应关系或具体条件时，只说明该关系或条件尚不能确认，不概括成该方面完全没有材料。不得依据题名、阶段名称、引用行号或另一来源的结论补写当前来源未提供的细节。'
 export const stripBlockIds = (content: string): string => content.replace(/[ \t]+\^[a-zA-Z0-9-]+[ \t]*(?=\r?$)/gm, '')
 // 未依赖特定供应商 tokenizer；UTF-8 字节数作为保守 token 上界，同一预算在所有入口一致。
 export const tokenCost = (value: string): number => Buffer.byteLength(value, 'utf8')
@@ -218,11 +220,24 @@ export function excerpts(page: { library: string; path: string; title: string; c
     const citation = [...block.content.matchAll(citationPattern)][0]?.[1]
     if (citation) citations.set(block.anchor.slice(1), `[${citation}](../sources/${citation.split('@')[0]}.md#${block.anchor})`)
   }
+  // 一条要点的多段证据必须共同定位；旧页也可从每条证据的完整 point_id 恢复关联。
+  const evidenceGroups = new Map<string, string[]>(), pointGroups = new Map<string, Set<string>>()
+  for (const block of blocks.filter(block => block.evidence)) {
+    const point = /(?:^|\n)(?:-\s*)?((?:S-\d+|\d{14}-[a-z0-9]{7}):[^\s：]+)：/.exec(block.content)?.[1]
+    if (!point) continue
+    const refs = pointGroups.get(point) ?? new Set<string>()
+    for (const ref of block.refs) refs.add(ref)
+    pointGroups.set(point, refs)
+  }
+  for (const refs of [...pointGroups.values()].map(refs => [...refs]).concat(pointMatches.map(point => point.anchors))) {
+    for (const ref of refs) evidenceGroups.set(ref, [...new Set([...(evidenceGroups.get(ref) ?? []), ...refs])])
+  }
+  const fullRefs = (refs: string[]) => [...new Set(refs.flatMap(ref => evidenceGroups.get(ref) ?? [ref]))]
   const expand = (text: string) => page.path.startsWith('sources/')
-    ? text.replace(/\[(?:证据|回源)\]\(#\^(p[\w-]+)\)/g, (link, id: string) => citations.get(id) ?? link) : text
+    ? text.replace(/\[(?:证据|回源)\]\(#\^(p[\w-]+)\)/g, (link, id: string) => fullRefs([id]).map(ref => citations.get(ref)).filter(Boolean).join(' ') || link) : text
   const unique = new Map<string, typeof blocks[number]>()
   for (const block of blocks) {
-    const key = plainPoint(block.content)
+    const key = plainPoint(block.content).replace(/[；;]+$/, '').trim()
     const previous = unique.get(key)
     // 同一主张的分类副本沿用含证据链接的版本，避免分类正文和概览重复消耗预算。
     if (!previous || !previous.refs.length && block.refs.length) unique.set(key, block)
@@ -231,30 +246,57 @@ export function excerpts(page: { library: string; path: string; title: string; c
   const matches = candidates.filter(block => block.score > 0 || block.pointScore > 0)
   const claims = matches.filter(block => !block.evidence)
   const pending = claims.length ? claims : matches
-  const selected: { block: typeof blocks[number]; content: string; line: number; last: number }[] = []
+  const unverifiedEvidence = new Set<typeof blocks[number]>(), fallbackClaims = new Set<typeof blocks[number]>()
+  const fallbackByBlock = new Map<typeof blocks[number], typeof blocks[number]>()
+  const fallbackGroups = new Map<typeof blocks[number], string>(), fallbackTerms = passageTerms(queries)
+  if (page.path.startsWith('sources/')) for (let index = pending.length - 1; index >= 0; index--) {
+    const claim = pending[index]!, refs = fullRefs(claim.refs)
+    if (claim.evidence || refs.length < 2) continue
+    const evidence = blocks.filter(block => block.evidence && block.refs.some(ref => refs.includes(ref)))
+    const needsOriginal = /原文|定位|引文|original|\blocat(?:ion|or)\b/i.test(queries.join('\n'))
+    if (!needsOriginal && refs.every(ref => citations.has(ref)) && tokenCost(expand(claim.content)) <= budget) continue
+    // 预算不足或明确问原文时，返回各自绑定引用的真实证据段；不让首行号替代整条复合主张。
+    if (!evidence.length) continue
+    pending.splice(index, 1); fallbackClaims.add(claim)
+    for (const block of evidence) {
+      const vocabulary = passageVocabulary(plainPoint(block.content).replace(/^\s*```[^\n]*$/gm, '')), matched = [...fallbackTerms].filter(([term]) => vocabulary.has(term))
+      const citation = citations.get(block.anchor.slice(1)), hasCitation = [...block.content.matchAll(citationPattern)].length > 0
+      const content = !citation ? block.content : hasCitation ? block.content.replace(citationPattern, citation) : block.content + ' ' + citation
+      const original = fallbackByBlock.get(block) ?? { ...block, content, score: claim.score + matched.reduce((sum, [, weight]) => sum + weight, 0), matched: matched.map(([term]) => term) }
+      if (!fallbackByBlock.has(block)) { pending.push(original); fallbackByBlock.set(block, original) }
+      fallbackGroups.set(original, refs.join(','))
+      if (/【未核实】/.test(claim.content)) unverifiedEvidence.add(original)
+    }
+  }
+  const selected: { block: typeof blocks[number]; content: string; line: number; last: number; truncated: boolean }[] = []
   const totalBudget = budget
-  const locations = (block: typeof blocks[number]) => block.refs.map(ref => citations.get(ref)?.split(']')[0]).filter((value): value is string => !!value)
+  const locations = (block: typeof blocks[number]) => [
+    ...block.refs.map(ref => citations.get(ref)?.split(']')[0]).filter((value): value is string => !!value),
+    ...(fallbackGroups.has(block) ? ['point:' + fallbackGroups.get(block)] : []),
+  ]
   // 展开文本、长度与原文定位在选择过程中不变，每块只算一次；排序比较器里反复计算会让大页面的查询变慢数倍。
   const fixed = new Map(pending.map(block => {
     const expanded = expand(block.content)
     return [block, { expanded, root: Math.sqrt(tokenCost(expanded)), locations: locations(block) }] as const
   }))
-  const selectedLocations = new Set<string>()
+  const selectedLocations = new Map<string, number>()
   // 首条按相关度；后续优先增加尚未覆盖的词项，最后按页内顺序合并，每条保留自己的引用。
   const gain = (block: typeof blocks[number]) => block.matched.reduce((sum, term) => sum + (covered.has(term) ? 0 : needles.get(term) ?? 0), 0) * block.penalty
-  // 同一原文段拆出的相关要点优先相邻补齐，避免主张措辞不同却被已覆盖词项挡掉。
+  // 同段补齐只在相关度相当时破同分，不能挤掉问题尚未覆盖的高相关事实。
   const related = (block: typeof blocks[number]) => block.score > 0 && block.penalty === 1 && fixed.get(block)!.locations.some(location => selectedLocations.has(location))
   const distance = (block: typeof blocks[number]) => Math.min(...selected.map(item => Math.abs(item.block.line - block.line)))
   while (pending.length) {
     // 覆盖词项与已选位置只在选中一条后变化：每轮先为每块算一次排序键，比较器只读取键值，排序结果与逐次计算相同。
     const keys = new Map(pending.map(block => {
-      const isRelated = related(block)
-      return [block, { related: isRelated, distance: isRelated ? distance(block) : 0, ratio: selected.length ? (block.score + gain(block)) / fixed.get(block)!.root : 0 }] as const
+      const isRelated = related(block), inherited = isRelated ? Math.max(0, ...fixed.get(block)!.locations.map(location => selectedLocations.get(location) ?? 0)) : 0
+      const relevance = Math.max(block.score, inherited) + (selected.length ? gain(block) : 0)
+      return [block, { related: isRelated, relevance, distance: isRelated ? distance(block) : 0, ratio: selected.length ? relevance / fixed.get(block)!.root : 0 }] as const
     }))
     pending.sort((a, b) => {
       const ka = keys.get(a)!, kb = keys.get(b)!
-      return Number(kb.related) - Number(ka.related) || (ka.related && kb.related ? ka.distance - kb.distance || a.line - b.line : 0)
-        || kb.ratio - ka.ratio || b.score - a.score || b.pointScore - a.pointScore || a.line - b.line
+      return kb.relevance - ka.relevance || (ka.related && kb.related ? ka.distance - kb.distance : 0)
+        || kb.ratio - ka.ratio || b.score - a.score || Number(kb.related) - Number(ka.related)
+        || (ka.related && kb.related ? ka.distance - kb.distance : 0) || b.pointScore - a.pointScore || a.line - b.line
     })
     const block = pending.shift()!
     if (selected.length && !gain(block) && !keys.get(block)!.related && block.score < selected[0]!.block.score / 2) continue
@@ -264,16 +306,25 @@ export function excerpts(page: { library: string; path: string; title: string; c
     const window = passageWindow(expanded, queries, available)
     if (!window.content) continue
     const line = block.line + expanded.slice(0, window.offset).split('\n').length - 1
-    selected.push({ block, content: window.content, line, last: line + window.content.split('\n').length })
+    selected.push({ block, content: window.content, line, last: line + window.content.split('\n').length, truncated: window.content !== expanded })
     budget -= tokenCost(window.content) + (selected.length > 1 ? 1 : 0)
     for (const term of window.content === expanded ? block.matched : passageVocabulary(plainPoint(window.content))) covered.add(term)
-    if (block.score >= selected[0]!.block.score * 0.8) for (const location of locations(block)) selectedLocations.add(location)
+    for (const location of locations(block)) selectedLocations.set(location, Math.max(selectedLocations.get(location) ?? 0, block.score))
   }
+  const selectedBlocks = new Set(selected.map(item => item.block))
+  const incompleteEvidence = new Set([...fallbackGroups].filter(([block, group]) => !selectedBlocks.has(block)
+    || group.split(',').some(ref => !citations.has(ref))).map(([, group]) => group))
   const emit = (items: typeof selected) => {
     items.sort((a, b) => a.line - b.line)
     const content = items.map(item => item.content).join('\n'), first = items[0]!
+    let offset = 0
+    const segments = items.map(item => {
+      const start = offset; offset += item.content.length + 1
+      return { start, end: offset - 1, anchor: item.block.anchor, locator: `L${item.line + 1}-L${item.last}`, contextLocator: item.block.locator,
+        truncated: item.truncated || incompleteEvidence.has(fallbackGroups.get(item.block) ?? ''), unverified: unverifiedEvidence.has(item.block) || /【未核实】/.test(item.block.content) }
+    })
     result.push({ library: page.library, path: page.path, title: page.title, anchor: first.block.anchor,
-      locator: `L${first.line + 1}-L${Math.max(...items.map(item => item.last))}`, quote_hash: signature(content), content, tokens: tokenCost(content) })
+      locator: `L${first.line + 1}-L${Math.max(...items.map(item => item.last))}`, quote_hash: signature(content), content, tokens: tokenCost(content), segments })
   }
   if (selected.length) {
     // 无证据关联的普通段落（含图片两侧的连续文本）仍各自定位，不能跨图片拼出不存在的原文。
@@ -281,7 +332,7 @@ export function excerpts(page: { library: string; path: string; title: string; c
     else emit(selected)
   }
   // 无词项命中时仍允许语义证据；普通无引用页面保留页首概览补充。
-  const supplement = candidates.filter(block => !selected.some(item => item.block === block)
+  const supplement = candidates.filter(block => !fallbackClaims.has(block)).map(block => fallbackByBlock.get(block) ?? block).filter(block => !selected.some(item => item.block === block)
     && (block.score === 0 && block.pointScore === 0 || !needles.size || !selected.some(item => item.block.score > 0) && block.evidence))
     .sort((a, b) => a.line - b.line)
   if (!selected.length || !selected.some(item => item.block.refs.length) || !selected.some(item => item.block.score > 0)) for (const block of supplement) {
@@ -290,7 +341,7 @@ export function excerpts(page: { library: string; path: string; title: string; c
     const window = passageWindow(expanded, queries, budget)
     if (!window.content) continue
     const line = block.line + expanded.slice(0, window.offset).split('\n').length - 1
-    emit([{ block, content: window.content, line, last: line + window.content.split('\n').length }])
+    emit([{ block, content: window.content, line, last: line + window.content.split('\n').length, truncated: window.content !== expanded }])
     budget -= tokenCost(window.content)
   }
   return result

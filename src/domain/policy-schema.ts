@@ -1,6 +1,8 @@
 import { z } from 'zod'
 import type { LibraryPolicy } from './policy.js'
+import { buildModelsSchema } from './route-schema.js'
 export const policySchema = z.strictObject({
+  libraryFormat: z.literal('0.3.0').optional(), buildModels: buildModelsSchema.optional(),
   version: z.literal(1), wikiLanguage: z.string().trim().min(1), useCustomWikiLanguage: z.boolean(),
   concurrencyLimit: z.number().int().min(1).max(1000).default(50),
   pageGenerationConcurrency: z.number().int().min(1).max(1000), analysisConcurrency: z.number().int().min(1).max(1000),

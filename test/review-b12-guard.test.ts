@@ -109,7 +109,7 @@ it('B12 来源标题按来源身份绑定，标题词不作事实锚点且不同
   expect(preservesClaimFacts('《Many Nurses Improve Outcomes》报告，CRN负责访谈。', '《Other Study》报告，CRN负责访谈。', sources)).toBe(false)
 })
 
-it.skipIf(!hasFixture)('B12 主语换说法未获最终等价性确认仍拒收（夹具含第三方论文原文，未随公开仓库发布）', async () => {
+it.skipIf(!(existsSync(new URL('./fixtures/topic-guard-review.json', import.meta.url))))('B12 主语换说法未获最终等价性确认仍拒收（夹具含第三方论文原文，未随公开仓库发布）', async () => {
   const sample = samples.accepted[0]
   const result = await correct([body(sample.original)], [body(sample.corrected)], { claim_preserved: false })
   expect(result.requests.some(d => d.sentences?.some((s: any) => s.original_text))).toBe(true)

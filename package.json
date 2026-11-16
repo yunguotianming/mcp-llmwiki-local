@@ -1,7 +1,12 @@
 {
   "name": "llmwiki-local",
-  "version": "0.2.0",
+  "version": "0.3.0-preview.1",
   "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yunguotianming/mcp-llmwiki-local.git"
+  },
   "description": "独立的本地 LLM Wiki 查询与建库 MCP 服务",
   "type": "module",
   "bin": {
@@ -16,8 +21,9 @@
     "test": "node test/run.mjs"
   },
   "source": {
-    "repository": "<个人资料目录>/ai-projects/deepseek-harness/plugins/self-developed/dsh-llmwiki",
-    "commit": "ff449031f899b53bc3342adae89008e536a69c26"
+    "repository": "https://github.com/yunguotianming/dsh-llmwiki",
+    "commit": "078b0579b021d0b67c8aa74d9c628111ba81c823",
+    "localCommit": "7a5604e613189ca3ffb78f7ac67d93a0d2c4e832"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
@@ -32,6 +38,5 @@
     "@types/node": "24.10.1",
     "typescript": "5.9.3",
     "vitest": "4.1.8"
-  },
-  "license": "MIT"
+  }
 }

@@ -1,9 +1,27 @@
 import path from 'node:path'
+import { tmpdir } from 'node:os'
 import { mkdir, readFile, writeFile, stat } from 'node:fs/promises'
 import { expect, it } from 'vitest'
 import { temporaryWorkspace } from './temp.js'
 import { LocalConfigStore, parseLocalConfig } from '../src/local/config.js'
 import { runCli } from '../src/cli.js'
+import { emptyRegistry, layeredSettings, newLibrary } from '../src/domain/config.js'
+
+it('独立配置接受库级向量并发，旧配置默认三路并拒绝越界值', () => {
+  const registry = emptyRegistry(), library = newLibrary('embedding-concurrency')
+  library.wikiPath = path.join(tmpdir(), 'llmwiki-config-concurrency')
+  library.layered = {}; registry.libraries.push(library)
+  const parsed = () => parseLocalConfig({ registry }).registry.libraries[0]!
+  expect(layeredSettings(parsed().layered).embeddingConcurrency).toBe(3)
+  for (const concurrency of [1, 16]) {
+    library.layered.embeddingConcurrency = concurrency
+    expect(parsed().layered!.embeddingConcurrency).toBe(concurrency)
+  }
+  for (const concurrency of [0, 17, 1.5]) {
+    library.layered.embeddingConcurrency = concurrency
+    expect(parsed).toThrow()
+  }
+})
 
 it('首次配置、library 增列删命令保留资料和库文件', async () => {
   const f = await temporaryWorkspace()
@@ -24,7 +42,7 @@ it('首次配置、library 增列删命令保留资料和库文件', async () =>
   } finally { await f.cleanup() }
 })
 
-it('拒绝明文密钥、非法配置及并发覆盖', async () => {
+it('拒绝未知字段、非法配置及并发覆盖', async () => {
   const f = await temporaryWorkspace()
   try {
     const first = new LocalConfigStore(f.root), second = new LocalConfigStore(f.root)

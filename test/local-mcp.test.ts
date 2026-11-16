@@ -51,12 +51,14 @@ async function finished(call: Awaited<ReturnType<typeof session>>['call'], jobId
   throw new Error('假模型作业未按期结束。')
 }
 
-it('SDK 列出九工具，搜索、浏览与按 ID/块 ID 阅读均走核心', async () => {
+it('SDK 保留作业工具并接入库管理、回答和回源，搜索浏览阅读均走核心', async () => {
   const f = await queryFixture(), config = new LocalConfigStore(path.join(f.root, 'mcp-home')); await config.load()
   sessions.push(async () => f.cleanup()); f.library.layered = { embeddingMode: 'none' }
   await config.writeRegistry(f.store.snapshot(), config.registry())
   const app = await session(config)
-  expect((await app.client.listTools()).tools).toHaveLength(9)
+  const names = (await app.client.listTools()).tools.map(tool => tool.name)
+  expect(names).toHaveLength(19)
+  expect(names).toEqual(expect.arrayContaining(['wiki_generate', 'wiki_status', 'wiki_commit', 'wiki_cancel', 'wiki_answer', 'wiki_source_read', 'wiki_find_library', 'wiki_update_library']))
   const search = await app.call('wiki_search', { query: '审查证据', variants: ['审查'], include: 'hits' })
   expect(search.total).toBeGreaterThan(0)
   const browse = await app.call('wiki_browse', { library: f.library.id, ref: 'root' })

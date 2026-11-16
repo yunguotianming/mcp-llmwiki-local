@@ -1,3 +1,5 @@
+import { recoveryTask } from './extraction-cache.js'
+import { activeAcceptedRefs, businessValue, recoveryContext } from './accepted.js'
 import { jsonProtocol, schemaJSON } from '../llm/protocol.js'
 import { z } from 'zod'
 import { parseModelJson } from '../llm/json.js'
@@ -14,7 +16,7 @@ const system = jsonProtocol(baseSystem, schemaJSON(outputSchema))
 const tagProtocolVersion = hash(JSON.stringify(['tag-merges-v3', system, schemaJSON(outputSchema)]))
 type TagMergeState = NonNullable<PendingBuild['manifest']['tag_merges']> & { fingerprint?: string }
 
-export async function prepareTagMerges(root: string, pending: PendingBuild, options: BuildLayeredOptions) {
+async function prepareTagMergesOnce(root: string, pending: PendingBuild, options: BuildLayeredOptions, persist = true) {
   const policy = pending.manifest.tag_policy
   const fingerprint = tagProtocolVersion
   const stored: TagMergeState = pending.manifest.tag_merges ?? { checked: [], groups: [] }
@@ -63,10 +65,10 @@ export async function prepareTagMerges(root: string, pending: PendingBuild, opti
   }
   } catch (error) {
     options.signal?.throwIfAborted()
-    if (error && typeof error === 'object' && ('budgetPause' in error || error instanceof Error && error.name === 'AbortError'
+    if (error && typeof error === 'object' && ('budgetPause' in error || 'stagePause' in error || 'storageFailure' in error || error instanceof Error && error.name === 'AbortError'
       || 'code' in error && ['EIO', 'ENOSPC', 'EACCES', 'EPERM', 'ENOENT'].includes(String(error.code)))) throw error
     pending.manifest.tag_merge_gap = { tags: newTags, message: String(error) }
-    await writeJson(root, 'work/pending.json', pending)
+    persist && await writeJson(root, 'work/pending.json', pending)
     return { changed: true, modelCalls }
   }
   if (rejected.length && !rejectedTags.size) for (const tag of newTags) rejectedTags.add(tag)
@@ -78,6 +80,27 @@ export async function prepareTagMerges(root: string, pending: PendingBuild, opti
   next.models = mergeModels(previous.models ?? [], usage.models)
   next.fingerprint = fingerprint
   pending.manifest.tag_merges = next
-  await writeJson(root, 'work/pending.json', pending)
+  persist && await writeJson(root, 'work/pending.json', pending)
   return { changed: true, modelCalls }
+}
+
+export async function prepareTagMerges(root: string, pending: PendingBuild, options: BuildLayeredOptions): Promise<{ changed: boolean; modelCalls: number }> {
+  if (!recoveryContext()) return prepareTagMergesOnce(root, pending, options)
+  const sources = pending.manifest.sources
+  const input = businessValue({ sources: sources.map(source => [source.source_id, source.source_version, source.extract.path]),
+    vocabulary: options.vocabulary ?? null, tags: pending.manifest.tag_policy ?? null, previous: pending.manifest.tag_merges ?? null, retryGaps: options.retryGaps ?? false })
+  const receipt = await recoveryTask(options, 'extract', input, async signal => {
+    const draft = { ...pending, manifest: { ...pending.manifest, ...(pending.manifest.tag_merges ? { tag_merges: structuredClone(pending.manifest.tag_merges) } : {}), ...(pending.manifest.tag_merge_gap ? { tag_merge_gap: structuredClone(pending.manifest.tag_merge_gap) } : {}) } }
+    const result = await prepareTagMergesOnce(root, draft, { ...options, signal }, false)
+    return { result, tag_merges: draft.manifest.tag_merges ?? null, tag_merge_gap: draft.manifest.tag_merge_gap ?? null }
+  }, value => !value.tag_merge_gap || value.tag_merges !== null && JSON.stringify(value.tag_merges) !== JSON.stringify(pending.manifest.tag_merges ?? null), {
+    unitId: 'tagMerge', sourceRefs: sources.map(source => ({ sourceId: source.source_id, sourceVersion: source.source_version })),
+    operation: 'tagMerge', input, prompt: system, schema: schemaJSON(outputSchema), validatorVersion: 'tagMerge-v1', semanticVersion: 'tagMerge-v1',
+    dependencies: activeAcceptedRefs(sources.flatMap(source => source.acceptedRef ? [source.acceptedRef] : [])),
+  })
+  if (receipt.value.tag_merges) pending.manifest.tag_merges = { ...receipt.value.tag_merges, ...(receipt.acceptedRef && receipt.value.result.modelCalls > 0 ? { acceptedRef: receipt.acceptedRef } : {}) }
+  if (receipt.value.tag_merge_gap) pending.manifest.tag_merge_gap = receipt.value.tag_merge_gap
+  else delete pending.manifest.tag_merge_gap
+  await writeJson(root, 'work/pending.json', pending)
+  return { ...receipt.value.result, modelCalls: receipt.reused ? 0 : receipt.value.result.modelCalls }
 }

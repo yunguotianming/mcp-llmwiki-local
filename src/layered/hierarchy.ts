@@ -9,6 +9,7 @@ export { topicPath } from './schema.js'
 export const topicDepth = (topic: Topic): number => topic.id.split('-').length - 2
 export const pageLink = (from: string, to: string): string => path.posix.relative(path.posix.dirname(from), to)
 export const childrenOf = (state: TopicState, topic: Topic): Topic[] => state.topics.filter(child => child.parent_id === topic.id).sort((a, b) => a.id.localeCompare(b.id))
+export const effectiveChildren = (state: TopicState, topic: Topic): Topic[] => childrenOf(state, topic).filter(child => !child.page_status || child.page_status === 'ready')
 export const logicalSource = (state: TopicState, pointId: string): string => state.logical_sources?.[pointId.split(':')[0]!] ?? pointId.split(':')[0]!
 export const logicalSourceCount = (state: TopicState, topic: Topic): number => new Set(topic.point_ids.map(id => logicalSource(state, id))).size
 export function refreshTopic(state: TopicState, topic: Topic): void {
@@ -19,10 +20,10 @@ export function refreshTopic(state: TopicState, topic: Topic): void {
 export function refreshTree(state: TopicState): void {
   for (const topic of [...state.topics].sort((a, b) => topicDepth(b) - topicDepth(a))) {
     const children = childrenOf(state, topic)
-    if (children.length) topic.point_ids = [...(topic.direct_point_ids ?? []), ...children.flatMap(child => child.point_ids)]
+    if (children.length) topic.point_ids = [...(topic.direct_point_ids ?? []), ...effectiveChildren(state, topic).flatMap(child => child.point_ids)]
     refreshTopic(state, topic)
   }
-  state.topics = state.topics.filter(topic => topic.point_ids.length || topic.archived)
+  state.topics = state.topics.filter(topic => topic.point_ids.length || topic.archived || topic.page_status === 'failed' || childrenOf(state, topic).length)
 }
 export function newTopic(state: TopicState, parent: Topic | undefined, reserved: Set<string>): Topic {
   let id: string
@@ -36,6 +37,7 @@ export function newTopic(state: TopicState, parent: Topic | undefined, reserved:
   }
   reserved.add(id)
   const topic: Topic = { id, path: topicPath(id), parent_id: parent?.id ?? null, title: '', summary: '', sources: [], point_ids: [], centroid: [], revisions: 0 }
+  if (state.topics.some(topic => topic.page_status)) topic.page_status = 'pending'
   state.topics.push(topic)
   return topic
 }

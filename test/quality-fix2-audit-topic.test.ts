@@ -10,7 +10,7 @@ it('A16 主题每主题一次逐句，精细含归属，未变主题零调用', 
   const input = JSON.parse(f.call.mock.calls[0]![2])
   expect(input.contradiction_attribution).toBe(true)
   expect(input.sentences.map((s: any) => s.text)).toContain('提高1.5%。')
-  expect(input.sentences.some((s: any) => s.text.includes('[来源]'))).toBe(false)
+  expect(input.sentences.some((s: any) => s.text.includes('[来源]'))).toBe(true)
   const second = await reviewTopicContent('T1', first.content, [point()], f.options, first.review)
   expect(second.calls).toBe(0)
 })

@@ -6,9 +6,67 @@ import { separateImages } from '../ingest/markdown.js'
 import type { Evidence, Point, Segment } from './schema.js'
 
 const frontmatter = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/
-const sentenceSegmenter = new Intl.Segmenter(undefined, { granularity: 'sentence' })
 
-export const topicEvidenceContextVersion = 'topic-evidence-sentence-v2'
+// 只识别独立的临时引用编号；不删除普通括号中的条件、数值或作者。
+const referenceId = '(?:P\\d+|[ST]-\\d+(?:[.-]\\d+)*)'
+const referenceList = `${referenceId}(?:[\\s、,，;；]+${referenceId})*`
+const referenceMarker = `(?:[（(【]\\s*${referenceList}\\s*[）)】]|\\\\?\\[\\s*${referenceList}\\s*\\\\?\\](?!\\())`
+const markdownLink = '\\[[^\\]\\n]*\\]\\((?:[^()\\s]|\\([^()\\n]*\\))*\\)'
+const bareReferences = `${referenceList}(?=\\s*(?:${markdownLink}(?:[；;\\s]+${markdownLink})*)?\\s*$)`
+const suffix = new RegExp(`^(?:[\\s；;]*)(?:${markdownLink}|${referenceMarker}|${bareReferences})`)
+
+export function topicClaimText(text: string): string {
+  return text.replace(new RegExp(referenceMarker, 'g'), '')
+    .replace(new RegExp(`(^|[。！？.!?]\\s*)${bareReferences}`, 'g'), '$1').trim()
+}
+
+/** 保留原文偏移；句后引用和链接归属前一句，链接内部与作者缩写不是句界。 */
+export function splitTopicSentences(text: string): string[] {
+  const protectedSpans = [...text.matchAll(new RegExp(`${markdownLink}|${referenceMarker}`, 'g'))]
+    .map(match => [match.index!, match.index! + match[0].length])
+  const pairs: Record<string, string> = { '“': '”', '‘': '’', '「': '」', '『': '』', '（': '）', '(': ')', '[': ']', '【': '】', '{': '}', '《': '》' }
+  const stack: string[] = []
+  const result: string[] = []
+  let start = 0
+  for (let i = 0; i < text.length; i++) {
+    const character = text[i]!
+    if (protectedSpans.some(([a, b]) => i >= a! && i < b!)) continue
+    if (character === '\\') { i++; continue }
+    // 英文词中的撇号不是引号；未配对的引号或括号不能吞掉后续事实。
+    if ((character === "'" || character === '’') && /[\p{L}\p{N}]/u.test(text[i - 1] ?? '')
+      && (/[\p{L}\p{N}]/u.test(text[i + 1] ?? '') || character === "'" && stack.at(-1) !== character)) continue
+    if (stack.at(-1) === character) { stack.pop(); continue }
+    const close = pairs[character] ?? (character === '"' || character === "'" || character === '`' ? character
+      : character === '<' && /^(?:https?:\/\/|mailto:)/i.test(text.slice(i + 1)) ? '>' : undefined)
+    if (close && text.indexOf(close, i + 1) >= 0) { stack.push(close); continue }
+    if (stack.length || !/[。！？!?.]/.test(character)) continue
+    if (character === '.') {
+      if (i + 1 < text.length && !/\s/.test(text[i + 1]!)) continue
+      if (/(?:\b[A-Z]|\b(?:Dr|Mr|Mrs|Ms|Prof|Sr|Jr|vs|etc)|\bet al)\.$/i.test(text.slice(0, i + 1))) continue
+    }
+    let end = i + 1
+    while (/[。！？!?]/.test(text[end] ?? '') && end < text.length) end++
+    for (;;) {
+      const attached = suffix.exec(text.slice(end))
+      if (!attached) break
+      end += attached[0].length
+    }
+    while (end < text.length && /\s/.test(text[end]!)) end++
+    result.push(text.slice(start, end)); start = end; i = end - 1
+  }
+  if (start < text.length) result.push(text.slice(start))
+  return result
+}
+
+export function rebuildTopicScope(content: string, members: Point[]): string {
+  // 摘录最终成员原话形成范围，下一轮仍须逐句核对；程序不添加概括性主张。
+  const summary = [...new Set(members.map(point => topicClaimText(point.text).replace(/[\r\n]+/g, ' ')))].slice(0, 3).join('；')
+  if (!summary) return content.replace(/^范围：.*\r?\n?/m, '')
+  return /^范围：/m.test(content) ? content.replace(/^范围：.*$/m, '范围：' + summary)
+    : content.replace(/^(# .*\r?\n)/m, '$1范围：' + summary + '\n')
+}
+
+export const topicEvidenceContextVersion = 'topic-evidence-paragraph-v3'
 export interface TopicEvidenceSource {
   title: string
   source_version: string
@@ -38,26 +96,8 @@ export function topicEvidenceContext(evidence: Evidence, source?: TopicEvidenceS
     && (!evidence.locator.startsWith('block:') || segment.locator === evidence.locator))
   if (!owner) throw new Error('主题成员证据找不到所属原段。')
   const rawParagraph = source.text.slice(owner.start, owner.end)
-  // 上下文不穿过图片或编码；保留引文所属连续原文片段的真实偏移。
-  const span = (/data:image\//i.test(rawParagraph) ? separateImages(rawParagraph).mapping
-    : [{ replacement: false, originalStart: 0, originalEnd: rawParagraph.length }]).find(span => !span.replacement
-    && span.originalStart <= quoteStart - owner.start && span.originalEnd >= quoteEnd - owner.start)
-  if (!span) throw new Error('主题成员引文无法定位到不含图片的原文上下文。')
-  const paragraphStart = owner.start + span.originalStart
-  const paragraph = rawParagraph.slice(span.originalStart, span.originalEnd)
-  // 软换行不是句界；保持字符长度，分句偏移仍可直接用于原文。
-  const continuous = paragraph.replace(/\r?\n/g, newline => ' '.repeat(newline.length))
-  const allSentences = [...sentenceSegmenter.segment(continuous)]
-  const sentences = allSentences.filter(sentence =>
-    sentence.index < quoteEnd - paragraphStart && sentence.index + sentence.segment.length > quoteStart - paragraphStart)
-  if (!sentences.length) throw new Error('主题成员引文找不到完整句子上下文。')
-  let first = sentences[0]!
-  const last = sentences.at(-1)!
-  // 代词可能出现在句中；所在句仍指向前句时，把前一个完整句子一并提供。
-  // 现场 L227 的 them 指向前句 families，不能在句号处再次丢失该上下文。
-  const preceding = allSentences[allSentences.indexOf(first) - 1]
-  if (preceding && /\b(?:them|their|they|it|its|this|these|those|such)\b|该|上述|前述|他们|她们|它们|其/iu.test(first.segment)) first = preceding
-  return paragraph.slice(first.index, last.index + last.segment.length).trim()
+  // 返回完整所属原段，后续补证和限定条件不得因句界丢失；图片编码仍由既有规则隔离。
+  return /data:image\//i.test(rawParagraph) ? separateImages(rawParagraph).text : rawParagraph
 }
 
 export function citedTopicPoints(content: string, members: Point[], anchors = evidenceBlockIds(members)): Point[] {

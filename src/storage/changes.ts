@@ -85,11 +85,13 @@ async function checkDependencies(root: string, batch: ChangeSet, sourceRoots: st
 }
 
 async function checkLayeredInputs(root: string, batch: ChangeSet, sourceRoots: string[], signal?: AbortSignal): Promise<void> {
+  if (sourceRoots.length !== 1) throw new Error('本地分层库只支持一个资料根。')
+  const knowledgeRoot = (await validateRoots(root, sourceRoots)).sources[0]!
   const revoked = await readRevocations(root)
   if (revoked.generation !== batch.generation) throw new Error('来源撤权状态已变化，请取消后重新生成预览。')
-  const scanned = await scanSourceFiles(sourceRoots, root, signal)
+  const scanned = await scanSourceFiles([knowledgeRoot], root, signal)
   const key = (file: string) => process.platform === 'win32' ? file.toLowerCase() : file
-  const excluded = new Set(revoked.sources.filter(source => !source.deleted).flatMap(source => [source.current_path, ...(source.alias_paths ?? [])].map(file => key(path.resolve(path.dirname(root), file)))))
+  const excluded = new Set(revoked.sources.filter(source => !source.deleted).flatMap(source => [source.current_path, ...(source.alias_paths ?? [])].map(file => key(path.resolve(knowledgeRoot, file)))))
   const actual = scanned.inputs.filter(input => /\.(md|markdown)$/i.test(input.actual) && !excluded.has(key(input.actual))).map(input => key(input.actual)).sort()
   const expected = batch.dependencies.filter(input => input.source).map(input => key(input.path)).sort()
   if (scanned.errors.length || JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error('资料来源集合已变化或无法读取，请取消后重新生成预览。')
@@ -138,6 +140,9 @@ export class ChangeStore {
   async prepareLayered(libraryId: string, version: string, registrationKey: string, policyRevision: string): Promise<ChangeSet> {
     const root = await this.libraries.root(libraryId, true)
     return withBuildLock(path.dirname(root), async () => {
+      const library = this.libraries.registration(libraryId, registrationKey)
+      if (library.sourceRoots.length !== 1) throw new Error('本地分层库只支持一个资料根。')
+      const knowledgeRoot = (await validateRoots(root, library.sourceRoots)).sources[0]!
       const pending = await readOptional<PendingBuild>(await safePath(root, 'work/pending.json'))
       if (pending?.version !== version) throw new Error('分层预览作业已变化。')
       // 续做身份不含模型；提交预览仍锁定生成完成时的完整登记与策略修订。
@@ -150,7 +155,7 @@ export class ChangeStore {
         .map(page => ({ path: page, before: before?.pages?.[page] ?? null, after: next.pages![page] ?? null }))
       const batch: ChangeSet = { version: 1, id: randomUUID(), libraryId, registrationKey, policyRevision, generation: next.revocation_generation,
         createdAt: new Date().toISOString(), reason: '资料提取与跨文档综合', digest: '', pages,
-        dependencies: next.sources.flatMap(source => [source.current_path, ...(source.alias_paths ?? [])].map(file => ({ path: path.resolve(path.dirname(root), file), hash: source.content_hash.replace(/^sha256:/, ''), source: true as const }))), status: 'preview', written: [],
+        dependencies: next.sources.flatMap(source => [source.current_path, ...(source.alias_paths ?? [])].map(file => ({ path: path.resolve(knowledgeRoot, file), hash: source.content_hash.replace(/^sha256:/, ''), source: true as const }))), status: 'preview', written: [],
         ...(backup ? { message: `旧库已备份到 ${backup.backupPath}。取消预览不会自动恢复；如需手动恢复，请先停止生成，将新库 ${root} 移走，再把备份目录改回原名 .llmwiki。` } : {}),
         layered: { version, baseVersion: pending.base_version, ...(backup ?? {}), ...(pending.deleted_sources?.length ? { deletedSources: pending.deleted_sources } : {}) } }
       batch.digest = digest(batch)

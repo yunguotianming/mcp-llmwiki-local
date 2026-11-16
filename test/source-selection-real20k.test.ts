@@ -9,12 +9,12 @@ const cases = (hasFixture ? JSON.parse(readFileSync(new URL('./fixtures/real20k/
   id: string; question: string; chars: number; source: string; points: Point[]; chapters: { ids: string[]; minimum: number }[]
 }[]
 const facts: Record<string, string[]> = {
-  'C-027': ['虚构样例C-027的条件1', '虚构样例C-027的条件2'],
-  'C-029': ['虚构样例C-029的条件1', '虚构样例C-029的条件2', '虚构样例C-029的条件3'],
-  'C-036': ['虚构样例C-036的条件1', '虚构样例C-036的条件2'],
-  'C-001': ['虚构样例C-001的条件1', '虚构样例C-001的条件2', '虚构样例C-001的条件3'],
-  'C-002': ['虚构样例C-002的条件1', '虚构样例C-002的条件2'],
-  'C-038': ['虚构样例C-038的条件1', '虚构样例C-038的条件2'],
+  'C-027': ['虚构档案条件e0c20a5f29', '虚构档案条件42daf24271'],
+  'C-029': ['虚构档案条件c021ecbd78', '虚构档案条件690ef7c1ac', '虚构档案条件baa022411a'],
+  'C-036': ['虚构档案条件4e2993b1d9', '虚构档案条件90942853ea'],
+  'C-001': ['虚构档案条件e114cf8dcb', '虚构档案条件529e43a229', '虚构档案条件a816dc086d'],
+  'C-002': ['虚构档案条件a714e6aa0a', '虚构档案条件8ee7aa6fde'],
+  'C-038': ['虚构档案条件70492d02e3', '虚构档案条件821120ed28'],
 }
 it.skipIf(!hasFixture).each(cases)('$question 首提事实经扩额选点保留，关键引文仍逐字成立（夹具含第三方论文原文，未随公开仓库发布）', fixture => {
   const limit = ordinaryPointLimit(fixture.chars, 100, 'fine')

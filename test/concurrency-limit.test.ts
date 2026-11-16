@@ -37,14 +37,17 @@ it('模型闸门从默认3升到1000后实际开启1000槽位，供应商限制�
   expect(peak).toBe(70)
 })
 
-it('LLM设为1000时嵌入闸门实际峰值仍为50', async () => {
+it.each([undefined, 7])('LLM设为1000时嵌入峰值等于embeddingConcurrency（默认3）且不超过配置值：%s', async embeddingConcurrency => {
   const f = await layeredFixture(), release = Promise.withResolvers<void>()
+  const settings = layeredSettings({ embeddingBatchSize: 1, ...(embeddingConcurrency === undefined ? {} : { embeddingConcurrency }) })
+  if (embeddingConcurrency === undefined) expect(settings.embeddingConcurrency).toBe(3)
   let active = 0, peak = 0
   const client = { identity: async () => '并发回归权重', embed: async (texts: string[]) => {
     peak = Math.max(peak, ++active); await release.promise; active--
     return texts.map(() => [1, 0])
   } }
-  const pending = embedInputs(f.root, Array.from({ length: 55 }, (_, index) => `并发要点${index}`), layeredSettings({ embeddingBatchSize: 1 }), client, undefined, 1000)
-  try { await vi.waitFor(() => expect(active).toBe(50)) } finally { release.resolve() }
-  expect(await pending).toHaveLength(55); expect(peak).toBe(50); expect(active).toBe(0)
+  const pending = embedInputs(f.root, Array.from({ length: 55 }, (_, index) => `并发要点${index}`), settings, client, undefined, 1000)
+  try { await vi.waitFor(() => expect(active).toBe(settings.embeddingConcurrency)) } finally { release.resolve(); await pending }
+  expect(await pending).toHaveLength(55); expect(peak).toBe(settings.embeddingConcurrency)
+  expect(peak).toBeLessThanOrEqual(settings.embeddingConcurrency); expect(active).toBe(0)
 })

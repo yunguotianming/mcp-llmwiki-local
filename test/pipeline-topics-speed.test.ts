@@ -66,6 +66,8 @@ it('成员变化重算分支，父输入未变复用回执，提示版本变化�
   await prepareTopics(f.root, f.pending, f.committed, f.options, undefined)
   const stable = structuredClone(f.pending.topics!.pages['topics/T-0002.md'])
   const parentContent = f.pending.topics!.pages['topics/T-0001.md']!.content
+  const parentReview = f.pending.topics!.pages['topics/T-0001.md']!.dependencies.review!.fingerprint
+  f.call.mockClear()
   await changeExtraction(f, extraction => {
     const point = extraction.segments.flatMap(segment => segment.points)[0]!
     point.text += '补充条件'
@@ -73,11 +75,12 @@ it('成员变化重算分支，父输入未变复用回执，提示版本变化�
   })
   f.topicRequests.splice(0)
   await prepareTopics(f.root, f.pending, f.committed, f.options, undefined)
-  // 子页摘要未变，父页仍重新准备，但复用已通过校验的相同输入回执。
+  // 0.2.2 修复3分开判断生成与核对；子摘要不变时正文保留，证据变化仍重做核对。
   expect(f.topicRequests.map(request => request.input.topic_id)).toEqual(['T-0001-01'])
   const parent = f.pending.topics!.pages['topics/T-0001.md']!
-  expect(parent.content).not.toBe(parentContent)
-  expect(parent.content.replace(/^input_fingerprint: .*\n/m, '')).toBe(parentContent.replace(/^input_fingerprint: .*\n/m, ''))
+  expect(parent.content).toBe(parentContent)
+  expect(parent.dependencies.review!.fingerprint).not.toBe(parentReview)
+  expect(f.call.mock.calls.some(call => { const input = JSON.parse(call[2]); return input.topic_id === 'T-0001' && input.review_stage })).toBe(true)
   expect(f.pending.topics!.pages['topics/T-0002.md']).toEqual(stable)
   f.topicRequests.splice(0)
   await prepareTopics(f.root, f.pending, f.committed, { ...f.options, promptVersion: '新版本' }, undefined)

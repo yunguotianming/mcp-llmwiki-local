@@ -2,13 +2,14 @@ import path from 'node:path'
 import { stat } from 'node:fs/promises'
 import { defaultWikiPath, type LayeredSettings } from '../domain/config.js'
 import { isLibraryDirectoryName } from '../domain/embedding-name.js'
-import { actualPath, isLayeredRoot } from './paths.js'
+import { actualPath, isLayeredRoot, validateRoots } from './paths.js'
 
 export async function resolveLibraryRoot(knowledgeRoot: string, selected?: string, settings?: Partial<LayeredSettings>): Promise<string> {
-  if (await isLayeredRoot(knowledgeRoot)) return knowledgeRoot
+  if (await isLayeredRoot(knowledgeRoot) && (!selected || await actualPath(selected) === knowledgeRoot)) return knowledgeRoot
   if (selected) {
     const root = await actualPath(selected)
-    if (path.dirname(root) !== knowledgeRoot || !isLibraryDirectoryName(path.basename(root))) throw new Error('库目录必须是资料根下的 .llmwiki 或 .llmwiki-<模型标准名>。')
+    if (!isLibraryDirectoryName(path.basename(root))) throw new Error('库目录必须为 .llmwiki 或 .llmwiki-<模型标准名>。')
+    await validateRoots(root, [knowledgeRoot])
     return root
   }
   const legacy = path.join(knowledgeRoot, '.llmwiki')

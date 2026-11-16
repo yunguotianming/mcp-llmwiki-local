@@ -83,3 +83,27 @@ it('批量恢复按对象去重且有界并行，保留原成员顺序和归一�
   expect(records.map(item => item.vector_id)).toEqual([...ids, ...ids.toReversed()])
   expect(records.map(item => item.vector)).toEqual(Array.from({ length: 20 }, () => [0.6, 0.8]))
 })
+
+it('数百页检索引用恢复不展开向量，翻倍页数不增加解码或克隆载荷', async () => {
+  const f = await layeredFixture()
+  const { vector_id, input_hash } = await putVector(f.knowledgeRoot, { provider: '测试', model: '模型', revision: '权重',
+    preprocessing: 'v1', dimensions: 4096, input_hash: hash('共享输入') }, Array.from({ length: 4096 }, () => 1), 'float32')
+  const original = filesystem.readFile
+  const reads = vi.spyOn(filesystem, 'readFile').mockImplementation(original)
+  for (const pages of [200, 400]) {
+    const value = { manifest: { vector_state: { page_vectors: Object.fromEntries(Array.from({ length: pages }, (_, page) =>
+      [`topics/${page}.md`, { vectors: Array.from({ length: 64 }, () => ({ vector_id, input_hash })) }])) } } }
+    const before = JSON.stringify(value)
+    await hydrateVectors(f.knowledgeRoot, value)
+    expect(reads.mock.calls.filter(([file]) => String(file).endsWith('.bin'))).toHaveLength(0)
+    expect(JSON.stringify(structuredClone(value))).toBe(before)
+    expect(Object.values(value.manifest.vector_state.page_vectors).every(page => page.vectors.every(ref => !('vector' in ref)))).toBe(true)
+  }
+  // 聚类真正使用的向量仍读取并归一化；同一对象在运行态按身份共享。
+  const records = Array.from({ length: 2 }, () => ({ vector_id, input_hash, vector: [] as number[] }))
+  await hydrateVectors(f.knowledgeRoot, records)
+  expect(reads.mock.calls.filter(([file]) => String(file).endsWith('.bin'))).toHaveLength(1)
+  expect(records[0]!.vector).toBe(records[1]!.vector)
+  expect(records[0]!.vector).toHaveLength(4096)
+  expect(records[0]!.vector[0]).toBe(1 / 64)
+})

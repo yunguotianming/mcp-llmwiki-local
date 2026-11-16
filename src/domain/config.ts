@@ -1,7 +1,11 @@
 import { linkedGranularity } from './granularity.js'
-import { embeddingStandardName } from './embedding-name.js'
+import { embeddingStandardName, isLibraryDirectoryName } from './embedding-name.js'
 import { queryUnderstandingSettings } from './query-settings.js'
 import type { QueryUnderstandingSettings } from './query-settings.js'
+import { compatibleProvidersSchema, embeddingServiceSchema, modelExecutionSchema, upgradeSchema } from './route-schema.js'
+import type { CompatibleProviders, EmbeddingServiceConfig, ModelExecution, StageId, UpgradeLimits } from './route-schema.js'
+import { libraryOrganizationSchema, registryOrganizationSchema } from './registry-schema.js'
+import type { LibraryOrganization, RegistryOrganization } from './registry-schema.js'
 export const NAMESPACE = 'llmwiki'
 export const TASKS = ['ingest', 'query', 'lint', 'vision'] as const
 export type Task = typeof TASKS[number]
@@ -26,7 +30,7 @@ export function siyuanSettings(value: SiyuanSettings) {
 }
 export type AccessMode = 'readonly' | 'managed' | 'shared'
 export interface ModelRef { provider: string; model: string }
-export type LayeredModelTask = 'extract' | 'topic' | 'parent' | 'term' | 'rewrite'
+export type LayeredModelTask = StageId
 export interface ProviderProfile {
   concurrency: number; requestsPerMinute?: number | undefined; tokensPerMinute?: number | undefined
   retryLimit: number; backoffMs: number; cacheMode: 'automatic-prefix' | 'none'
@@ -52,7 +56,7 @@ export interface LayeredSettings {
   cloudEmbeddingUrl: string; cloudEmbeddingModel: string; cloudEmbeddingKeyEnv: string
   lexicalTopicSimilarityThreshold: number; lexicalTopicAttachThreshold: number
   topicAttachThreshold: number; topicMaxPoints: number; topicClusterBlockSize: number; topicNeighborCount: number
-  embeddingBatchSize: number; embeddingBatchBytes: number; embeddingTimeoutMs: number
+  embeddingConcurrency: number; embeddingBatchSize: number; embeddingBatchBytes: number; embeddingTimeoutMs: number
   queryEmbeddingTimeoutMs: number; queryEmbeddingColdTimeoutMs: number
   vectorPrecision: 'float32' | 'float16'; writerTakeoverToken?: string | undefined
   leafInputBudget: number; topicReviewInputBudget: number; topicMaxChars: number; topicMaxSources: number
@@ -79,7 +83,7 @@ export const defaultLayeredSettings: LayeredSettings = {
   sourcePointBaseChars: 25000, sourcePointMaxMultiplier: 4, sourceChapterMinPoints: 1,
   localEmbeddingUrl: 'http://127.0.0.1:11434', localEmbeddingModel: 'qwen3-embedding:0.6b',
   cloudEmbeddingUrl: 'https://api.openai.com/v1', cloudEmbeddingModel: 'text-embedding-3-small', cloudEmbeddingKeyEnv: 'LLMWIKI_EMBEDDING_API_KEY',
-  embeddingBatchSize: 32, embeddingBatchBytes: 32768, embeddingTimeoutMs: 120000,
+  embeddingConcurrency: 3, embeddingBatchSize: 32, embeddingBatchBytes: 32768, embeddingTimeoutMs: 120000,
   queryEmbeddingTimeoutMs: 2000, queryEmbeddingColdTimeoutMs: 10000,
   vectorPrecision: 'float32',
   topicSimilarityThreshold: 0.65, topicAttachThreshold: 0.60, topicMaxPoints: 40, topicClusterBlockSize: 2000, topicNeighborCount: 64,
@@ -134,6 +138,7 @@ export function layeredSettings(value: Partial<LayeredSettings> = {}, tier = 50)
   if (settings.sourceSummaryFanout < 2 || settings.sourceSummaryFanout > 10) throw new Error('来源摘要合成路数必须在 2～10 之间。')
   if (!['http:', 'https:'].includes(url.protocol) || !settings.localEmbeddingModel.trim()) throw new Error('本地向量模型地址或模型名无效。')
   for (const key of ['embeddingBatchSize', 'embeddingBatchBytes', 'embeddingTimeoutMs'] as const) if (!Number.isSafeInteger(settings[key]) || settings[key] <= 0) throw new Error('嵌入批次上限和超时必须为正整数。')
+  if (!Number.isInteger(settings.embeddingConcurrency) || settings.embeddingConcurrency < 1 || settings.embeddingConcurrency > 16) throw new Error('向量端点并发必须为 1～16 的整数。')
   if (settings.embeddingTimeoutMs > 2147483647) throw new Error('嵌入超时超出计时器范围。')
   for (const key of ['queryEmbeddingTimeoutMs', 'queryEmbeddingColdTimeoutMs'] as const)
     if (!Number.isSafeInteger(settings[key]) || settings[key] < 1 || settings[key] > 2147483647) throw new Error('查询向量时限必须为 1～2147483647 毫秒的整数。')
@@ -162,7 +167,7 @@ export interface ModelRoutes {
   providerProfiles: Record<string, ProviderProfile>
   layeredRoutes: Record<string, LayeredModelRoute | undefined>
 }
-export interface LibraryRegistration {
+export interface LibraryRegistration extends LibraryOrganization {
   id: string
   name: string
   description: string
@@ -180,7 +185,11 @@ export interface LibraryRegistration {
   queryUnderstanding?: Partial<QueryUnderstandingSettings>
   siyuan?: SiyuanSettings
 }
-export interface Registry {
+export interface Registry extends RegistryOrganization {
+  compatibleProviders?: CompatibleProviders | undefined
+  embeddingService?: EmbeddingServiceConfig | undefined
+  modelExecution?: ModelExecution | undefined
+  upgrade?: UpgradeLimits | undefined
   language: 'zh' | 'en'
   activeLibraryId: string
   libraries: LibraryRegistration[]
@@ -199,9 +208,26 @@ export function defaultLibraryModels(): ModelRoutes {
   return { ...emptyModels(), unified: { provider: 'codex-cli', model: 'gpt-6.1-terra' },
     layeredRoutes: Object.fromEntries(['extract', 'topic', 'parent', 'term', 'rewrite'].map(task => [task, { reasoningEffort: 'high' }])) }
 }
-// 旧分层思源登记只改来源类型；库身份、路径及随库状态均不迁移。
+/** 本地库未指定资料目录时使用库父目录；显式来源始终优先。 */
+export function defaultSourceRoot(wikiPath: string): string {
+  const normalized = wikiPath.trim().replaceAll('\\', '/').replace(/\/+$/, '')
+  if (!/^(?:[a-zA-Z]:\/|\/)/.test(normalized) || normalized.split('/').some(part => part === '.' || part === '..')) return ''
+  const split = normalized.lastIndexOf('/')
+  if (!isLibraryDirectoryName(normalized.slice(split + 1))) return ''
+  let parent = normalized.slice(0, split) || '/'
+  if (normalized.startsWith('//') && parent.split('/').filter(Boolean).length < 2) return ''
+  if (/^[a-zA-Z]:$/.test(parent)) parent += '/'
+  return wikiPath.includes('\\') ? parent.replaceAll('/', '\\') : parent
+}
+export function effectiveSourceRoots(library: Pick<LibraryRegistration, 'kind' | 'wikiPath' | 'sourceRoots' | 'siyuan'>): string[] {
+  if (library.sourceRoots.length || library.kind !== 'local' || library.siyuan) return library.sourceRoots
+  const root = defaultSourceRoot(library.wikiPath)
+  return root ? [root] : []
+}
+// 旧分层思源登记只改来源类型；本地空来源采用库父目录，不迁移随库状态。
 export function migrateRegistry(registry: Registry): Registry {
-  return { ...registry, libraries: registry.libraries.map(library => library.kind === 'local' && library.siyuan ? { ...library, kind: 'siyuan' } : library) }
+  return { ...registry, libraries: registry.libraries.map(library => library.kind === 'local' && library.siyuan
+    ? { ...library, kind: 'siyuan' } : { ...library, sourceRoots: effectiveSourceRoots(library) }) }
 }
 export function defaultWikiPath(sourceRoots:string[], embedding: Partial<LayeredSettings> = {}):string {
   if(sourceRoots.length!==1)return ''
@@ -217,12 +243,15 @@ export function isWritable(library: LibraryRegistration): boolean {
 export function resolveModel(routes: ModelRoutes, task: Task): ModelRef {
   // 识图使用明确选择的视觉路由，不能继承未经能力检查的文本模型。
   const override = routes[task]
-  if ((routes.perTask || task === 'vision') && override.provider && override.model) return { ...override }
+  if ((routes.perTask || task === 'vision' || task === 'query') && override.provider && override.model) return { ...override }
   return { ...routes.unified }
 }
 export function resolveLayeredModel(routes: ModelRoutes, task: LayeredModelTask): ModelRef {
-  const override = routes.layeredRoutes?.[task]?.route
+  const override = resolveLayeredRoute(routes, task)?.route
   return override?.provider && override.model ? { ...override } : { ...routes.unified }
+}
+export function resolveLayeredRoute(routes: ModelRoutes, task: LayeredModelTask): LayeredModelRoute | undefined {
+  return routes.layeredRoutes?.[task] ?? (task === 'extractionReview' || task === 'topicReview' ? routes.layeredRoutes?.extract : undefined)
 }
 export function providerProfile(routes: ModelRoutes, provider: string): ProviderProfile {
   return { ...defaultProviderProfile, ...routes.providerProfiles?.[provider] }
@@ -232,11 +261,28 @@ export interface ConfigIssue { field: string; message: string }
 export function parseRegistry(registry: Registry): Registry {
   registry = migrateRegistry(registry)
   const issues: ConfigIssue[] = []
+  const check = (field: string, result: { success: boolean; error?: { issues: { path: PropertyKey[]; message: string }[] } }) => {
+    if (!result.success) for (const issue of result.error!.issues) issues.push({ field: [field, ...issue.path].join('.'), message: issue.message })
+  }
+  if (registry.upgrade !== undefined) check('upgrade', upgradeSchema.safeParse(registry.upgrade))
+  if (registry.compatibleProviders !== undefined) check('compatibleProviders', compatibleProvidersSchema.safeParse(registry.compatibleProviders))
+  if (registry.embeddingService !== undefined) check('embeddingService', embeddingServiceSchema.safeParse(registry.embeddingService))
+  if (registry.modelExecution !== undefined) check('modelExecution', modelExecutionSchema.safeParse(registry.modelExecution))
+  const organization = registryOrganizationSchema.safeParse(Object.fromEntries(['groups', 'discovery'].filter(key => key in registry).map(key => [key, registry[key as keyof Registry]])))
+  check('registry', organization)
+  if (organization.success && organization.data.discovery) registry = { ...registry, discovery: organization.data.discovery }
+  const groups = new Set<string>()
+  for (const group of registry.groups ?? []) {
+    if (groups.has(group.id)) issues.push({ field: 'groups', message: '分组标识不能重复。' })
+    groups.add(group.id)
+  }
   const ids = new Set<string>()
   const paths = new Set<string>()
   const remoteIds = new Set<string>()
   for (const library of registry.libraries) {
     const field = `libraries.${library.id}`
+    check(field, libraryOrganizationSchema.safeParse(Object.fromEntries(Object.keys(libraryOrganizationSchema.shape).filter(key => key in library).map(key => [key, library[key as keyof LibraryRegistration]]))))
+    if (library.groupId && !groups.has(library.groupId)) issues.push({ field: field + '.groupId', message: '库引用的分组不存在。' })
     if (library.kind === 'siyuan' || library.siyuan) {
       try {
         if (!library.siyuan) throw new Error('请填写思源导出设置。')
@@ -259,6 +305,8 @@ export function parseRegistry(registry: Registry): Registry {
       if (library.mode !== 'readonly' || library.wikiPath || library.sourceRoots.length) issues.push({ field, message: 'whalefall 只查询已有 Wiki，不设置本地输出或资料目录。' })
     } else {
       if (!library.wikiPath.trim()) issues.push({ field: field + '.wikiPath', message: '请填写 Wiki 的绝对路径。' })
+      else if (!/^(?:[a-zA-Z]:[\\/]|\\\\|\/)/.test(library.wikiPath)) issues.push({ field: field + '.wikiPath', message: '请填写 Wiki 的绝对路径；路径前后不能有空格或不可见字符。' })
+      if (library.sourceRoots.some(root => !/^(?:[a-zA-Z]:[\\/]|\\\\|\/)/.test(root))) issues.push({ field: field + '.sourceRoots', message: '原始资料目录须为绝对路径；路径前后不能有空格或不可见字符。' })
       const key = library.wikiPath.replaceAll('\\', '/').replace(/\/+$/, '').toLowerCase()
       if (paths.has(key)) issues.push({ field: field + '.wikiPath', message: '同一个 Wiki 目录不能重复登记。' })
       paths.add(key)
