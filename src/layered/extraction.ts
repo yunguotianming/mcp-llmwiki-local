@@ -189,6 +189,16 @@ export function resultFingerprint(extraction: Extraction): string {
   const segments = extraction.segments.length ? extraction.segments.map(segment => segment.processing_fingerprint) : [processingFingerprint(extraction.processing)]
   return hash(JSON.stringify(extraction.grouping_fingerprint ? [segments, extraction.grouping_fingerprint] : segments))
 }
+// 只排除无法匹配任何已校验成员的旧摘要组，不改变模型内容、计划或作者归属。
+export function excludeEmptySourceSummary(result: Extraction, key: string, points: { text: string; evidence: { quote: string; locator: string }[] }[]): boolean {
+  const group = result.group_cache?.[key]
+  if (!group?.missing_summary || result.segments.flatMap(segment => segment.points).some(point => points.some(item =>
+    item.text === point.text && item.evidence.every(evidence => point.evidence.some(saved => saved.quote === evidence.quote && saved.locator === evidence.locator))))) return false
+  group.missing_summary = false
+  group.summary_excluded_reason = '无可用摘要依据：原组在现有已校验要点中没有匹配成员。'
+  result.gaps = result.gaps?.filter(gap => gap.kind !== 'summary' || !gap.segment_hashes.length || !gap.segment_hashes.every(hash => group.parts.some(part => part.text_hash === hash))) ?? []
+  return true
+}
 export function retryableExtractionGap(gap: ExtractionGap): boolean {
   return gap.kind === 'group' && (gap.retryable ?? gap.reasons.some(reason => reason.rule === 'extract-group' && isModelTransportError(reason.actual)))
 }
@@ -577,10 +587,7 @@ async function extractSourceOnce(root: string, sourceId: string, source: LocalSo
       const raw = outputSchema.parse(parseModelJson(group.raw, schemaJSON(outputSchema)))
       const members = result.segments.flatMap(segment => segment.points).filter(point => raw.points.some(item =>
         item.text === point.text && item.evidence.every(evidence => point.evidence.some(saved => saved.quote === evidence.quote && saved.locator === evidence.locator))))
-      if (options.retrySources && !members.length) {
-        group.missing_summary = false
-        group.summary_excluded_reason = '无可用摘要依据：原组在现有已校验要点中没有匹配成员。'
-        result.gaps = result.gaps?.filter(gap => gap.kind !== 'summary' || !gap.segment_hashes.length || !gap.segment_hashes.every(hash => group.parts.some(part => part.text_hash === hash))) ?? []
+      if (options.retrySources && excludeEmptySourceSummary(result, key, raw.points)) {
         await writeJson(root, progressPath(grouping), result)
         continue
       }

@@ -293,6 +293,7 @@ export interface ProductionArtifact {
   sourceRefs: SourceRef[]; status: 'recorded' | 'legacy-recorded' | 'unknown' | 'local-derived'
   productionIds: string[]
   inheritedFrom: { version: string; artifactId: string; productionIds: string[] } | null
+  derivedFrom?: { operation: 'source-summary-exclusion-v1'; artifactId: string }
   reason?: string
   metadata?: { target: string; fields: string[]; value: unknown }
   legacyEvidence?: { originVersion: string; field: string; models: unknown; role: string | null }[]

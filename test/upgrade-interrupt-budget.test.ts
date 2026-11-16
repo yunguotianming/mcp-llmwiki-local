@@ -226,7 +226,7 @@ it('同一升级对象的两个真实核对分块并发，重试受全部在途�
   })
 }, 60000)
 
-it('备份复制与 complete 标记前连续中断，半备份拒绝恢复且重跑不覆盖', async () => {
+it('备份复制与 complete 标记前连续中断，沿同一身份续拷且半备份仍拒绝恢复', async () => {
   const f = await legacyFixture('0.2.0')
   await capture('backup-interruption', f, async record => {
     const old = await snapshot(f.root), page = await readable(f), copy = fs.copyFile, rename = fs.rename
@@ -247,6 +247,7 @@ it('备份复制与 complete 标记前连续中断，半备份拒绝恢复且重
     const backups = async () => (await fs.readdir(f.parent)).filter(name => name.includes('.backup-before-0.3.0-')).sort().map(name => path.join(f.parent, name))
     await expect(upgradeLibrary(f.root)).rejects.toThrow('复制第二文件前中断')
     const partial = (await backups())[0]!, partialHash = await snapshot(partial)
+    const originalMeta = JSON.parse(await fs.readFile(path.join(partial, '.llmwiki-upgrade-backup.json'), 'utf8'))
     expect(Object.keys(partialHash)).toHaveLength(2)
     await expect(verifyUpgradeBackup(partial)).rejects.toMatchObject({ code: 'UPGRADE_BACKUP_CORRUPT' })
     await expect(restoreUpgradeBackup(f.root, partial)).rejects.toMatchObject({ code: 'UPGRADE_BACKUP_CORRUPT' })
@@ -254,21 +255,23 @@ it('备份复制与 complete 标记前连续中断，半备份拒绝恢复且重
     expect(await readable(f)).toBe(page)
     stopComplete = true
     await expect(upgradeLibrary(f.root)).rejects.toThrow('备份 complete 原子提交前中断')
-    const beforeMarker = (await backups()).find(backup => backup !== partial)!, beforeMarkerHash = await snapshot(beforeMarker)
+    expect(await backups()).toEqual([partial])
+    const beforeMarker = partial, beforeMarkerHash = await snapshot(beforeMarker)
     const meta = JSON.parse(await fs.readFile(path.join(beforeMarker, '.llmwiki-upgrade-backup.json'), 'utf8'))
     expect(meta.complete).toBe(false)
     for (const [file, digest] of Object.entries(meta.files)) expect(hash(await fs.readFile(path.join(beforeMarker, file)))).toBe(digest)
     await expect(verifyUpgradeBackup(beforeMarker)).rejects.toMatchObject({ code: 'UPGRADE_BACKUP_CORRUPT' })
-    expect(await snapshot(partial)).toEqual(partialHash); expect(await snapshot(f.root, Object.keys(old))).toEqual(old)
+    expect(await snapshot(partial, Object.keys(partialHash))).toEqual(partialHash); expect(await snapshot(f.root, Object.keys(old))).toEqual(old)
     expect(await readable(f)).toBe(page)
     const done = (await upgradeLibrary(f.root))!, completeHash = await snapshot(done.backupPath)
-    expect(done.status).toBe('complete'); expect(done.actual.calls).toBe(0)
-    expect(await backups()).toHaveLength(3); expect((await verifyUpgradeBackup(done.backupPath)).complete).toBe(true)
-    expect(await snapshot(partial)).toEqual(partialHash); expect(await snapshot(beforeMarker)).toEqual(beforeMarkerHash)
+    expect(done).toMatchObject({ status: 'complete', id: originalMeta.id, backupPath: partial, actual: { calls: 0, tokens: 0, unknownUsage: 0 } })
+    expect(await backups()).toEqual([partial]); expect((await verifyUpgradeBackup(done.backupPath)).complete).toBe(true)
+    const copiedFiles = Object.keys(beforeMarkerHash).filter(file => file !== '.llmwiki-upgrade-backup.json')
+    expect(await snapshot(partial, copiedFiles)).toEqual(Object.fromEntries(copiedFiles.map(file => [file, beforeMarkerHash[file]])))
     const oldData = Object.fromEntries(Object.entries(old).filter(([file]) => file.replaceAll('\\', '/') !== '.llmwiki/policy.json'))
     expect(await snapshot(f.root, Object.keys(oldData))).toEqual(oldData); expect(await readable(f)).toBe(page)
     await upgradeLibrary(f.root)
-    expect(await snapshot(done.backupPath)).toEqual(completeHash); expect(await backups()).toHaveLength(3)
+    expect(await snapshot(done.backupPath)).toEqual(completeHash); expect(await backups()).toEqual([partial])
     record.partial = { path: partial, files: partialHash }; record.beforeMarker = { path: beforeMarker, files: beforeMarkerHash }
     record.done = done; record.completedBackup = completeHash; record.old = old; record.modelCalls = 0
   })

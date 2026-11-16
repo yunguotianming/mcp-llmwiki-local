@@ -10,7 +10,7 @@ import { localDevice } from './devices.js'
 import { resumeRevocationCleanup } from './revocation-cleanup.js'
 import { pageObjectPath, readVersion, versionPage, validateVersionSidecars } from './objects.js'
 import { modelRetentionRoots } from './costs.js'
-import { sidecarPath } from './models.js'
+import { isProductionFormat, readProvenance, sidecarPath } from './models.js'
 import { readVectorRecord, storageJson, vectorPath, vectorUnavailable } from './vectors.js'
 import { hasVectorMode, recordIdentity, sameIdentity } from './vector-identity.js'
 import type { CurrentVersion, SnapshotManifest, SourceEntry } from './schema.js'
@@ -358,6 +358,7 @@ export async function collectGarbage(root: string, graceMs = readerLeaseMs): Pro
     for (const version of retained) {
       const manifest = await readVersion(root, version)
       references(manifest, files, vectors)
+      if (await isProductionFormat(root)) references(await readProvenance(root, version, hash(storageJson(manifest))), files, vectors)
     }
     const cache = await readOptional<{ vectors: Record<string, { vector_id: string }> }>(await safePath(root, 'state/embeddings.json'))
     const building = await readOptional(await safePath(root, 'work/pending.json'))

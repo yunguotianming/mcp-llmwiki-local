@@ -2,7 +2,7 @@
 
 llmwiki-local 是独立运行的本地 stdio MCP 服务，让 Codex 等客户端查询 Markdown 知识库、生成预览、确认发布，以及复制已有库并更换向量模型。无需安装 dsh。
 
-代码最初复制自 dsh-llmwiki 的 `ff44903`，共享建库、存储和查询代码按固定提交同步，独立安装、独立维护。当前预览版为 **[0.3.0-preview.1](https://github.com/yunguotianming/mcp-llmwiki-local/releases/tag/0.3.0-preview.1)**，通过本仓 GitHub Release 独立分发。查询回答继续完善，预览版不代表正式质量验收通过。实际同步提交和适配范围见[源仓库文件对照](docs/06-验收与测试/01-源仓库文件对照.md)，验收与发布状态见[项目进度](docs/00-项目进度/01-项目进度.md)。适配层负责配置、模型调用与 MCP；package.json 的 repository 记录本仓发布地址，source 记录同源插件的同步依据。许可与第三方声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+代码最初复制自 dsh-llmwiki 的 `ff44903`，共享建库、存储和查询代码按固定提交同步，独立安装、独立维护。当前预览版为 **[0.3.0-preview.2](https://github.com/yunguotianming/mcp-llmwiki-local/releases/tag/0.3.0-preview.2)**，通过本仓 GitHub Release 独立分发。本版包含首次建库颗粒度引导、旧库定向发布及中断备份恢复修复。查询回答继续完善，预览版不代表正式质量验收通过。实际同步提交和适配范围见[源仓库文件对照](docs/06-验收与测试/01-源仓库文件对照.md)，验收与发布状态见[项目进度](docs/00-项目进度/01-项目进度.md)。适配层负责配置、模型调用与 MCP；package.json 的 repository 记录本仓发布地址，source 记录同源插件的同步依据。许可与第三方声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 ## 1. 安装与启动
 
@@ -63,7 +63,7 @@ node dist/cli.js mcp
 
 ### 2.3 首次建库选择颗粒度
 
-这项引导是预览发布后的新增功能，已发布的 `0.3.0-preview.1` ZIP 尚不包含。需求见[FR-10](docs/02-需求/01-独立服务验收范围.md)，当前源码的实现与验证状态见[项目进度](docs/00-项目进度/01-项目进度.md)。
+这项引导从 `0.3.0-preview.2` 提供。需求见[FR-10](docs/02-需求/01-独立服务验收范围.md)，实现与验证状态见[项目进度](docs/00-项目进度/01-项目进度.md)。
 
 首次调用 `wiki_generate`，尚无成果或恢复任务的新库会返回 `selection_required` 和档位说明。客户端应先解释差异、询问用户，再携选择调用；收到待选择结果时，生成作业尚未启动。
 

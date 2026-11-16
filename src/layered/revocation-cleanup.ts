@@ -9,7 +9,7 @@ import { checkWriter } from './devices.js'
 import { indexDependencies } from './revocations.js'
 import type { CurrentVersion, Revocations, SnapshotManifest, TopicState } from './schema.js'
 import type { ReadingCopyState } from './reading-copy.js'
-import { artifactId, isProductionFormat, protocolDigest, protocolError, readProtocol, sidecarPath, writeProtocol, writeProvenance } from './models.js'
+import { artifactId, isProductionFormat, protocolDigest, protocolError, readProtocol, readProvenance, retainDerivedArtifacts, sidecarPath, writeProtocol, writeProvenance } from './models.js'
 import type { AcceptanceSnapshot, AttemptEntry, VersionProvenance } from './schema.js'
 import type { VersionCosts } from './costs.js'
 import { modelRetentionRoots } from './costs.js'
@@ -131,6 +131,7 @@ async function cleanProductionVersion(root: string, manifest: SnapshotManifest, 
     }
     artifacts[artifactId(item)] = item
   }
+  retainDerivedArtifacts(artifacts, Object.fromEntries(Object.entries(value.artifacts).filter(([, item]) => !item.sourceRefs.some(ref => revoked.has(ref.sourceId)))))
   const digest = manifest.pages?.['index.md']
   if (digest && !Object.values(artifacts).some(a => a.pagePath === 'index.md')) {
     const item = { kind: 'page' as const, objectPath: `objects/pages/${digest.slice(7)}.md`, objectDigest: digest, pagePath: 'index.md', sourceRefs: [], status: 'local-derived' as const, productionIds: [], inheritedFrom: null }
@@ -212,6 +213,7 @@ export async function resumeRevocationCleanup(root: string): Promise<void> {
       for (const page of await cleanManifest(root, manifest, revocations)) pages.add(page)
       await cleanProductionVersion(root, manifest, revocations)
       references(manifest, files, vectors)
+      if (await isProductionFormat(root)) references(await readProvenance(root, manifest.version!, hash(storageJson(manifest))), files, vectors)
       if (manifest.version === current?.version) active = manifest
     }
     if (active?.topics) await writeJson(root, 'state/topics.json', active.topics)

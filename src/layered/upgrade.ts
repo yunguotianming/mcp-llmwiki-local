@@ -220,13 +220,13 @@ export function upgradeReviewRunner(bind: (hooks: ExecutionHooks) => AcceptanceB
   }
 }
 const volatile = (file: string) => /(?:^|\/)(?:write\.lock|inventory-lock\.sqlite(?:-wal|-shm)?|readers\/[^/]+|[^/]+\.tmp)$/.test(file)
-async function inventory(root: string): Promise<Record<string, string>> {
+async function inventory(root: string, allFiles = false): Promise<Record<string, string>> {
   const files: Record<string, string> = {}
   for (const entry of await readdir(root, { recursive: true, withFileTypes: true })) {
     if (entry.isSymbolicLink()) throw new Error('升级备份不接受库内符号链接。')
     if (!entry.isFile()) continue
     const relative = path.relative(root, path.join(entry.parentPath, entry.name)).replaceAll('\\', '/')
-    if (!volatile(relative)) files[relative] = hash(await readFile(await safePath(root, relative)))
+    if (allFiles || !volatile(relative)) files[relative] = hash(await readFile(await safePath(root, relative)))
   }
   return files
 }
@@ -417,6 +417,38 @@ export async function verifyUpgradeBackup(backupPath: string): Promise<BackupMet
   if (protocolDigest(meta.files) !== meta.inputDigest) throw protocolError('UPGRADE_BACKUP_CORRUPT', '备份清单摘要不符。')
   return meta
 }
+function verifyBackupIdentity(root: string, backupPath: string, meta: BackupMetadata | undefined, libraryId: string | null): asserts meta is BackupMetadata {
+  const corrupt = () => protocolError('UPGRADE_BACKUP_CORRUPT', '升级备份身份或清单无效：' + backupPath)
+  if (!meta || typeof meta.id !== 'string' || !/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(meta.id)
+    || meta.root !== root || meta.libraryId !== libraryId || typeof meta.complete !== 'boolean'
+    || !path.basename(backupPath).endsWith('-' + meta.id) || !meta.upgrade || meta.upgrade.id !== meta.id
+    || meta.upgrade.backupPath !== backupPath || !meta.files || typeof meta.files !== 'object' || Array.isArray(meta.files)) throw corrupt()
+  for (const [file, digest] of Object.entries(meta.files)) if (path.isAbsolute(file) || file.includes('\\') || file.includes('\0')
+    || file.split('/').some(part => !part || part === '.' || part === '..') || !/^sha256:[a-f0-9]{64}$/.test(digest)) throw corrupt()
+  if (protocolDigest(meta.files) !== meta.inputDigest || meta.upgrade.inputDigest !== meta.inputDigest
+    || !meta.upgrade.files || canonicalJson(meta.upgrade.files) !== canonicalJson(meta.files)) throw corrupt()
+}
+async function finishBackup(root: string, backupPath: string, meta: BackupMetadata, signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted()
+  const copied = await inventory(backupPath, true)
+  delete copied[backupMetadata]
+  if (Object.keys(copied).some(file => !(file in meta.files))) throw protocolError('UPGRADE_BACKUP_CORRUPT', '未完成备份含清单外文件。')
+  for (const [file, digest] of Object.entries(copied)) if (digest !== meta.files[file]) throw protocolError('UPGRADE_BACKUP_CORRUPT', '备份校验失败：' + file)
+  for (const [file, digest] of Object.entries(meta.files)) {
+    signal?.throwIfAborted()
+    if (copied[file]) continue
+    const source = await safePath(root, file), target = await safePath(backupPath, file)
+    if (hash(await readFile(source)) !== digest) throw protocolError('UPGRADE_INPUT_CHANGED', '备份期间源文件变化：' + file)
+    await mkdir(path.dirname(target), { recursive: true }); await copyFile(source, target)
+    if (hash(await readFile(target)) !== digest) throw protocolError('UPGRADE_INPUT_CHANGED', '备份期间源文件变化：' + file)
+  }
+  // 已复用的文件和复制期间新增、删除的输入也必须复核，完整标记不能先于原库校验。
+  if (protocolDigest(await inventory(root)) !== meta.inputDigest) throw protocolError('UPGRADE_INPUT_CHANGED', '备份期间原库清单变化。')
+  signal?.throwIfAborted()
+  meta.complete = true
+  await writeProtocol(backupPath, backupMetadata, meta)
+  await verifyUpgradeBackup(backupPath)
+}
 export async function readUpgradeStatus(root: string): Promise<UpgradeStatus | undefined> { return readProtocol(root, checkpoint, 'UPGRADE_CHECKPOINT_CORRUPT') }
 async function completeUpgrade(root: string, state: UpgradeStatus): Promise<UpgradeStatus> {
   const total = (await readRunCosts(root, state.id)).total
@@ -450,38 +482,54 @@ export async function upgradeLibrary(root: string, options: UpgradeOptions = {})
   for (const value of Object.values(options.upgrade ?? {})) if (!Number.isSafeInteger(value) || value < 0) throw new Error('升级上限必须为非负整数。')
   let state = await readUpgradeStatus(root)
   if (state) state.estimate = totalEstimate(state.steps)
-  const initial = state ?? { ...await preflight(root, options), id: randomUUID(), backupPath: '' }
-  await options.onStatus?.(structuredClone(initial))
+  const initial = state ?? { ...await preflight(root, options), id: '', backupPath: '' }
+  if (state) await options.onStatus?.(structuredClone(initial))
   return withLibraryLock(root, 'upgrade-0.3.0', async () => {
     if (!state) {
       const current = await preflight(root, options)
       if (current.inputDigest !== initial.inputDigest) throw protocolError('UPGRADE_INPUT_CHANGED', '升级预检后输入变化，请重新估算。')
       const prefix = path.basename(root) + '.backup-before-0.3.0-'
-      for (const name of await readdir(path.dirname(root))) {
-        if (!name.startsWith(prefix)) continue
-        const candidate = path.join(path.dirname(root), name)
+      const identity = JSON.parse(await readFile(await safePath(root, '.llmwiki/library.json'), 'utf8').catch(error => { if (error.code === 'ENOENT') return '{}'; throw error }))
+      const candidates: { path: string; meta: BackupMetadata }[] = []
+      for (const entry of await readdir(path.dirname(root), { withFileTypes: true })) {
+        if (!entry.name.startsWith(prefix)) continue
+        if (!entry.isDirectory() || entry.isSymbolicLink()) throw protocolError('UPGRADE_BACKUP_CORRUPT', '升级备份目录无效：' + entry.name)
+        const candidate = path.join(path.dirname(root), entry.name)
         const meta = await readProtocol<BackupMetadata>(candidate, backupMetadata, 'UPGRADE_BACKUP_CORRUPT')
-        if (meta?.complete && meta.root === root && meta.upgrade) {
+        verifyBackupIdentity(root, candidate, meta, identity.libraryId ?? null)
+        if (meta.complete) {
           const unchanged = await Promise.all(Object.entries(meta.files).filter(([file]) => !/(?:^|\/)logs\/build\.md$/.test(file))
             .map(async ([file, digest]) => hash(await readFile(await safePath(root, file)).catch(() => Buffer.alloc(0))) === digest))
           if (!unchanged.every(Boolean)) continue
-          await verifyUpgradeBackup(candidate); Object.assign(initial, structuredClone(meta.upgrade)); initial.backupPath = candidate; break
+          await verifyUpgradeBackup(candidate)
+        } else {
+          if (meta.inputDigest !== current.inputDigest || canonicalJson(meta.files) !== canonicalJson(current.files))
+            throw protocolError('UPGRADE_INPUT_CHANGED', '未完成升级备份的原库输入已变化。')
+          const { id: _id, backupPath: _path, limits, ...saved } = meta.upgrade
+          const { limits: _limits, ...fresh } = current
+          if (!limits || typeof limits !== 'object' || Array.isArray(limits)
+            || Object.entries(limits).some(([key, value]) => !['maxCalls', 'maxTokens'].includes(key) || typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0)
+            || canonicalJson(saved) !== canonicalJson(fresh)) throw protocolError('UPGRADE_BACKUP_CORRUPT', '未完成备份的升级计划或零调用状态不符。')
         }
+        candidates.push({ path: candidate, meta })
       }
-      if (!initial.backupPath) {
+      if (candidates.length > 1) throw protocolError('UPGRADE_BACKUP_AMBIGUOUS', '存在多个可承接的升级备份，请先核对原升级身份。')
+      let meta = candidates[0]?.meta
+      if (meta) Object.assign(initial, structuredClone(meta.upgrade))
+      else {
+        initial.id = randomUUID()
         initial.backupPath = path.join(path.dirname(root), prefix + new Date().toISOString().replace(/[:.]/g, '-') + '-' + initial.id)
-        await mkdir(initial.backupPath)
-        const identity = JSON.parse(await readFile(await safePath(root, '.llmwiki/library.json'), 'utf8').catch(error => { if (error.code === 'ENOENT') return '{}'; throw error }))
-        const meta: BackupMetadata = { id: initial.id, root, libraryId: identity.libraryId ?? null, inputDigest: current.inputDigest, files: current.files, complete: false, upgrade: structuredClone(initial) }
-        await writeProtocol(initial.backupPath, backupMetadata, meta)
-        for (const file of Object.keys(current.files)) {
-          options.signal?.throwIfAborted()
-          const target = await safePath(initial.backupPath, file)
-          await mkdir(path.dirname(target), { recursive: true }); await copyFile(await safePath(root, file), target)
-          if (hash(await readFile(target)) !== current.files[file]) throw new Error('备份期间源文件变化：' + file)
-        }
-        meta.complete = true; await writeProtocol(initial.backupPath, backupMetadata, meta); await verifyUpgradeBackup(initial.backupPath)
       }
+      // 原身份已确定；预检通知仍不把尚未提交检查点的备份宣告为就绪。
+      await options.onStatus?.({ ...structuredClone(initial), backupPath: '' })
+      options.signal?.throwIfAborted()
+      if (!meta) {
+        await mkdir(initial.backupPath)
+        meta = { id: initial.id, root, libraryId: identity.libraryId ?? null, inputDigest: current.inputDigest, files: current.files, complete: false, upgrade: structuredClone(initial) }
+        await writeProtocol(initial.backupPath, backupMetadata, meta)
+      }
+      if (!meta.complete) await finishBackup(root, initial.backupPath, meta, options.signal)
+      options.signal?.throwIfAborted()
       state = initial
       await writeProtocol(root, checkpoint, state)
     }
