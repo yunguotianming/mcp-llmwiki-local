@@ -1,6 +1,7 @@
 import { copyFile, mkdir, readFile, readdir, rename, stat } from 'node:fs/promises'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
+import { parse } from 'yaml'
 import { safePath } from '../storage/paths.js'
 import { withLibraryLock } from '../storage/lock.js'
 import { policySchema } from '../domain/policy-schema.js'
@@ -11,10 +12,11 @@ import type { AcceptedRef, ExecutionHooks, SnapshotManifest, StageId } from './s
 import { storageJson } from './vectors.js'
 import { executeAccepted, makeTaskIdentity, readAccepted, recoverAccepted, withRecovery } from './accepted.js'
 import type { AcceptanceBindings, RecoveryPending } from './accepted.js'
-import type { BuildLayeredOptions, Extraction, Point, SourceEntry, TaskIdentity } from './schema.js'
+import type { BuildLayeredOptions, Extraction, PageDependencies, Point, SourceEntry, TaskIdentity } from './schema.js'
 import { extractionReviewRequests, reviewExtraction, reviewPromptHash } from './review.js'
-import { reviewTopicContent, topicReviewRequests, topicReviewVersion } from './topic-review.js'
+import { reviewTopicContent, topicReviewFingerprint, topicReviewRequests, topicReviewVersion } from './topic-review.js'
 import type { TopicEvidenceSource } from './topic-metadata.js'
+import { topicClaimText, topicEvidenceContext } from './topic-metadata.js'
 import { layeredSettings } from '../domain/config.js'
 import { topicBudget } from './input-budget.js'
 import { readRetentionRoots } from './retention.js'
@@ -31,10 +33,15 @@ export interface UpgradeStep {
 }
 export interface UpgradeEstimate { calls: number; inputTokens: number; outputTokens: number }
 interface ReuseItem { path: string; digest: string; kind: 'extraction' | 'page' | 'vector' | 'checkpoint'; after: string }
+interface UpgradeReviewExclusion {
+  rule: 'archived-topic-placeholder-v1'; reason: string; objectDigest: string; dependencyDigests: string[]; pagePaths: string[]
+}
 export interface UpgradeStatus {
   id: string; status: 'prepared' | 'paused' | 'complete'; reason: string | null; backupPath: string
   originalFormat: '0.2.x'; inputDigest: string; files: Record<string, string>; reuse: ReuseItem[]
   steps: UpgradeStep[]; accepted: Record<string, AcceptedRef>
+  /** 逐对象本地排除依据；不表示模型核对通过，也不产生接受记录。 */
+  reviewExclusions?: Record<string, UpgradeReviewExclusion>
   estimate: UpgradeEstimate
   limits: { maxCalls?: number; maxTokens?: number }
   actual: { calls: number; tokens: number; unknownUsage: number }
@@ -72,22 +79,119 @@ async function upgradeExtraction(root: string, source: SourceEntry) {
   return { extraction, source: { path: source.current_path, bytes, text: bytes.toString('utf8'), contentHash: source.content_hash,
     sourceId: source.source_id, sourceVersion: source.source_version, segments: source.segments, metadata: source.metadata } }
 }
-async function upgradeTopic(root: string, versions: Awaited<ReturnType<typeof manifests>>, id: string) {
-  const owners = versions.flatMap(({ manifest }) => Object.entries(manifest.pages ?? {}).filter(([, digest]) => id === `objects/pages/${digest.slice(7)}.md`)
+function topicOwners(versions: Awaited<ReturnType<typeof manifests>>, id: string) {
+  return versions.flatMap(({ manifest }) => Object.entries(manifest.pages ?? {}).filter(([, digest]) => id === `objects/pages/${digest.slice(7)}.md`)
     .map(([page]) => ({ manifest, page, dependency: manifest.deps?.pages[page] })))
+}
+/** 只识别 renderTopic 的无来源归档占位；任意额外事实、导航或依赖均保留模型核对。 */
+async function topicReviewExclusion(root: string, versions: Awaited<ReturnType<typeof manifests>>, id: string): Promise<UpgradeReviewExclusion | undefined> {
+  const owners = topicOwners(versions, id), content = await readFile(await safePath(root, id), 'utf8')
+  if (!owners.length || hash(content) !== 'sha256:' + path.basename(id, '.md')) return
+  const match = /^---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/.exec(content)
+  if (!match) return
+  let header: Record<string, unknown>
+  try { header = parse(match[1]!) } catch { return }
+  if (!header || typeof header !== 'object' || Array.isArray(header)) return
+  const empty = (value: unknown) => Array.isArray(value) && value.length === 0
+  const fields = ['id', 'page_type', 'aliases', 'title', 'source_type', 'credibility', 'source_date', 'sources', 'models', 'archived', 'updated',
+    'generation_hash', 'input_fingerprint', 'generation_input_fingerprint', 'type', 'created', 'tags']
+  if (Object.keys(header).some(key => !fields.includes(key)) || header.archived !== true || header.page_type !== 'topic'
+    || typeof header.title !== 'string' || !header.title || !empty(header.aliases) || !empty(header.sources) || !empty(header.models)
+    || header.source_type !== '综合' || header.credibility !== 'mixed' || header.source_date !== 'unknown' || header.updated !== 'unknown'
+    || header.type !== undefined && header.type !== 'topic' || header.tags !== undefined && !empty(header.tags)
+    || header.created !== undefined && (typeof header.created !== 'string' || !Number.isFinite(Date.parse(header.created)))
+    || ['generation_hash', 'input_fingerprint', 'generation_input_fingerprint'].some(key => header[key] !== undefined && !/^sha256:[a-f0-9]{64}$/.test(String(header[key])))) return
+  for (const { manifest, page, dependency } of owners) {
+    const topic = manifest.topics?.topics.find(topic => topic.path === page)
+    if (!page.startsWith('topics/') || header.id !== path.basename(page, '.md') || !dependency
+      || dependency.sources.length || dependency.points.length || dependency.children?.length || dependency.models?.length
+      || topic && (!topic.archived || topic.point_ids.length || topic.direct_point_ids?.length || topic.sources.length)) return
+  }
+  // 83b2384 前原样转义标题；此后先清理临时引用。两版都按完整正文精确匹配。
+  const titles = [header.title, topicClaimText(header.title)].map(title => title.replace(/[\r\n]+/g, ' ').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('[', '\\[').replaceAll(']', '\\]'))
+  const body = match[2]!.replaceAll('\r\n', '\n').trimEnd()
+  if (!titles.some(title => body === `\n# ${title}\n\n范围：旧主题保留；当前来源已无可引用的原要点。\n\n## 共识\n\n未提取\n\n## 分歧\n\n未提取\n\n## 适用条件\n\n未提取\n\n## 来源导航`)) return
+  return { rule: 'archived-topic-placeholder-v1', reason: '无来源、成员或子页，正文完全匹配程序生成的归档保留占位；不作研究事实核对。',
+    objectDigest: hash(content), dependencyDigests: sortedUnique(owners.map(owner => protocolDigest(owner.dependency))), pagePaths: sortedUnique(owners.map(owner => owner.page)) }
+}
+async function reviewExclusions(root: string, versions: Awaited<ReturnType<typeof manifests>>, steps: UpgradeStep[]) {
+  const result: Record<string, UpgradeReviewExclusion> = {}
+  for (const id of sortedUnique(steps.filter(step => step.kind === 'review' && step.stage === 'topicReview').flatMap(step => step.unitIds))) {
+    const exclusion = await topicReviewExclusion(root, versions, id)
+    if (exclusion) result[id] = exclusion
+  }
+  return result
+}
+const reviewUnitIds = (step: UpgradeStep, exclusions: Record<string, UpgradeReviewExclusion>) => step.unitIds.filter(id => !exclusions[id])
+/** 父页依赖只保存 direct points；核对成员与正常 checkTopic 一样包含显式子树的成员。 */
+async function topicReviewPoints(root: string, owner: ReturnType<typeof topicOwners>[number], physical: Awaited<ReturnType<typeof manifests>>) {
+  const points = new Map<string, string>(), active = new Set<string>(), completed = new Set<string>()
+  const incomplete = (message: string) => protocolError('UPGRADE_ROOT_INCOMPLETE', '有效主题根的子树证据不完整：' + message)
+  const visit = async (manifest: SnapshotManifest, page: string, dependency: PageDependencies) => {
+    const key = `${manifest.version ?? 'pending'}:${page}`
+    if (active.has(key)) throw incomplete('子页依赖成环：' + page)
+    if (completed.has(key)) return
+    active.add(key)
+    for (const sourceId of dependency.sources) {
+      const source = manifest.sources.find(source => source.source_id === sourceId)
+      const parent = owner.manifest.sources.find(source => source.source_id === sourceId)
+      if (!owner.dependency!.sources.includes(sourceId) || !source || !parent || protocolDigest(source) !== protocolDigest(parent))
+        throw incomplete('子页来源与父页绑定版本不符：' + page)
+    }
+    for (const point of dependency.points) {
+      if (points.has(point.point_id) && points.get(point.point_id) !== point.text_hash) throw incomplete('同成员出现不同摘要：' + point.point_id)
+      points.set(point.point_id, point.text_hash)
+    }
+    for (const child of dependency.children ?? []) {
+      const version = child.version || manifest.version
+      const childManifest = version === manifest.version && manifest.pages?.[child.page] ? manifest
+        : physical.find(item => item.manifest.version === version)?.manifest
+      const digest = childManifest?.pages?.[child.page], childDependency = childManifest?.deps?.pages[child.page]
+      if (!child.page.startsWith('topics/') || !childManifest || !digest || !childDependency
+        || hash(await readFile(await safePath(root, `objects/pages/${digest.slice(7)}.md`)).catch(error => {
+          if (error.code === 'ENOENT') return Buffer.alloc(0)
+          throw error
+        })) !== digest) throw incomplete('子页版本、对象或依赖缺失：' + child.page)
+      await visit(childManifest, child.page, childDependency)
+    }
+    active.delete(key); completed.add(key)
+  }
+  await visit(owner.manifest, owner.page, owner.dependency!)
+  return [...points].sort(([a], [b]) => a.localeCompare(b)).map(([point_id, text_hash]) => ({ point_id, text_hash }))
+}
+async function upgradeTopic(root: string, versions: Awaited<ReturnType<typeof manifests>>, id: string) {
+  const owners = topicOwners(versions, id)
   if (!owners.length || owners.some(owner => !owner.dependency)) throw protocolError('UPGRADE_ROOT_INCOMPLETE', '有效主题根缺少依赖上下文：' + id)
-  const inputs = owners.map(({ manifest, page, dependency }) => ({ page, sources: dependency!.sources, points: dependency!.points,
-    entries: manifest.sources.filter(source => dependency!.sources.includes(source.source_id)) }))
+  const physical = owners.some(owner => owner.dependency!.children?.length) ? await manifests(root) : []
+  const inputs = await Promise.all(owners.map(async owner => ({ page: owner.page, sources: owner.dependency!.sources,
+    points: await topicReviewPoints(root, owner, physical), entries: owner.manifest.sources.filter(source => owner.dependency!.sources.includes(source.source_id)) })))
   if (new Set(inputs.map(input => protocolDigest(input))).size !== 1) throw protocolError('UPGRADE_ROOT_INCOMPLETE', '有效主题根的来源上下文不唯一：' + id)
   const { manifest, page, dependency } = owners[0]!, contexts = new Map<string, TopicEvidenceSource>()
   if (dependency!.sources.some(id => !manifest.sources.some(source => source.source_id === id))) throw protocolError('UPGRADE_ROOT_INCOMPLETE', '有效主题根的来源缺失。')
   const points: Point[] = []
+  const expected = new Map(inputs[0]!.points.map(point => [point.point_id, point.text_hash]))
   for (const source of manifest.sources.filter(source => dependency!.sources.includes(source.source_id))) {
     const { extraction, source: input } = await upgradeExtraction(root, source)
-    points.push(...extraction.segments.flatMap(segment => segment.points).filter(point => dependency!.points.some(dependency => dependency.point_id === point.point_id)))
-    contexts.set(source.source_id, { title: source.metadata.title, source_version: source.source_version,
-      text: input.text, segments: source.segments })
+    if (extraction.source_id !== source.source_id || extraction.source_hash !== source.content_hash)
+      throw protocolError('UPGRADE_ROOT_INCOMPLETE', '有效主题根的提取对象与原文来源不符。')
+    const evidenceSource = { title: source.metadata.title, source_version: source.source_version, text: input.text, segments: source.segments }
+    for (const segment of extraction.segments) for (const point of segment.points.filter(point => expected.has(point.point_id))) {
+      if (expected.get(point.point_id) !== point.text_hash || point.source_version !== source.source_version)
+        throw protocolError('UPGRADE_ROOT_INCOMPLETE', '有效主题根的成员摘要或来源版本不符。')
+      const original = source.segments.find(item => item.locator === segment.locator && item.start === segment.start && item.end === segment.end)
+      if (point.text_hash !== segment.text_hash || !original || original.text_hash !== segment.text_hash
+        || hash(input.text.slice(segment.start, segment.end)) !== segment.text_hash)
+        throw protocolError('UPGRADE_ROOT_INCOMPLETE', '有效主题根的成员所属原段摘要不符。')
+      if (!point.evidence.length || point.evidence.some(evidence => evidence.source_id !== source.source_id || evidence.source_version !== source.source_version))
+        throw protocolError('UPGRADE_ROOT_INCOMPLETE', '有效主题根的成员证据来源或版本不符。')
+      try { for (const evidence of point.evidence) topicEvidenceContext(evidence, evidenceSource) }
+      catch (error) { throw protocolError('UPGRADE_ROOT_INCOMPLETE', '有效主题根的成员证据无效：' + String(error)) }
+      points.push(point)
+    }
+    contexts.set(source.source_id, evidenceSource)
   }
+  if (points.length !== expected.size || new Set(points.map(point => point.point_id)).size !== expected.size)
+    throw protocolError('UPGRADE_ROOT_INCOMPLETE', '有效主题根的成员缺失或不唯一。')
   return { topicId: path.basename(page, '.md'), content: await readFile(await safePath(root, id), 'utf8'), points, contexts }
 }
 function upgradeReviewIdentity(bindings: AcceptanceBindings, versions: Awaited<ReturnType<typeof manifests>>, step: UpgradeStep, sources: SourceEntry[]): TaskIdentity {
@@ -99,8 +203,11 @@ function upgradeReviewIdentity(bindings: AcceptanceBindings, versions: Awaited<R
     groupPlanDigest: protocolDigest(step.unitIds), revocationGeneration: versions[0]?.manifest.revocation_generation ?? 0, reextractGeneration: 0 }
 }
 interface UpgradeUnitResult { id: string; result: unknown }
-const validReviewStep = (step: UpgradeStep) => (value: { units: UpgradeUnitResult[] }) => value.units.length === step.unitIds.length
-  && step.unitIds.every(id => value.units.some(unit => unit.id === id))
+const validReviewStep = (step: UpgradeStep, exclusions: Record<string, UpgradeReviewExclusion> = {}) => (value: { units: UpgradeUnitResult[] }) => {
+  const matches = (ids: string[]) => value.units.length === ids.length && ids.every(id => value.units.some(unit => unit.id === id))
+  // 原版本已由模型接受的完整输出仍可回放；新执行只接受需要模型核对的对象。
+  return matches(reviewUnitIds(step, exclusions)) || matches(step.unitIds)
+}
 async function upgradeReviewUnit(root: string, versions: Awaited<ReturnType<typeof manifests>>, sources: SourceEntry[], parent: TaskIdentity, id: string) {
   const candidates = sources.filter(source => source.extract.path === id)
   if (parent.stage === 'extractionReview' && (candidates.length === 0 || new Set(candidates.map(source => protocolDigest(source))).size !== 1))
@@ -123,7 +230,17 @@ async function upgradeReviewUnit(root: string, versions: Awaited<ReturnType<type
         && value.result.some(item => item?.point_id === point.point_id && item.verification?.status === 'verified'))
     : Boolean(value.result && typeof value.result === 'object' && 'fingerprint' in value.result && typeof value.result.fingerprint === 'string'
       && 'removed' in value.result && Array.isArray(value.result.removed) && !value.result.removed.length))
-  return { unit, identity, valid }
+  return { id, unit, identity, valid }
+}
+function assertReviewEvidence(value: { units: UpgradeUnitResult[] }, plans: Awaited<ReturnType<typeof upgradeReviewUnit>>[], options: BuildLayeredOptions) {
+  const settings = layeredSettings(options.topics || {}, options.tier)
+  for (const { id, unit } of plans) {
+    if (unit.kind !== 'topic') continue
+    const result = value.units.find(item => item.id === id)?.result as { fingerprint?: unknown; removed?: unknown } | undefined
+    if (result?.fingerprint !== topicReviewFingerprint(unit.content, unit.points, settings.contradictionReview, unit.contexts)
+      || !Array.isArray(result.removed) || result.removed.length)
+      throw protocolError('UPGRADE_REVIEW_EVIDENCE_CHANGED', '升级主题核对证据已变化，原接受不适用于当前对象：' + id)
+  }
 }
 
 /** 统计当前证据和窗口已确定的初轮包；后续合并、纠正和重试由实际账本累计。 */
@@ -134,13 +251,15 @@ export function upgradeReviewEstimator(bind: (hooks?: ExecutionHooks) => Accepta
     const active = await narrowReviewStep(root, step, versions, physical)
     if (!active) return estimate
     step = active
+    const exclusions = await reviewExclusions(root, versions, [step])
     const sources = reviewSources(versions, step), bindings = bind()
     const identity = upgradeReviewIdentity(bindings, physical, step, sources)
     const unitParent = reviewUnitParent(step, identity)
-    if (await readAccepted(root, bindings, identity, validReviewStep(step))) return estimate
+    const plans = await Promise.all(reviewUnitIds(step, exclusions).map(id => upgradeReviewUnit(root, versions, sources, unitParent, id)))
+    const saved = await readAccepted(root, bindings, identity, validReviewStep(step, exclusions))
+    if (saved) { assertReviewEvidence(saved.value, plans, options); return estimate }
     const pending = []
-    for (const id of step.unitIds) {
-      const planned = await upgradeReviewUnit(root, versions, sources, unitParent, id)
+    for (const planned of plans) {
       if (!await readAccepted(root, bindings, planned.identity, planned.valid)) pending.push(planned.unit)
     }
     if (!pending.length) return estimate
@@ -184,17 +303,21 @@ export function upgradeReviewRunner(bind: (hooks: ExecutionHooks) => AcceptanceB
     const activeStep = await narrowReviewStep(context.root, step, versions, physical)
     if (!activeStep || activeStep.id !== step.id) throw protocolError('UPGRADE_ROOT_CHANGED', '核对范围已变化，请重新进行升级预检。')
     const sources = reviewSources(versions, step)
+    const exclusions = await reviewExclusions(context.root, versions, [step])
     const bindings = bind(context.hooks)
     const identity = upgradeReviewIdentity(bindings, physical, step, sources)
     const unitParent = reviewUnitParent(step, identity)
+    const plans = await Promise.all(reviewUnitIds(step, exclusions).map(id => upgradeReviewUnit(context.root, versions, sources, unitParent, id)))
     const pending = { runId: context.runId, acceptedProtocol: 1 } as RecoveryPending
     return withRecovery(context.root, pending, { ...options, recovery: bindings, automaticRecovery: true, replayOnly: context.replayOnly }, async active => {
-      const valid = validReviewStep(step)
-      const recovered = await recoverAccepted(identity, valid)
+      const valid = validReviewStep(step, exclusions)
+      const previous = await readAccepted(context.root, bindings, identity, valid)
+      if (previous) assertReviewEvidence(previous.value, plans, active)
+      const recovered = previous ? await recoverAccepted(identity, valid) : undefined
       const accepted = recovered ?? await executeAccepted(identity, async () => {
         const units: UpgradeUnitResult[] = []
-        for (const id of step.unitIds) {
-          const planned = await upgradeReviewUnit(context.root, versions, sources, unitParent, id)
+        for (const [index, id] of reviewUnitIds(step, exclusions).entries()) {
+          const planned = plans[index]!
           const saved = await recoverAccepted(planned.identity, planned.valid)
           const result = saved ?? await executeAccepted(planned.identity, async () => {
             const unit = planned.unit
@@ -560,6 +683,10 @@ export async function upgradeLibrary(root: string, options: UpgradeOptions = {})
       const narrowed = await Promise.all(currentState.steps.map(step => narrowReviewStep(root, step, active, physical)))
       // 计划收缩只改变剩余核对；原升级、备份、接受记录与尝试账本保持。
       currentState.steps = narrowed.filter((step): step is UpgradeStep => step !== undefined)
+      const exclusions = await reviewExclusions(root, active, currentState.steps)
+      for (const [id, previous] of Object.entries(currentState.reviewExclusions ?? {})) if (currentState.steps.some(step => step.unitIds.includes(id))
+        && (!exclusions[id] || canonicalJson(previous) !== canonicalJson(exclusions[id]))) throw protocolError('UPGRADE_ROOT_CHANGED', '归档占位排除依据发生变化：' + id)
+      if (Object.keys(exclusions).length) currentState.reviewExclusions = { ...currentState.reviewExclusions, ...exclusions }
       currentState.estimate = totalEstimate(currentState.steps)
       await writeProtocol(root, checkpoint, currentState)
       // 新协议显式保存单元身份及输入摘要；接受提交早于升级检查点时精确恢复。
@@ -587,13 +714,14 @@ export async function upgradeLibrary(root: string, options: UpgradeOptions = {})
       await refreshReviewEstimates(root, currentState.steps, options, currentState.accepted)
       currentState.estimate = totalEstimate(currentState.steps)
       await writeProtocol(root, checkpoint, currentState)
-      const remaining = currentState.steps.filter(step => !currentState.accepted[step.id])
+      const localOnly = (step: UpgradeStep) => step.kind === 'review' && !reviewUnitIds(step, exclusions).length
+      const remaining = currentState.steps.filter(step => !currentState.accepted[step.id] && !localOnly(step))
       const remainingEstimate = totalEstimate(remaining)
       if (currentState.limits.maxCalls !== undefined && currentState.actual.calls + remainingEstimate.calls > currentState.limits.maxCalls
         || currentState.limits.maxTokens !== undefined && currentState.actual.tokens + remainingEstimate.inputTokens + remainingEstimate.outputTokens > currentState.limits.maxTokens) return report('paused', '初轮预计用量超过用户设置的升级上限。')
       for (const step of currentState.steps) {
         options.signal?.throwIfAborted()
-        if (currentState.accepted[step.id]) continue
+        if (currentState.accepted[step.id] || localOnly(step)) continue
         if (step.estimatedInputTokens > (options.inputLimitTokens ?? Infinity)) return report('paused', '完整证据超出候选输入窗口。')
         if (!options.runStep) return report('paused', '升级补齐执行器尚未提供，旧版本继续可读。')
         const stepHooks: ExecutionHooks = { ...hooks, beforeAttempt: async request => {
@@ -609,6 +737,13 @@ export async function upgradeLibrary(root: string, options: UpgradeOptions = {})
       }
       for (const { manifest, checksum } of await manifests(root)) {
         const provenance = await legacyProvenance(root, manifest, checksum)
+        for (const [id, exclusion] of Object.entries(exclusions)) {
+          if (!Object.values(manifest.pages ?? {}).includes(exclusion.objectDigest)) continue
+          const metadata = { target: id, fields: ['review-exclusion'], value: exclusion }
+          const artifact = { kind: 'metadata' as const, objectPath: null, objectDigest: protocolDigest(metadata), pagePath: null,
+            sourceRefs: [], status: 'local-derived' as const, productionIds: [], inheritedFrom: null, metadata }
+          provenance.artifacts[artifactId(artifact)] = artifact
+        }
         for (const [stepId, ref] of Object.entries(currentState.accepted)) {
           const step = currentState.steps.find(s => s.id === stepId)
           if (!step) continue
@@ -617,7 +752,9 @@ export async function upgradeLibrary(root: string, options: UpgradeOptions = {})
           if (step.kind === 'gap') continue
           const raw = await readFile(await safePath(root, accepted.record.output.path))
           if (hash(raw) !== accepted.record.output.digest) throw new Error('升级补齐输出摘要不符。')
-          const metadata = { target: step.unitIds.join(','), fields: [step.kind], value: accepted.record.output.encoding === 'utf8-json' ? JSON.parse(raw.toString('utf8')) : raw.toString('utf8') }
+          const value = accepted.record.output.encoding === 'utf8-json' ? JSON.parse(raw.toString('utf8')) : raw.toString('utf8')
+          const targets = step.kind === 'review' ? (value as { units: UpgradeUnitResult[] }).units.map(unit => unit.id) : step.unitIds
+          const metadata = { target: targets.join(','), fields: [step.kind], value }
           const artifact = { kind: 'metadata' as const, objectPath: null, objectDigest: protocolDigest(metadata), pagePath: null,
             sourceRefs: sortedUnique(accepted.record.identity.scope.sourceRefs), status: 'recorded' as const, productionIds: sortedUnique(Object.keys(accepted.record.productions)), inheritedFrom: null, metadata }
           provenance.artifacts[artifactId(artifact)] = artifact; Object.assign(provenance.records, accepted.record.productions)
