@@ -49,6 +49,12 @@ export async function shareExtraction<T>(key: string, signal: AbortSignal | unde
 }
 
 export const taskReceiptProtocol = 'validated-tasks-v1'
+type TaskReplay = (stage: LayeredModelTask | RecoveryStage, spec: AcceptedTaskSpec, work: () => Promise<unknown>, valid: (value: unknown) => boolean) => Promise<{ value: unknown; reused: boolean; acceptedRef?: AcceptedRef }>
+const taskReplays = new AsyncLocalStorage<{ replay: TaskReplay; refs: Set<string> }>()
+// 只读证明重放复用原业务任务定义；实现方必须核验完整身份与输出，禁止模型及持久化。
+export const withTaskReplay = <T>(refs: AcceptedRef[], replay: TaskReplay, work: () => Promise<T>): Promise<T> => taskReplays.run({ replay, refs: new Set(refs.map(ref => ref.taskId)) }, work)
+export const taskReplayActive = (): boolean => !!taskReplays.getStore()
+export const replayAcceptedRefs = (refs: AcceptedRef[]): AcceptedRef[] => refs.filter(ref => taskReplays.getStore()?.refs.has(ref.taskId))
 export const taskCallContext = new AsyncLocalStorage<{ receipt_key: string | null; invalidation_reason?: string }>()
 export async function recoveryTask<T>(options: BuildLayeredOptions, operation: RecoveryStage, identity: unknown,
   work: (signal: AbortSignal) => Promise<T>, valid: (value: T) => boolean, spec: AcceptedTaskSpec): Promise<{ value: T; reused: boolean; acceptedRef?: AcceptedRef }> {
@@ -58,6 +64,11 @@ export async function recoveryTask<T>(options: BuildLayeredOptions, operation: R
 // 回执只保存调用方已完成全部业务校验的结果；请求身份只落摘要，模型配置不会写入缓存。
 export async function validatedTask<T>(options: BuildLayeredOptions, operation: LayeredModelTask | RecoveryStage, identity: unknown,
   work: (signal: AbortSignal) => Promise<T>, valid: (value: T) => boolean, spec?: AcceptedTaskSpec): Promise<{ value: T; reused: boolean; acceptedRef?: AcceptedRef }> {
+  const replay = taskReplays.getStore()
+  if (replay) {
+    if (!spec) throw new Error('接受输出重放缺少完整任务定义。')
+    return await replay.replay(operation, spec, () => work(options.signal ?? new AbortController().signal), value => valid(value as T)) as { value: T; reused: boolean; acceptedRef?: AcceptedRef }
+  }
   const execute = (signal: AbortSignal, receipt_key: string | null) => taskCallContext.run({ receipt_key,
     ...(options.invalidationReason ? { invalidation_reason: options.invalidationReason } : {}) }, () => work(signal))
   const recovery = recoveryContext()

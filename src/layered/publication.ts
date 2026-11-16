@@ -478,7 +478,8 @@ export async function publishLibrary(root: string, pending: PendingBuild, signal
     const checksum = hash(storageJson(pending.manifest))
     const base = pending.base_version ? await readVersion(root, pending.base_version) : undefined
     const baseChecksum = base ? hash(storageJson(base)) : undefined
-    const provenance = await publicationProvenance(root, pending, checksum, base ? await readProvenance(root, base.version!, baseChecksum!) : undefined)
+    const provenance = await publicationProvenance(root, pending, checksum, base ? await readProvenance(root, base.version!, baseChecksum!) : undefined,
+      options ? layeredSettings(options.topics || {}, options.tier) : undefined)
     pending.provenanceRef = await writeProvenance(root, provenance)
     pending.costsRef = await writeVersionCosts(root, version, checksum, pending.runIds ?? (pending.runId ? [pending.runId] : []), base ? await readVersionCosts(root, base.version!, baseChecksum!) : null)
     await writeJson(root, 'work/pending.json', pending)

@@ -160,12 +160,16 @@ export function validateProvenance(value: VersionProvenance, version: string, ma
     if (artifact.kind === 'metadata' && (!artifact.metadata || artifact.objectPath !== null || artifact.pagePath !== null || protocolDigest(artifact.metadata) !== artifact.objectDigest)) throw protocolError('PROVENANCE_INCOMPLETE', '元数据快照无效。')
     if (artifact.derivedFrom !== undefined) {
       const edge = artifact.derivedFrom
-      if (!edge || !keysMatch(edge, ['operation', 'artifactId']) || edge.operation !== 'source-summary-exclusion-v1' || !digestPattern.test(edge.artifactId)) throw protocolError('PROVENANCE_INCOMPLETE', '本地派生操作无效。')
+      if (!edge || !['source-summary-exclusion-v1', 'source-summary-completion-v1'].includes(edge.operation)
+        || !keysMatch(edge, edge.operation === 'source-summary-completion-v1' ? ['operation', 'artifactId', 'proof'] : ['operation', 'artifactId'])
+        || !digestPattern.test(edge.artifactId)) throw protocolError('PROVENANCE_INCOMPLETE', '本地派生操作无效。')
       const parent = value.artifacts[edge.artifactId]
+      const completion = edge.operation === 'source-summary-completion-v1'
       if (artifact.kind !== 'extraction' || !parent || parent.kind !== 'extraction' || parent.status === 'local-derived'
         || artifact.objectDigest === parent.objectDigest || canonicalJson(artifact.sourceRefs) !== canonicalJson(parent.sourceRefs)
-        || artifact.status !== parent.status || (artifact.reason ?? null) !== (parent.reason ?? null)
-        || canonicalJson(artifact.productionIds) !== canonicalJson(parent.productionIds)
+        || artifact.status !== (completion && parent.status === 'unknown' ? 'legacy-recorded' : parent.status)
+        || (artifact.reason ?? null) !== (completion ? null : parent.reason ?? null)
+        || !completion && canonicalJson(artifact.productionIds) !== canonicalJson(parent.productionIds)
         || canonicalJson(artifact.legacyEvidence ?? []) !== canonicalJson(parent.legacyEvidence ?? [])) throw protocolError('PROVENANCE_INCOMPLETE', '本地摘要排除的父项或作者归属无效。')
     }
     validateProductions(value.records, [...artifact.productionIds, ...(artifact.inheritedFrom?.productionIds ?? [])])
@@ -221,7 +225,7 @@ async function summaryExclusionMatches(parent: Extraction, child: Extraction): P
   } catch { return false }
 }
 async function validateDerivedObjects(root: string, value: VersionProvenance, manifest: SnapshotManifest): Promise<void> {
-  const { resultFingerprint } = await import('./extraction.js')
+  const { resultFingerprint, renderSource } = await import('./extraction.js')
   for (const artifact of Object.values(value.artifacts)) if (artifact.derivedFrom) {
     const parent = value.artifacts[artifact.derivedFrom.artifactId]!
     const [before, after] = await Promise.all([extractionObject(root, parent), extractionObject(root, artifact)])
@@ -230,7 +234,33 @@ async function validateDerivedObjects(root: string, value: VersionProvenance, ma
     if (!source || before.source_id !== source.source_id || before.source_hash !== source.content_hash
       || artifact.objectPath === source.extract.path && (canonicalJson(source.extract.processing) !== canonicalJson(after.processing)
         || source.extract.processing_fingerprint !== resultFingerprint(after))
-      || !await summaryExclusionMatches(before, after)) throw protocolError('PROVENANCE_INCOMPLETE', '本地摘要排除无法从父成果严格重放。')
+      ) throw protocolError('PROVENANCE_INCOMPLETE', '本地派生来源身份不符。')
+    if (artifact.derivedFrom.operation === 'source-summary-completion-v1') {
+      const proof = artifact.derivedFrom.proof
+      const { replaySummaryCompletion } = await import('./summary-completion.js')
+      if (parent.objectPath !== proof.baseSource.extract.path
+        || canonicalJson(parent.sourceRefs) !== canonicalJson([{ sourceId: proof.baseSource.source_id, sourceVersion: proof.baseSource.source_version }])
+        || canonicalJson(before.processing) !== canonicalJson(proof.baseSource.extract.processing)
+        || resultFingerprint(before) !== proof.baseSource.extract.processing_fingerprint) throw protocolError('PROVENANCE_INCOMPLETE', '摘要补缺未绑定原发布基线。')
+      const records = await replaySummaryCompletion(root, before, after, source, proof, value.revocationGeneration, value.derivationBases?.[proof.baseManifestChecksum])
+      if (canonicalJson(artifact.productionIds) !== canonicalJson(sortedUnique([...parent.productionIds, ...Object.keys(records)]))
+        || Object.entries(records).some(([id, record]) => canonicalJson(value.records[id]) !== canonicalJson(record))) throw protocolError('PROVENANCE_INCOMPLETE', '摘要补缺生产链不完整。')
+    } else if (!await summaryExclusionMatches(before, after)) throw protocolError('PROVENANCE_INCOMPLETE', '本地摘要排除无法从父成果严格重放。')
+  }
+  for (const source of manifest.sources) {
+    const extraction = Object.values(value.artifacts).find(artifact => artifact.kind === 'extraction' && artifact.objectPath === source.extract.path)
+    if (extraction?.derivedFrom?.operation !== 'source-summary-completion-v1') continue
+    const pagePath = 'sources/' + source.source_id + '.md'
+    const page = Object.values(value.artifacts).find(artifact => artifact.kind === 'page' && artifact.pagePath === pagePath)
+    if (!page || page.objectDigest !== manifest.pages?.[pagePath] || page.status !== extraction.status
+      || page.inheritedFrom?.version !== value.version || page.inheritedFrom.artifactId !== artifactId(extraction)
+      || canonicalJson(page.inheritedFrom.productionIds) !== canonicalJson(extraction.productionIds)
+      || canonicalJson(page.sourceRefs) !== canonicalJson(extraction.sourceRefs)
+      || canonicalJson(page.productionIds) !== canonicalJson(extraction.productionIds)
+      || canonicalJson(page.legacyEvidence ?? []) !== canonicalJson(extraction.legacyEvidence ?? [])
+      || hash(renderSource(source, await extractionObject(root, extraction))) !== page.objectDigest
+      || hash(await readFile(await safePath(root, page.objectPath!))) !== page.objectDigest)
+      throw protocolError('PROVENANCE_INCOMPLETE', '摘要补缺来源页未从本轮提取严格派生。')
   }
 }
 export async function readProvenance(root: string, version: string, checksum: string): Promise<VersionProvenance> {
@@ -297,7 +327,8 @@ export async function legacyProvenance(root: string, manifest: SnapshotManifest,
   return { schema: 'llmwiki-provenance-v1', version: manifest.version!, manifestChecksum, revocationGeneration: manifest.revocation_generation, artifacts, records: {} }
 }
 
-export async function publicationProvenance(root: string, pending: PendingBuild, manifestChecksum: string, previous?: VersionProvenance): Promise<VersionProvenance> {
+export async function publicationProvenance(root: string, pending: PendingBuild, manifestChecksum: string, previous?: VersionProvenance,
+  summarySettings?: import('../domain/config.js').LayeredSettings): Promise<VersionProvenance> {
   const value = await legacyProvenance(root, pending.manifest, manifestChecksum)
   const base = previous && pending.base_version ? await (await import('./objects.js')).readVersion(root, pending.base_version, false) : undefined
   if (base && (base.version !== previous!.version || hash(storageJson(base)) !== previous!.manifestChecksum)) throw protocolError('PROVENANCE_INCOMPLETE', '本地派生的发布基线不符。')
@@ -346,6 +377,24 @@ export async function publicationProvenance(root: string, pending: PendingBuild,
           artifact.derivedFrom = { operation: 'source-summary-exclusion-v1', artifactId: parent[0] }
           continue
         }
+        if (pending.source_scope?.request.kinds.length === 1 && pending.source_scope.request.kinds[0] === 'summary'
+          && pending.source_scope.request.sourceIds.includes(source.source_id)) {
+          const { summaryCompletionProof, replaySummaryCompletion } = await import('./summary-completion.js')
+          const proof = await summaryCompletionProof(root, source, priorSource!, previous.version,
+            Object.entries((pending as import('./accepted.js').RecoveryPending).acceptedRefs ?? {}).filter(([unit]) => unit.startsWith(source.source_id + '/')).map(([, ref]) => ref), summarySettings,
+            (pending as import('./accepted.js').RecoveryPending).reextractGenerations?.[source.source_id] ?? 0)
+          if (proof.baseManifestChecksum !== previous.manifestChecksum) throw protocolError('PROVENANCE_INCOMPLETE', '摘要补缺原基线摘要不符。')
+          ;(value.derivationBases ??= {})[proof.baseManifestChecksum] = storageJson(base)
+          const records = await replaySummaryCompletion(root, await extractionObject(root, parent[1]), await extractionObject(root, artifact), source, proof,
+            pending.manifest.revocation_generation, value.derivationBases[proof.baseManifestChecksum])
+          inheritAuthor(parent[1]); delete artifact.reason
+          if (artifact.status === 'unknown') artifact.status = 'legacy-recorded'
+          artifact.productionIds = sortedUnique([...artifact.productionIds, ...Object.keys(records)])
+          Object.assign(value.records, records)
+          artifact.inheritedFrom = { version: previous.version, artifactId: parent[0], productionIds: [...parent[1].productionIds] }
+          artifact.derivedFrom = { operation: 'source-summary-completion-v1', artifactId: parent[0], proof }
+          continue
+        }
       }
       // 旧接受只证明旧输出；不能把它再次 attach 到改变过的新提取上。
       if (source.acceptedRef && sameRef) throw protocolError('PROVENANCE_INCOMPLETE', '旧接受不能证明改变过的提取成果。')
@@ -374,6 +423,8 @@ export async function publicationProvenance(root: string, pending: PendingBuild,
       }
     } else if (inherited) {
       Object.assign(artifact, structuredClone(inherited[1]), { inheritedFrom: { version: previous!.version, artifactId: inherited[0], productionIds: inherited[1].productionIds } })
+      if (!inherited[1].reason) delete artifact.reason
+      if (!inherited[1].legacyEvidence) delete artifact.legacyEvidence
       Object.assign(value.records, previous!.records)
     } else if (artifact.status !== 'local-derived') {
       // 本地来源页可以从原样复用的提取结果派生，但不能猜新主题的作者。
@@ -397,6 +448,14 @@ export async function publicationProvenance(root: string, pending: PendingBuild,
     Object.assign(value.records, previous!.records)
   }
   retainDerivedArtifacts(value.artifacts, previous?.artifacts ?? {})
+  const bases = { ...previous?.derivationBases, ...value.derivationBases }
+  const neededBases = sortedUnique(Object.values(value.artifacts).flatMap(artifact => artifact.derivedFrom?.operation === 'source-summary-completion-v1'
+    ? [artifact.derivedFrom.proof.baseManifestChecksum] : []))
+  if (neededBases.length) value.derivationBases = Object.fromEntries(neededBases.map(checksum => {
+    if (!bases[checksum]) throw protocolError('PROVENANCE_INCOMPLETE', '摘要补缺原基线快照缺失。')
+    return [checksum, bases[checksum]!]
+  }))
+  else delete value.derivationBases
   validateProvenance(value, value.version, manifestChecksum)
   await validateDerivedObjects(root, value, pending.manifest)
   // 内嵌闭合链，移除未被本版本引用的历史记录。

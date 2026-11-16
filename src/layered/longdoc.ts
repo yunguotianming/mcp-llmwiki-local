@@ -13,7 +13,7 @@ import { allocatePointQuotas } from './budget.js'
 import { mapConcurrent } from '../llm/scheduler.js'
 import { defaultPolicy } from '../domain/policy.js'
 import { mergeModels, modelUsage } from './models.js'
-import { validatedTask } from './extraction-cache.js'
+import { validatedTask, taskReplayActive, replayAcceptedRefs } from './extraction-cache.js'
 import { activeAcceptedRefs, businessValue, recoveryBudget, recoveryContext, verifyAcceptedRefs } from './accepted.js'
 import type { AcceptedRef } from './accepted.js'
 
@@ -165,16 +165,20 @@ export async function synthesizeSourceSummary(result: Extraction, keys: string[]
   const summaryCalls = new Map<string, Extraction['calls'][number]>()
   const points = new Map(result.segments.flatMap(segment => segment.points).map(point => [point.point_id, point]))
   const nodes = result.summary_nodes ??= {}, active = new Set<string>()
-  const recovering = Boolean(recoveryContext()), saved = result as Extraction & SummaryRecoveryState
+  const recovering = Boolean(recoveryContext()) || taskReplayActive(), saved = result as Extraction & SummaryRecoveryState
   await verifyAcceptedRefs({ nodes, blocks: saved.summary_blocks, groups: result.group_summaries }, true)
   const plans = recovering ? saved.summary_plans ??= {} : {}
   const blocks = recovering ? saved.summary_blocks ??= {} : {}
+  const validGroups = (groups: string[][], members: string[]) => Array.isArray(groups) && groups.length > 0
+    && groups.every(group => Array.isArray(group) && group.length > 0) && JSON.stringify(groups.flat()) === JSON.stringify(members)
   const sourceRefs = [{ sourceId: result.source_id, sourceVersion: result.segments.flatMap(segment => segment.points)[0]?.source_version ?? result.source_hash }]
   let budget: Promise<number> | undefined
   const currentBudget = () => budget ??= recoveryBudget('extract', async () => inputLimit, options.maxInputBytes)
   const pause = () => Object.assign(new Error('单个完整摘要要点超过当前窗口。'), { stagePause: true, stage: 'extract', code: 'NO_COMPATIBLE_CANDIDATE' })
-  const refOf = (child: SourceSummary) => activeAcceptedRefs([(child as SourceSummary & { acceptedRef?: AcceptedRef }).acceptedRef]
-    .filter((ref): ref is AcceptedRef => Boolean(ref)))[0]
+  const refOf = (child: SourceSummary) => {
+    const refs = [(child as SourceSummary & { acceptedRef?: AcceptedRef }).acceptedRef].filter((ref): ref is AcceptedRef => Boolean(ref))
+    return (taskReplayActive() ? replayAcceptedRefs(refs) : activeAcceptedRefs(refs))[0]
+  }
   const missing = (id: string): SourceSummary => ({ id, point_ids: [], missing: [id], level: 0, children: [], fingerprint: hash(id + ':missing') })
   let current = keys.map(key => result.group_summaries?.[key] ?? missing(key))
   const mergeOnce = async (children: SourceSummary[]): Promise<SourceSummary> => {
@@ -255,6 +259,7 @@ export async function synthesizeSourceSummary(result: Extraction, keys: string[]
               if (plans[splitId] || Buffer.byteLength(prompt + input) > limit) {
                 if (ids.length === 1) throw pause()
                 const halves = plans[splitId] ??= [ids.slice(0, Math.ceil(ids.length / 2)), ids.slice(Math.ceil(ids.length / 2))]
+                if (!validGroups(halves, ids)) throw new Error('摘要拆分计划未完整覆盖原候选。')
                 await checkpoint()
                 const selected = await mapConcurrent(halves, concurrency, signal, select)
                 return { ids: selected.flatMap(block => block.ids), models: mergeModels(...selected.map(block => block.models)) }
@@ -280,6 +285,7 @@ export async function synthesizeSourceSummary(result: Extraction, keys: string[]
             groups = completeInputBlocks(candidates, ids => Buffer.byteLength(prompt + request(ids, recovering ? '/block/' + hashName(hash(JSON.stringify(ids))) : '/budget-' + level + '-999999')) <= limit)
             if (recovering) { plans[planId] = groups; await checkpoint() }
           }
+          if (!validGroups(groups, candidates)) throw new Error('摘要分组计划未完整覆盖原候选。')
           const selected = await mapConcurrent(groups, concurrency, signal, (ids, index) => recovering ? select(ids)
             : run(ids, request(ids, groups.length === 1 ? '' : '/budget-' + level + '-' + index), id + '/budget-' + level + '-' + index, inputLimit))
           node.point_ids = [...new Set(selected.flatMap(block => block.ids))]

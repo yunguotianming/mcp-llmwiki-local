@@ -294,13 +294,21 @@ export interface ProductionArtifact {
   productionIds: string[]
   inheritedFrom: { version: string; artifactId: string; productionIds: string[] } | null
   derivedFrom?: { operation: 'source-summary-exclusion-v1'; artifactId: string }
+    | { operation: 'source-summary-completion-v1'; artifactId: string; proof: SummaryCompletionProof }
   reason?: string
   metadata?: { target: string; fields: string[]; value: unknown }
   legacyEvidence?: { originVersion: string; field: string; models: unknown; role: string | null }[]
 }
+export interface SummaryCompletionProof {
+  libraryId: string; baseVersion: string; baseSource: SourceEntry
+  baseManifestChecksum: string; reextractGeneration: number; creationGeneration: number
+  settings: Pick<LayeredSettings, 'sourceSummaryFanout' | 'sourceSummaryMaxPoints' | 'sourcePointBaseChars' | 'sourcePointMaxMultiplier' | 'sourceChapterMinPoints' | 'sourceLongChapterChars'>
+  accepted: { ref: AcceptedRef; record: Omit<AcceptedRecord, 'acceptedDigest'>; output: string }[]
+}
 export interface VersionProvenance {
   schema: 'llmwiki-provenance-v1'; version: string; manifestChecksum: string; revocationGeneration: number
   artifacts: Record<string, ProductionArtifact>; records: Record<string, ProductionRecord>
+  derivationBases?: Record<string, string>
 }
 export interface NormalizedUsage { inputTokens: number; cacheReadTokens: number; cacheWriteTokens: number; outputTokens: number }
 export interface PriceSnapshot {
