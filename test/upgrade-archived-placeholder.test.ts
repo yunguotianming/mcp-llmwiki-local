@@ -11,6 +11,7 @@ import { readProvenance } from '../src/layered/models.js'
 import { pageObjectPath, putPage } from '../src/layered/objects.js'
 import { readUpgradeStatus, upgradeLibrary } from '../src/layered/upgrade.js'
 import { storageJson } from '../src/layered/vectors.js'
+import { topicClaimText } from '../src/layered/topic-metadata.js'
 import type { AcceptedRecord } from '../src/layered/schema.js'
 import type { ModelRuntime } from '../src/llm/client.js'
 import { finish, legacyFixture, request } from './b3-fixture.js'
@@ -55,6 +56,30 @@ function models(f: Awaited<ReturnType<typeof fixture>>, supported = false) {
       yield { type: 'finish' as const, reason: { kind: 'stop' as const } }
     }) }
   return { calls, client: (maxCalls: number) => createBuildModelClient(runtime, library, policy, { ...emptyRegistry(), upgrade: { maxCalls } }) }
+}
+
+async function sourcedFixture(clean = true, sourceIds = ['S-0001']) {
+  const f = await fixture(), title = '旧研究题目 [P1] <标题>', summary = '旧主题保留；当前来源已无可引用的原要点。'
+  const prose = (text: string) => (clean ? topicClaimText(text) : text).replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('[', '\\[').replaceAll(']', '\\]')
+  const sources = f.manifest.sources.filter(source => sourceIds.includes(source.source_id))
+  for (const source of sources) { source.metadata.title = source.source_id + ' 来源 [P2] <标题>'; source.tags = ['alpha', 'beta'] }
+  const created = '2026-11-14T04:33:40.550Z'
+  f.manifest.page_created = { [archivedPage]: created }
+  f.manifest.topics = { format_version: 1, version: f.manifest.version, next_topic_number: 13, embedding: { url: '', model: '' }, vectors: {},
+    topics: [{ id: archivedId, path: archivedPage, parent_id: null, title: prose(title), summary, sources: sourceIds, point_ids: [],
+      centroid: [], revisions: 0, aliases: [], models: [], archived: true, page_status: 'ready' }] }
+  f.manifest.deps!.pages[archivedPage] = { sources: sourceIds, points: [], children: [], revisions: 0, models: [] }
+  const header = { id: archivedId, page_type: 'topic', aliases: [], title, source_type: '综合', credibility: 'unknown',
+    source_date: '2026-11-13/2026-11-13', sources: sourceIds, models: [], archived: true, updated: '2026-11-13',
+    generation_hash: hash('程序生成'), input_fingerprint: hash(archivedId), generation_input_fingerprint: hash('原生成输入'), type: 'topic', created, tags: ['alpha', 'beta'] }
+  const navigation = sources.map(source => `- [${source.source_id} ${prose(source.metadata.title)}](../../../../sources/${source.source_id}.md) — `).join('\n')
+  const content = `---\n${stringify(header).trimEnd()}\n---\n\n# ${prose(title)}\n\n范围：${summary}\n\n## 共识\n\n${sources.length === 1 ? '单来源，未形成共识。' : '未提取'}\n\n## 分歧\n\n未提取\n\n## 适用条件\n\n未提取\n\n## 来源导航\n\n${navigation}\n`
+  return saveSourcedFixture(f, content)
+}
+async function saveSourcedFixture(f: Awaited<ReturnType<typeof fixture>>, content: string) {
+  f.manifest.pages![archivedPage] = await putPage(f.root, content)
+  await writeJson(f.root, 'versions/v000001.json', { manifest: f.manifest, checksum: hash(storageJson(f.manifest)) })
+  return { ...f, content, object: pageObjectPath(f.manifest.pages![archivedPage]!), versionBytes: await readFile(path.join(f.root, 'versions/v000001.json')) }
 }
 
 it('标准无来源归档占位零模型升级，独立本地排除不伪造接受或改写旧页', async () => {
@@ -110,4 +135,49 @@ it('正文虽同模板但仍有来源依赖的归档页继续核对，不依赖�
   await expect(upgradeLibrary(f.root, m.client(4).upgradeOptions)).rejects.toThrow('实质主题必须进入真实核对路径')
   expect(m.calls).toEqual([archivedId]); expect((await readUpgradeStatus(f.root))!.reviewExclusions).toBeUndefined()
   expect(await readFile(path.join(f.root, 'versions/v000001.json'))).toEqual(f.versionBytes)
+})
+
+it('有来源v2完整占位恢复保留原五次费用与升级身份，不新增请求或接受', async () => {
+  const f = await sourcedFixture(), m = models(f)
+  await expect(upgradeLibrary(f.root, { estimateReview: async () => ({ calls: 1, inputTokens: 10, outputTokens: 20, maxInputTokens: 10, maxOutputTokens: 20 }),
+    onStatus: status => { if (status.reason === '升级开始或重入') throw new Error('保留五次失败现场') } })).rejects.toThrow('保留五次失败现场')
+  const before = (await readUpgradeStatus(f.root))!, ledger = createExecutionLedger(f.root)
+  for (let sequence = 1; sequence <= 5; sequence++) await finish(ledger, request('t:' + hash('历史失败核对').slice(7), sequence, '原模型', before.id, 'topicReview'), false)
+  const costs = await readRunCosts(f.root, before.id), done = (await upgradeLibrary(f.root, m.client(5).upgradeOptions))!
+  expect(done).toMatchObject({ id: before.id, backupPath: before.backupPath, inputDigest: before.inputDigest, status: 'complete', actual: { calls: 5, tokens: 85 }, accepted: {} })
+  expect(done.reviewExclusions![f.object]).toMatchObject({ rule: 'archived-topic-placeholder-v2', objectDigest: f.manifest.pages![archivedPage], pagePaths: [archivedPage] })
+  expect(done.reviewExclusions![f.object]!.dependencyDigests).toHaveLength(1)
+  expect(await readRunCosts(f.root, before.id)).toEqual(costs); expect(m.calls).toEqual([])
+  expect(await readFile(path.join(f.root, 'versions/v000001.json'))).toEqual(f.versionBytes)
+  expect(await readFile(path.join(f.root, f.object), 'utf8')).toBe(f.content)
+  expect(await readdir(path.join(f.root, 'work/accepted/tasks')).catch(error => error.code === 'ENOENT' ? [] : Promise.reject(error))).toEqual([])
+})
+
+it('有来源v2兼容旧版原样转义标题和来源导航，精确保留嵌套相对路径', async () => {
+  const f = await sourcedFixture(false), m = models(f), done = (await upgradeLibrary(f.root, m.client(0).upgradeOptions))!
+  expect(done).toMatchObject({ status: 'complete', actual: { calls: 0 }, accepted: {} })
+  expect(done.reviewExclusions![f.object]!.rule).toBe('archived-topic-placeholder-v2'); expect(m.calls).toEqual([])
+  expect(await readFile(path.join(f.root, f.object), 'utf8')).toBe(f.content)
+})
+
+it('有来源v2多来源完整占位使用未提取共识并逐项核对导航', async () => {
+  const f = await sourcedFixture(true, ['S-0001', 'S-0002']), m = models(f), done = (await upgradeLibrary(f.root, m.client(0).upgradeOptions))!
+  expect(done).toMatchObject({ status: 'complete', actual: { calls: 0 }, accepted: {} })
+  expect(done.reviewExclusions![f.object]!.rule).toBe('archived-topic-placeholder-v2'); expect(m.calls).toEqual([])
+  expect(f.content).toContain('## 共识\n\n未提取')
+})
+
+it('有来源v2占位导航路径不符必须继续真实核对', async () => {
+  const initial = await sourcedFixture(), f = await saveSourcedFixture(initial, initial.content.replace('../../../../sources/S-0001.md', '../sources/S-0001.md')), m = models(f)
+  await expect(upgradeLibrary(f.root, m.client(4).upgradeOptions)).rejects.toThrow('实质主题必须进入真实核对路径')
+  expect(m.calls).toEqual([archivedId]); expect((await readUpgradeStatus(f.root))!.reviewExclusions).toBeUndefined()
+  expect(await readFile(path.join(f.root, 'versions/v000001.json'))).toEqual(f.versionBytes)
+})
+
+it('有来源v2空成员但权威主题保留模型时必须继续真实核对', async () => {
+  const initial = await sourcedFixture(); initial.manifest.topics!.topics[0]!.models = [{ provider: '历史', model: '真实综合' }]
+  const f = await saveSourcedFixture(initial, initial.content), m = models(f)
+  await expect(upgradeLibrary(f.root, m.client(4).upgradeOptions)).rejects.toThrow('实质主题必须进入真实核对路径')
+  expect(m.calls).toEqual([archivedId]); expect((await readUpgradeStatus(f.root))!.reviewExclusions).toBeUndefined()
+  expect(await readFile(path.join(f.root, f.object), 'utf8')).toBe(f.content)
 })

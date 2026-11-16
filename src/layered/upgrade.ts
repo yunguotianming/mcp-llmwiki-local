@@ -20,6 +20,8 @@ import { topicClaimText, topicEvidenceContext } from './topic-metadata.js'
 import { layeredSettings } from '../domain/config.js'
 import { topicBudget } from './input-budget.js'
 import { readRetentionRoots } from './retention.js'
+import { pageLink } from './hierarchy.js'
+import { mergedTags, prepareTags } from './tags.js'
 
 const checkpoint = 'work/upgrade-0.3.0.json'
 const backupMetadata = '.llmwiki-upgrade-backup.json'
@@ -34,7 +36,7 @@ export interface UpgradeStep {
 export interface UpgradeEstimate { calls: number; inputTokens: number; outputTokens: number }
 interface ReuseItem { path: string; digest: string; kind: 'extraction' | 'page' | 'vector' | 'checkpoint'; after: string }
 interface UpgradeReviewExclusion {
-  rule: 'archived-topic-placeholder-v1'; reason: string; objectDigest: string; dependencyDigests: string[]; pagePaths: string[]
+  rule: 'archived-topic-placeholder-v1' | 'archived-topic-placeholder-v2'; reason: string; objectDigest: string; dependencyDigests: string[]; pagePaths: string[]
 }
 export interface UpgradeStatus {
   id: string; status: 'prepared' | 'paused' | 'complete'; reason: string | null; backupPath: string
@@ -83,7 +85,51 @@ function topicOwners(versions: Awaited<ReturnType<typeof manifests>>, id: string
   return versions.flatMap(({ manifest }) => Object.entries(manifest.pages ?? {}).filter(([, digest]) => id === `objects/pages/${digest.slice(7)}.md`)
     .map(([page]) => ({ manifest, page, dependency: manifest.deps?.pages[page] })))
 }
-/** 只识别 renderTopic 的无来源归档占位；任意额外事实、导航或依赖均保留模型核对。 */
+/** 有来源占位须完整复算正文和发布元数据；来源版本、主题与标签依据共同绑定本地排除。 */
+function sourcedTopicReviewExclusion(owners: ReturnType<typeof topicOwners>, content: string, header: Record<string, unknown>, body: string): UpgradeReviewExclusion | undefined {
+  const rule = 'archived-topic-placeholder-v2', summary = '旧主题保留；当前来源已无可引用的原要点。'
+  const empty = (value: unknown) => Array.isArray(value) && value.length === 0
+  const same = (a: unknown, b: unknown) => canonicalJson(a) === canonicalJson(b)
+  const fields = ['id', 'page_type', 'aliases', 'title', 'source_type', 'credibility', 'source_date', 'sources', 'models', 'archived', 'updated',
+    'generation_hash', 'input_fingerprint', 'generation_input_fingerprint', 'type', 'created', 'tags']
+  if (Object.keys(header).some(key => !fields.includes(key)) || header.archived !== true || header.page_type !== 'topic'
+    || typeof header.title !== 'string' || !header.title || !empty(header.aliases) || !empty(header.models)
+    || header.source_type !== '综合' || header.type !== undefined && header.type !== 'topic'
+    || ['generation_hash', 'input_fingerprint', 'generation_input_fingerprint'].some(key => header[key] !== undefined && !/^sha256:[a-f0-9]{64}$/.test(String(header[key])))) return
+  const digests: string[] = []
+  for (const { manifest, page, dependency } of owners) {
+    const topics = manifest.topics?.topics.filter(topic => topic.path === page), topic = topics?.[0]
+    if (!page.startsWith('topics/') || !topic || topics!.length !== 1 || topic.id !== path.basename(page, '.md') || header.id !== topic.id
+      || !topic.archived || topic.point_ids.length || topic.direct_point_ids?.length || topic.models?.length || !empty(topic.aliases)
+      || topic.summary !== summary || topic.page_status !== undefined && topic.page_status !== 'ready'
+      || !dependency || dependency.points.length || dependency.children?.length || dependency.models?.length
+      || !dependency.sources.length || new Set(dependency.sources).size !== dependency.sources.length
+      || !same(header.sources, dependency.sources) || !same(topic.sources, dependency.sources)) return
+    const sources = manifest.sources.filter(source => dependency.sources.includes(source.source_id))
+    if (sources.length !== dependency.sources.length || dependency.sources.some(id => sources.filter(source => source.source_id === id).length !== 1)) return
+    const dates = sources.map(source => source.metadata.source_date).sort(), credibilities = new Set(sources.map(source => source.metadata.credibility))
+    const terms = Object.values(manifest.deps!.pages).flatMap(page => page.terms ?? [])
+    const tags = mergedTags(prepareTags(terms).frequent(sources, 8), manifest.tag_merges)
+    if (header.credibility !== (credibilities.size === 1 ? [...credibilities][0] : 'mixed')
+      || header.source_date !== `${dates[0]}/${dates.at(-1)}` || header.updated !== sources.map(source => source.updated_at).sort().at(-1)
+      || header.created !== undefined && header.created !== manifest.page_created?.[page]
+      || header.tags !== undefined && !same(header.tags, tags)) return
+    // 83b2384 前后必须各自使用同一版 prose 处理标题与全部来源导航，不能混搭。
+    if (![false, true].some(clean => {
+      const prose = (text: string) => (clean ? topicClaimText(text) : text).replace(/[\r\n]+/g, ' ').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('[', '\\[').replaceAll(']', '\\]')
+      const title = prose(header.title as string)
+      const navigation = sources.map(source => `- [${source.source_id} ${prose(source.metadata.title)}](${pageLink(page, `sources/${source.source_id}.md`)}) — `).join('\n')
+      return topic.title === title && body === `\n# ${title}\n\n范围：${summary}\n\n## 共识\n\n${sources.length === 1 ? '单来源，未形成共识。' : '未提取'}\n\n## 分歧\n\n未提取\n\n## 适用条件\n\n未提取\n\n## 来源导航\n\n${navigation}`.trimEnd()
+    })) return
+    // 历史 generation_* 只能校验格式；对象摘要绑定原值，不宣称复算过旧配置。
+    digests.push(protocolDigest({ rule, page, dependency, topic, sources, created: manifest.page_created?.[page] ?? null,
+      terms: terms.map(term => ({ name: term.name, aliases: term.aliases })), tagMerges: manifest.tag_merges ?? null }))
+  }
+  if (new Set(digests).size !== 1) return
+  return { rule, reason: '无成员、子页或模型，正文及来源导航完全匹配程序生成的归档保留占位，来源快照与发布元数据一致；不作研究事实核对。',
+    objectDigest: hash(content), dependencyDigests: sortedUnique(digests), pagePaths: sortedUnique(owners.map(owner => owner.page)) }
+}
+/** 只识别 renderTopic 的完整归档占位；任意额外事实、导航或依赖均保留模型核对。 */
 async function topicReviewExclusion(root: string, versions: Awaited<ReturnType<typeof manifests>>, id: string): Promise<UpgradeReviewExclusion | undefined> {
   const owners = topicOwners(versions, id), content = await readFile(await safePath(root, id), 'utf8')
   if (!owners.length || hash(content) !== 'sha256:' + path.basename(id, '.md')) return
@@ -92,6 +138,7 @@ async function topicReviewExclusion(root: string, versions: Awaited<ReturnType<t
   let header: Record<string, unknown>
   try { header = parse(match[1]!) } catch { return }
   if (!header || typeof header !== 'object' || Array.isArray(header)) return
+  if (Array.isArray(header.sources) && header.sources.length) return sourcedTopicReviewExclusion(owners, content, header, match[2]!.replaceAll('\r\n', '\n').trimEnd())
   const empty = (value: unknown) => Array.isArray(value) && value.length === 0
   const fields = ['id', 'page_type', 'aliases', 'title', 'source_type', 'credibility', 'source_date', 'sources', 'models', 'archived', 'updated',
     'generation_hash', 'input_fingerprint', 'generation_input_fingerprint', 'type', 'created', 'tags']
