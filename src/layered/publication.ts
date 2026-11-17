@@ -30,7 +30,7 @@ import { pageLink, topicDepth, topicPath } from './hierarchy.js'
 import { validSourceId } from './revocations.js'
 import { validateSiyuanSnapshot } from './siyuan.js'
 import { prepareTags, mergedTags, personalTag, tagStatus } from './tags.js'
-import { publicationCreated, publicationMetadata } from './frontmatter.js'
+import { publicationCreated, publicationMetadata, synchronizeTopicSources } from './frontmatter.js'
 import { isProductionFormat, publicationProvenance, readProvenance, writeProvenance, readProtocol, protocolError, sidecarPath } from './models.js'
 import { readVersionCosts, writeVersionCosts } from './costs.js'
 import { storageJson } from './vectors.js'
@@ -431,6 +431,11 @@ export async function publishLibrary(root: string, pending: PendingBuild, signal
     dependency.sources = [...new Set(dependency.points.map(point => point.point_id.split(':')[0]!))].sort()
   }
   indexDependencies(deps)
+  // 子页来源可能已收缩；继承的父页也须与最终依赖一致，不能直接跳过页头规范化。
+  for (const file of files) if (inherited.has(file[0]) && file[0].startsWith('topics/') && deps.pages[file[0]]?.children?.length) {
+    const content = synchronizeTopicSources(file[1], deps.pages[file[0]]!.sources)
+    if (content !== file[1]) { file[1] = content; inherited.set(file[0], await putPage(root, content)) }
+  }
   // 发布树中的主题必须已有可发布页面；未完成或残留的无页主题保留检查点并暂停，不发布半成品。
   const unpublished = (pending.topics?.state.topics ?? []).filter(topic => !deps.pages[topic.path])
   if (unpublished.length) throw Object.assign(new Error('主题尚未形成可发布页面，保留检查点并暂停：' + unpublished.map(topic => topic.id).join('、')),

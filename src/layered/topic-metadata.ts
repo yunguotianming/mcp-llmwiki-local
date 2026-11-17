@@ -117,8 +117,9 @@ export function synchronizeTopicMetadata(content: string, members: Point[], alia
   const header = parse(match[1]!), sources = [...new Set(members.flatMap(point => point.evidence.map(item => item.source_id)))].sort()
   header.title = /^# (.*)$/m.exec(content)?.[1] ?? header.title
   header.aliases = aliases
-  header.sources = sources
   if (!content.includes('## 子主题导航')) {
+    // 叶页按剩余直引收缩；父页还包含子主题来源，由编排层按完整依赖维护。
+    header.sources = sources
     content = content.replace(/(## 来源导航\n)([\s\S]*?)(?=\n## |$)/, (_all, heading: string, body: string) => heading + '\n' + body.split('\n')
       .flatMap(line => {
         const source = sources.find(id => line.includes(`sources/${id}.md)`) || line.startsWith('- 来源版本：' + id + '@'))

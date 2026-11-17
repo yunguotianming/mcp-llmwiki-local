@@ -3,6 +3,15 @@ import { mergedTags, prepareTags } from './tags.js'
 import type { PendingBuild, SourceEntry } from './schema.js'
 
 const frontmatter = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/
+// 继承父页只刷新派生来源；正文、生成指纹及其余页头均沿用原成果。
+export function synchronizeTopicSources(content: string, sources: string[]): string {
+  const match = frontmatter.exec(content)
+  if (!match) return content
+  const header = parse(match[1]!) as Record<string, unknown>
+  if (JSON.stringify(header.sources) === JSON.stringify(sources)) return content
+  return content.replace(frontmatter, () => `---\n${stringify({ ...header, sources }).trimEnd()}\n---\n`)
+}
+
 export function validTimestamp(value: unknown): value is string {
   return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value)
     && Number.isFinite(Date.parse(value))

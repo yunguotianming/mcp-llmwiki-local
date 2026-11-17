@@ -33,6 +33,7 @@ import { childrenOf, effectiveChildren, logicalSource, logicalSourceCount, merge
 import { clusteringVersion, retainUnassignedCandidates, updateTopicCandidates } from './clustering.js'
 import { emptyStage } from './costs.js'
 import { mergeModels, modelUsage } from './models.js'
+import { synchronizeTopicSources } from './frontmatter.js'
 import type { BuildLayeredOptions, Dependencies, PageDependencies, PendingBuild, Point, SnapshotManifest, SourceEntry, Topic, TopicBuild, TopicState } from './schema.js'
 import { activeAcceptedRefs, businessValue, recoveryBudget, recoveryContext, recoverAcceptedRef, rejectAcceptedResponse, verifyAcceptedRefs } from './accepted.js'
 import type { AcceptedRef, RecoveryPending } from './accepted.js'
@@ -452,6 +453,7 @@ export async function prepareTopics(root: string, pending: PendingBuild, committ
       const members = topic.point_ids.map(id => points.get(id)!)
       if (restored.value.review?.metadata_members) content = synchronizeTopicMetadata(content, citedTopicPoints(content, members, anchors), topic.aliases)
       if (topicReviewFingerprint(content, members, settings.contradictionReview, contexts) !== scope.review_inputs[topic.id]) throw unavailable()
+      if (effectiveChildren(saved.state, topic).length) content = synchronizeTopicSources(content, topic.sources)
       content = updateTopicHeader(content, topic.models ?? [], generationHash, topicInputFingerprint(topic, saved.state, pointHashes))
       saved.pages[topic.path] = { content, input_fingerprint: topicInputFingerprint(topic, saved.state, pointHashes), dependencies: {
         sources: [...topic.sources], points: members.map(point => ({ point_id: point.point_id, text_hash: point.text_hash })),
@@ -632,10 +634,15 @@ export async function prepareTopics(root: string, pending: PendingBuild, committ
       const digest = (page as typeof page & { content_id?: string }).content_id ?? committed.pages?.[topic.path]
       if (digest && (hash(page.content) !== digest || await readPageObject(root, digest) !== page.content)) return false
       const header = topicHeader(page.content), children = effectiveChildren(build.state, topic), members = topic.point_ids.map(id => points.get(id)!)
+      // 旧核对将父页来源误缩为正文直引；原对象完整且其余依赖通过后，只恢复派生 sources。
+      const restoreSources = children.length > 0 && members.every(Boolean)
+        && JSON.stringify(header.sources) !== JSON.stringify(page.dependencies.sources)
+        && JSON.stringify(header.sources) === JSON.stringify([...new Set(citedTopicPoints(page.content, members, anchors)
+          .flatMap(point => point.evidence.map(evidence => evidence.source_id)))].sort())
       if (header.id !== topic.id || header.page_type !== 'topic' || header.source_type !== '综合' || !members.every(Boolean)
         || typeof header.generation_hash !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(header.generation_hash)
         || typeof header.input_fingerprint !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(header.input_fingerprint)
-        || JSON.stringify(header.sources) !== JSON.stringify(page.dependencies.sources)
+        || !restoreSources && JSON.stringify(header.sources) !== JSON.stringify(page.dependencies.sources)
         || JSON.stringify([...page.dependencies.sources].sort()) !== JSON.stringify([...topic.sources].sort())
         || JSON.stringify(page.dependencies.points.map(point => point.point_id).sort()) !== JSON.stringify([...(children.length ? topic.direct_point_ids ?? [] : topic.point_ids)].sort())
         || page.dependencies.points.some(point => points.get(point.point_id)?.text_hash !== point.text_hash)
@@ -656,6 +663,11 @@ export async function prepareTopics(root: string, pending: PendingBuild, committ
           if (children.length ? children.filter(child => line.includes(`](${pageLink(topic.path, child.path)})`)).length < 2
             : new Set(citedTopicPoints(line, members, anchors).map(point => logicalSource(build.state, point.point_id))).size < 2) return false
         }
+      }
+      if (restoreSources) {
+        page.content = synchronizeTopicSources(page.content, page.dependencies.sources)
+        delete (page as typeof page & { content_id?: string }).content_id
+        restoredPages = true
       }
       return true
     } catch (error) {
@@ -845,6 +857,7 @@ export async function prepareTopics(root: string, pending: PendingBuild, committ
       content = synchronizeTopicMetadata(content, cited, topic.aliases)
     }
     const preserved = preservedGeneration.get(topic.path)
+    if (childrenOf(build.state, topic).length) content = synchronizeTopicSources(content, dependencies.sources)
     content = normalizeCitations(updateTopicHeader(content, topic.models, preserved?.generation ?? generationHash, preserved?.input ?? pageInput(topic)), /\[(?:S-\d+|\d{14}-[a-z0-9]{7})#/.test(content))
     dependencies.claims = topicPageClaims(topic, content, build.state, points, anchors)
     build.pages[topic.path] = { content, dependencies, input_fingerprint: preserved?.input ?? pageInput(topic), ...(preserved ? { generation_input_fingerprint: pageInput(topic) } : {}) }

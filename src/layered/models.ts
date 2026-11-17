@@ -5,6 +5,7 @@ import { atomicWrite, hash, readVerifiedObject } from './files.js'
 import { safePath } from '../storage/paths.js'
 import type { AcceptedRecord, AcceptedRef, Extraction, PendingBuild, PendingTopicReview, ProductionArtifact, ProductionRecord, SnapshotManifest, SourceRef, VersionProvenance } from './schema.js'
 import { storageJson } from './vectors.js'
+import { synchronizeTopicSources } from './frontmatter.js'
 
 export type { ModelRef } from '../domain/config.js'
 
@@ -428,6 +429,18 @@ export async function publicationProvenance(root: string, pending: PendingBuild,
       .flatMap(child => pending.manifest.deps?.pages[child.page]?.acceptedRef ?? []) : []
     const refs = sortedUnique([...(ref ? [ref] : []), ...sectionRefs])
     const inherited = previous && Object.entries(previous.artifacts).find(([, prior]) => prior.kind === artifact.kind && prior.objectDigest === artifact.objectDigest && prior.pagePath === artifact.pagePath)
+    let normalizedParent: [string, ProductionArtifact] | undefined
+    if (!inherited && previous && base && artifact.kind === 'page' && artifact.pagePath?.startsWith('topics/')
+      && base.deps?.pages[artifact.pagePath]?.children?.length && pending.manifest.deps?.pages[artifact.pagePath]?.children?.length) {
+      const page = artifact.pagePath, prior = Object.entries(previous.artifacts).find(([, item]) => item.kind === 'page'
+        && item.pagePath === page && item.objectDigest === base.pages?.[page])
+      // 只承接可由同一来源快照确定性重建的 sources；其他页头或正文变化仍须新接受。
+      if (prior && prior[1].sourceRefs.every(ref => pending.manifest.sources.some(source => source.source_id === ref.sourceId && source.source_version === ref.sourceVersion))) {
+        const { versionPage } = await import('./objects.js')
+        if (synchronizeTopicSources(await versionPage(root, base, page), pending.manifest.deps!.pages[page]!.sources)
+          === await versionPage(root, pending.manifest, page)) normalizedParent = prior
+      }
+    }
     const inheritAuthor = (parent: ProductionArtifact) => {
       artifact.status = parent.status; artifact.productionIds = [...parent.productionIds]
       if (parent.reason) artifact.reason = parent.reason
@@ -481,7 +494,7 @@ export async function publicationProvenance(root: string, pending: PendingBuild,
       artifact.inheritedFrom = { version: value.version, artifactId: artifactId(derivedExtraction), productionIds: [...derivedExtraction.productionIds] }
       continue
     }
-    const sameAcceptance = refs.length && refs.every(ref => inherited?.[1].productionIds.some(id => previous!.records[id]?.taskId === ref.taskId))
+    const sameAcceptance = refs.length && refs.every(ref => (inherited ?? normalizedParent)?.[1].productionIds.some(id => previous!.records[id]?.taskId === ref.taskId))
     if (refs.length && !sameAcceptance) {
       for (const accepted of refs) await attach(artifact, accepted)
       const contribution = inherited ?? (previous && Object.entries(previous.artifacts).find(([, prior]) => prior.kind === artifact.kind && (artifact.kind === 'page'
@@ -501,6 +514,9 @@ export async function publicationProvenance(root: string, pending: PendingBuild,
       if (!inherited[1].reason) delete artifact.reason
       if (!inherited[1].legacyEvidence) delete artifact.legacyEvidence
       Object.assign(value.records, previous!.records)
+    } else if (normalizedParent) {
+      inheritAuthor(normalizedParent[1])
+      artifact.inheritedFrom = { version: previous!.version, artifactId: normalizedParent[0], productionIds: [...normalizedParent[1].productionIds] }
     } else if (artifact.status !== 'local-derived') {
       // 本地来源页可以从原样复用的提取结果派生，但不能猜新主题的作者。
       const oldExtraction = source && previous && Object.values(previous.artifacts).find(a => a.kind === 'extraction' && a.objectPath === source.extract.path)
