@@ -19,8 +19,10 @@ async function inventory(root: string) {
     return [path.relative(root, file), hash(await readFile(file))]
   })))
 }
-async function failedPublication() {
-  const f = await built('topics'), target = f.manifest.topics!.topics[0]!
+async function failedPublication(nested = false) {
+  const f = await built('topics'), parent = f.manifest.topics!.topics[0]!
+  const target = nested ? { ...structuredClone(parent), id: parent.id + '-01', path: parent.path.replace(/\.md$/, '/' + parent.id + '-01.md'), parent_id: parent.id } : parent
+  if (nested) { parent.direct_point_ids = []; f.manifest.topics!.topics.push(target) }
   f.manifest.topic_gaps = [{ topic_id: target.id, point_ids: target.point_ids, message: 'Connection error.' }]
   delete f.manifest.pages![target.path]
   await saveManifest(f.root, f.manifest)
@@ -31,12 +33,13 @@ async function failedPublication() {
   const pending = await hydratedState<PendingBuild>(f.root, 'work/pending.json')
   expect(pending.topic_scope!.completed).toContain(target.id)
   expect(pending.topics!.gaps).toEqual([])
+  if (nested) expect(pending.topic_scope!.completed).toContain(parent.id)
   f.call.mockClear()
   return { ...f, target, pending, options }
 }
 
-it('同范围主题已完成而发布中断后，完整SDK零模型恢复到预览并保原run', async () => {
-  const f = await failedPublication(), before = structuredClone(f.pending)
+it('目标与必要父链已完成而发布中断后，完整SDK零模型恢复到预览并保原run', async () => {
+  const f = await failedPublication(true), before = structuredClone(f.pending)
   const result = await buildLayeredLibrary(f.options)
   expect(result).toMatchObject({ unchanged: false, modelCalls: 0 })
   const preview = await hydratedState<{ version: string }>(f.root, 'work/preview.json'), pending = await hydratedState<PendingBuild>(f.root, 'work/pending.json')

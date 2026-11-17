@@ -34,8 +34,8 @@ import { clusteringVersion, retainUnassignedCandidates, updateTopicCandidates } 
 import { emptyStage } from './costs.js'
 import { mergeModels, modelUsage } from './models.js'
 import type { BuildLayeredOptions, Dependencies, PageDependencies, PendingBuild, Point, SnapshotManifest, SourceEntry, Topic, TopicBuild, TopicState } from './schema.js'
-import { activeAcceptedRefs, businessValue, recoveryBudget, recoveryContext, rejectAcceptedResponse, verifyAcceptedRefs } from './accepted.js'
-import type { AcceptedRef } from './accepted.js'
+import { activeAcceptedRefs, businessValue, recoveryBudget, recoveryContext, recoverAcceptedRef, rejectAcceptedResponse, verifyAcceptedRefs } from './accepted.js'
+import type { AcceptedRef, RecoveryPending } from './accepted.js'
 
 type AcceptedDependencies = PageDependencies & { acceptedRef?: AcceptedRef }
 type RecoverableTopicBuild = TopicBuild & {
@@ -147,6 +147,18 @@ export function topicHeader(page: string): Record<string, unknown> {
   if (!match) throw new Error('主题页缺少 YAML 头。')
   return parse(match[1]!) as Record<string, unknown>
 }
+function topicPageClaims(topic: Topic, content: string, state: TopicState, points: Map<string, Point>, anchors: Map<string, string[]>): NonNullable<PageDependencies['claims']> {
+  return topicSentences(content).filter(sentence => !sentence.navigation && !/^(?:#|范围：)/.test(sentence.text)).map(sentence => {
+    // 同一结构主张中的多句共用句组末尾引用，保存逐句绑定时沿用该句组的证据。
+    const end = content.indexOf('\n', sentence.end)
+    const bound = content.slice(sentence.start, end < 0 ? content.length : end)
+    return {
+      text: topicClaimText(sentence.text.replace(/\[[^\]]*\]\([^)]*\)/g, '').replace(/^[-*+]\s+/, '')),
+      point_ids: citedTopicPoints(bound, topic.point_ids.map(id => points.get(id)!).filter(Boolean), anchors).map(point => point.point_id),
+      child_ids: effectiveChildren(state, topic).filter(child => bound.includes(`](${pageLink(topic.path, child.path)})`)).map(child => child.id),
+    }
+  })
+}
 function updateTopicHeader(content: string, models: NonNullable<Topic['models']>, generationHash: string, inputFingerprint: string): string {
   const header = topicHeader(content), names = mergeModels(models).map(model => `${model.provider}/${model.model}`)
   if (JSON.stringify(header.models) === JSON.stringify(names) && header.generation_hash === generationHash && header.input_fingerprint === inputFingerprint) return content
@@ -163,7 +175,7 @@ function renderTopic(topic: Topic, output: TopicOutput, points: Map<string, Poin
   for (const [key, title] of [['consensus', '共识'], ['differences', '分歧'], ['conditions', '适用条件']] as const) {
     const content = output[key].map(item => `- ${prose(item.text)} ${[...new Set(item.point_ids)].flatMap(id => {
       const point = points.get(id)!
-      return point.evidence.map(evidence => `[${evidence.source_id}@${evidence.source_version}#${evidence.locator}](${pageLink(topic.path, `sources/${evidence.source_id}.md`)}#^${anchors.get(id)![0]})`)
+      return point.evidence.map((evidence, index) => `[${evidence.source_id}@${evidence.source_version}#${evidence.locator}](${pageLink(topic.path, `sources/${evidence.source_id}.md`)}#^${anchors.get(id)![index]})`)
     }).join('；')}`)
     blocks.push(`## ${title}\n\n${content.join('\n') || (key === 'consensus' && sources.length === 1 ? '单来源，未形成共识。' : '未提取')}`)
   }
@@ -173,17 +185,31 @@ function renderTopic(topic: Topic, output: TopicOutput, points: Map<string, Poin
   }).join('\n'))
   return blocks.join('\n\n') + '\n'
 }
+// 兼容旧页把同一要点的多条证据都写成首锚点；锚点须唯一定位原成员，来源、版本和定位须仍匹配该成员证据。
+function restoreTopicCitationAnchors(content: string, members: Point[], anchors: Map<string, string[]>): string {
+  const byAnchor = new Map(members.flatMap(point => (anchors.get(point.point_id) ?? []).map(anchor => [point.point_id.split(':')[0] + '#^' + anchor, point] as const)))
+  return content.replace(/\[([^\]@]+)@([^\]#]+)#([^\]]+)\]\(((?:\.\.\/)+)sources\/([^/]+)\.md#(\^[^\s)]+)\)/g,
+    (citation, source: string, version: string, locator: string, prefix: string, target: string, anchor: string) => {
+      const point = source === target ? byAnchor.get(source + '#' + anchor) : undefined
+      if (!point || anchor !== '^' + anchors.get(point.point_id)![0]) return citation
+      const matching = point.evidence.map((evidence, index) => ({ evidence, index })).filter(({ evidence }) => evidence.source_id === source && evidence.source_version === version && evidence.locator === locator)
+      if (!matching.length) return citation
+      return `[${source}@${version}#${locator}](${prefix}sources/${source}.md#^${anchors.get(point.point_id)![matching[0]!.index]})`
+    })
+}
 function rebindCitations(content: string, points: Map<string, Point>, previous: Map<string, Point>, ids: string[], anchors: Map<string, string[]>, previousIds: Map<string, string>): string {
   return expandCitationVersions(content).replace(/^- 来源版本：[^\n]+\n?/gm, '').replace(/\[(?:S-\d{4,}|\d{14}-[a-z0-9]{7})(?:@[^\]#]+)?#(L\d+-L\d+|block:\d{14}-[a-z0-9]{7})\]\(((?:\.\.\/)+)sources\/(?:S-\d{4,}|\d{14}-[a-z0-9]{7})\.md#([^\s)]+)\)/g, (citation, locator: string, prefix: string, id: string) => {
     const source = /sources\/([^/]+)\.md#/.exec(citation)![1]!
+    const originalAnchor = id
     id = previousIds.get(source + '#' + id) ?? id
     const point = points.get(id), old = previous.get(id) ?? point
     if (!point || !old || !ids.includes(id)) throw new Error('主题引文无法重绑到当前成员。')
+    const anchored = point.evidence[(anchors.get(id) ?? []).findIndex(anchor => '^' + anchor === originalAnchor)]
     const evidence = citation.startsWith(`[${source}@${point.source_version}#${locator}]`)
-      ? point.evidence.find(item => item.locator === locator)
+      ? anchored?.locator === locator ? anchored : point.evidence.find(item => item.locator === locator)
       : point.evidence[old.evidence.findIndex(item => item.locator === locator)]
     if (!evidence) throw new Error('主题引文无法重绑到当前要点。')
-    return `[${evidence.source_id}@${evidence.source_version}#${evidence.locator}](${prefix}sources/${evidence.source_id}.md#^${anchors.get(id)![0]})`
+    return `[${evidence.source_id}@${evidence.source_version}#${evidence.locator}](${prefix}sources/${evidence.source_id}.md#^${anchors.get(id)![point.evidence.indexOf(evidence)]})`
   }).replace(/(- \[(S-\d{4,}|\d{14}-[a-z0-9]{7}) [^\n]+\]\((?:\.\.\/)+sources\/(?:S-\d{4,}|\d{14}-[a-z0-9]{7})\.md\) — )[^\n]*/g, (line, prefix: string, id: string) =>
     ids.some(pointId => pointId.startsWith(id + ':') && previous.has(pointId))
       ? prefix + [...new Set(ids.filter(pointId => pointId.startsWith(id + ':')).map(pointId => points.get(pointId)!.locator))].join('、') : line)
@@ -269,8 +295,11 @@ export async function prepareTopics(root: string, pending: PendingBuild, committ
     await hydrateVectors(root, pending.topics!.state)
     await writeJson(root, 'work/pending.json', pending)
   }
-  if (requestedTopics && !requestedTopics.length) return { changed: restoredEmbedding, modelCalls: 0 }
+  let restoredPages = false
   const scope = pending.topic_scope, scopeIds = new Set(scope?.targets)
+  const continuing = scope?.targets.length && options.retryTopics?.topicIds?.length === scope.targets.length
+    && options.retryTopics.topicIds.every(id => scope.targets.includes(id)) && !options.retryTopics.reasons?.length
+  if (requestedTopics && !requestedTopics.length && !continuing) return { changed: restoredEmbedding, modelCalls: 0 }
   if (scope) {
     const identities = recoverTopicIdentities(pending.manifest, pending.topics)
     for (const id of [...scopeIds]) {
@@ -401,6 +430,40 @@ export async function prepareTopics(root: string, pending: PendingBuild, committ
   await verifyAcceptedRefs(saved, true)
   if (scope && saved?.state.topics.some(topic => inScope(topic.id) && topic.point_ids.some(id => !points.has(id))))
     throw Object.assign(new Error('定向恢复的原成员已不存在或未通过来源核对；请先完成普通增量，再重新选择主题。'), { stagePause: true, stage: 'topic', code: 'TOPIC_SCOPE_MEMBERS_CHANGED' })
+  // 完成标记只证明本次尝试已结束；旧版误删页面后，从原接受结果恢复，不能重新生成或授时。
+  if (scope && saved) {
+    const missing = saved.state.topics.filter(topic => scope.targets.includes(topic.id) && scope.completed.includes(topic.id)
+      && !saved.pages[topic.path] && scope.review_inputs[topic.id])
+    const anchors = evidenceBlockIds(points.values())
+    for (const topic of missing.sort((a, b) => topicDepth(b) - topicDepth(a))) {
+      const reviewRef = (pending as RecoveryPending).acceptedRefs?.[`topic:${topic.id}:review`], generationRef = (pending as RecoveryPending).acceptedRefs?.[`topic:${topic.id}:generate`]
+      const unavailable = () => Object.assign(new Error('已完成主题缺少可恢复的核对成果，保留检查点：' + topic.id), { stagePause: true, stage: 'topic', code: 'TOPIC_COMPLETED_PAGE_MISSING' })
+      if (!reviewRef || !generationRef || !saved.point_hashes || topic.point_ids.some(id => saved.point_hashes![id] !== (saved.point_hash_version === 2 ? pointHashes : legacyHashes)[id])) throw unavailable()
+      const restored = await recoverAcceptedRef<Awaited<ReturnType<typeof reviewTopicContent>>>(reviewRef,
+        identity => identity.scope.unitId === `topic:${topic.id}:review` && identity.stage === 'topicReview'
+          && identity.validatorVersion === topicReviewVersion && identity.semanticVersion === (options.promptVersion ?? 'layered-default-v1')
+          && identity.scope.sourceRefs.length === topic.sources.length && identity.scope.sourceRefs.every(ref => pending.manifest.sources.some(source => source.source_id === ref.sourceId && source.source_version === ref.sourceVersion && topic.sources.includes(ref.sourceId))),
+        value => Boolean(value?.content && value.review?.fingerprint && !value.failure && !value.incomplete))
+      const generation = await recoverAcceptedRef<{ calls: PageDependencies['calls'] }>(generationRef,
+        identity => identity.scope.unitId === `topic:${topic.id}:generate` && identity.stage === 'topic',
+        value => Boolean(value && Array.isArray(value.calls)))
+      if (!restored.record.dependencies.some(dependency => dependency.taskId === generationRef.taskId && dependency.acceptedDigest === generationRef.digest)) throw unavailable()
+      let content = restored.value.content
+      const members = topic.point_ids.map(id => points.get(id)!)
+      if (restored.value.review?.metadata_members) content = synchronizeTopicMetadata(content, citedTopicPoints(content, members, anchors), topic.aliases)
+      if (topicReviewFingerprint(content, members, settings.contradictionReview, contexts) !== scope.review_inputs[topic.id]) throw unavailable()
+      content = updateTopicHeader(content, topic.models ?? [], generationHash, topicInputFingerprint(topic, saved.state, pointHashes))
+      saved.pages[topic.path] = { content, input_fingerprint: topicInputFingerprint(topic, saved.state, pointHashes), dependencies: {
+        sources: [...topic.sources], points: members.map(point => ({ point_id: point.point_id, text_hash: point.text_hash })),
+        children: effectiveChildren(saved.state, topic).map(child => ({ page: child.path, version: '' })),
+        revisions: topic.revisions, models: topic.models ?? [], acceptedRef: generationRef,
+        claims: topicPageClaims(topic, content, saved.state, points, anchors), ...(generation.value.calls ? { calls: generation.value.calls } : {}),
+        review: { ...restored.value.review!, acceptedRef: reviewRef },
+      } }
+      topic.page_status = 'ready'
+      refreshTree(saved.state)
+    }
+  }
   const comparisonHashes = saved?.point_hash_version === 2 ? pointHashes : legacyHashes
   const legacyParentInputs = saved ? restoreTopicInputs(saved, pointHashes, legacyHashes) : new Map<string, string>()
   const legacy = saved && !saved.configuration_fingerprint && !saved.point_hashes
@@ -577,7 +640,7 @@ export async function prepareTopics(root: string, pending: PendingBuild, committ
         || JSON.stringify(page.dependencies.points.map(point => point.point_id).sort()) !== JSON.stringify([...(children.length ? topic.direct_point_ids ?? [] : topic.point_ids)].sort())
         || page.dependencies.points.some(point => points.get(point.point_id)?.text_hash !== point.text_hash)
         || JSON.stringify((page.dependencies.children ?? []).map(child => child.page).sort()) !== JSON.stringify(children.map(child => child.path).sort())) return false
-      const content = restoreCitationVersions(page.content, members, anchors)
+      const content = restoreTopicCitationAnchors(restoreCitationVersions(page.content, members, anchors), members, anchors)
       const citations = [...content.matchAll(/\[((?:S-\d+|\d{14}-[a-z0-9]{7}))@([^\]#]+)#(L\d+-L\d+|block:\d{14}-[a-z0-9]{7})\]\((?:\.\.\/)+sources\/([^/]+)\.md#(\^[^\s)]+)\)/g)]
       const sourceLinks = [...content.matchAll(/\]\([^\n)]*sources\/[^/]+\.md#[^\s)]+\)/g)]
       if (sourceLinks.length !== citations.length || !children.length && !topic.archived && !citations.length) return false
@@ -703,7 +766,11 @@ export async function prepareTopics(root: string, pending: PendingBuild, committ
     if (!inScope(topic.id)) continue
     const page = build.pages[topic.path]
     if (!page) continue
-    try { page.content = rebind(page.content, topic.point_ids) }
+    try {
+      const content = rebind(page.content, topic.point_ids)
+      restoredPages ||= content !== page.content
+      page.content = content
+    }
     catch { delete build.pages[topic.path]; preservedGeneration.delete(topic.path); forceRebuild.add(topic.path) }
   }
   restoreTopicDependencies(build)
@@ -779,16 +846,7 @@ export async function prepareTopics(root: string, pending: PendingBuild, committ
     }
     const preserved = preservedGeneration.get(topic.path)
     content = normalizeCitations(updateTopicHeader(content, topic.models, preserved?.generation ?? generationHash, preserved?.input ?? pageInput(topic)), /\[(?:S-\d+|\d{14}-[a-z0-9]{7})#/.test(content))
-    dependencies.claims = topicSentences(content).filter(sentence => !sentence.navigation && !/^(?:#|范围：)/.test(sentence.text)).map(sentence => {
-      // 同一结构主张中的多句共用句组末尾引用，保存逐句绑定时沿用该句组的证据。
-      const end = content.indexOf('\n', sentence.end)
-      const bound = content.slice(sentence.start, end < 0 ? content.length : end)
-      return {
-        text: topicClaimText(sentence.text.replace(/\[[^\]]*\]\([^)]*\)/g, '').replace(/^[-*+]\s+/, '')),
-        point_ids: citedTopicPoints(bound, topic.point_ids.map(id => points.get(id)!).filter(Boolean), anchors).map(point => point.point_id),
-        child_ids: effectiveChildren(build.state, topic).filter(child => bound.includes(`](${pageLink(topic.path, child.path)})`)).map(child => child.id),
-      }
-    })
+    dependencies.claims = topicPageClaims(topic, content, build.state, points, anchors)
     build.pages[topic.path] = { content, dependencies, input_fingerprint: preserved?.input ?? pageInput(topic), ...(preserved ? { generation_input_fingerprint: pageInput(topic) } : {}) }
     if (build.repairs) delete build.repairs[topic.id]
     topic.page_status = 'ready'
@@ -1333,7 +1391,7 @@ export async function prepareTopics(root: string, pending: PendingBuild, committ
     const direct = topic.direct_point_ids ?? []
     if (direct.length) body.push('## 本页保留要点\n\n' + direct.map(id => {
       const point = points.get(id)!
-      return `- ${prose(point.text)} ` + point.evidence.map(evidence => `[${evidence.source_id}@${evidence.source_version}#${evidence.locator}](${pageLink(topic.path, `sources/${evidence.source_id}.md`)}#^${anchors.get(id)![0]})`).join('；')
+      return `- ${prose(point.text)} ` + point.evidence.map((evidence, index) => `[${evidence.source_id}@${evidence.source_version}#${evidence.locator}](${pageLink(topic.path, `sources/${evidence.source_id}.md`)}#^${anchors.get(id)![index]})`).join('；')
     }).join('\n'))
     const header = stringify({ id: topic.id, page_type: 'topic', aliases: topic.aliases ?? [], title: topic.title, source_type: '综合', credibility: 'mixed', source_date: dates.length ? `${dates[0]}/${dates.at(-1)}` : 'unknown',
       sources: topic.sources, models: topic.models.map(model => `${model.provider}/${model.model}`),
@@ -1470,5 +1528,5 @@ export async function prepareTopics(root: string, pending: PendingBuild, committ
     || Boolean(committed.topics && Object.keys(build.state.vectors).some(id => committed.topics!.vectors[id]?.vector_id !== build.state.vectors[id]?.vector_id))
   pending.manifest.topic_sequence = { root: build.state.next_topic_number, children: build.state.next_children ?? {} }
   if (!changed && storageJson(build.state) !== originalState) await writeJson(root, 'state/topics.json', build.state)
-  return { changed, modelCalls: build.model_calls - before }
+  return { changed: requestedTopics && !requestedTopics.length ? restoredEmbedding || restoredPages : changed, modelCalls: build.model_calls - before }
 }

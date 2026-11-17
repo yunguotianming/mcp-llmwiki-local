@@ -290,6 +290,17 @@ export async function readAccepted<T>(root: string, bindings: AcceptedReader, id
   if (!valid(value as T)) throw recoveryError('ACCEPTED_CORRUPT', '接受输出未通过当前业务校验。')
   return { value: value as T, record, snapshot }
 }
+/** 按检查点中的明确引用恢复成果，仍核验准备快照、生产链和当前业务绑定。 */
+export async function recoverAcceptedRef<T>(ref: AcceptedRef, matches: (identity: TaskIdentity) => boolean, valid: (value: T) => boolean) {
+  const context = contexts.getStore()
+  if (!context) throw recoveryError('ACCEPTANCE_BINDING_REQUIRED', '接受成果恢复需要持久化接点。')
+  if (ref.path !== taskPath(ref.taskId)) throw recoveryError('ACCEPTED_CORRUPT', '业务检查点接受路径不符。')
+  const record = await readRecord(context.root, ref.taskId)
+  if (!record) throw recoveryError('ACCEPTED_MISSING', '业务检查点引用的接受记录缺失。')
+  if (record.acceptedDigest !== ref.digest || !matches(record.identity)) throw recoveryError('ACCEPTED_CORRUPT', '业务检查点接受摘要或任务绑定不符。')
+  return { ...(await recoverAccepted<T>(record.identity, valid))!, record }
+}
+
 export async function recoverAccepted<T>(identity: TaskIdentity, valid: (value: T) => boolean): Promise<{ value: T; reused: true; acceptedRef: AcceptedRef } | undefined> {
   const context = contexts.getStore()!, taskId = taskIdFor(identity)
   const saved = await readAccepted(context.root, context.bindings, identity, valid)

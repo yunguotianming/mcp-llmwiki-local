@@ -104,7 +104,7 @@ export async function buildLayeredLibrary(options: RecoveryBuildOptions): Promis
     // 目标已经处理完但发布失败的同次作业仍须收尾，不能把它当成新的零目标请求。
     const finishing = saved?.format_version === formatVersion && saved.base_version === current?.version && !saved.source_scope
       && scope && scope.targets.length > 0 && scope.targets.every(id => typeof id === 'string' && id.trim() && scope.completed.includes(id))
-      && new Set(scope.targets).size === scope.targets.length && scope.completed.every(id => scope.targets.includes(id))
+      && new Set(scope.targets).size === scope.targets.length && scope.completed.every(id => scope.targets.some(target => target === id || target.startsWith(id + '-')))
       && requested && new Set(requested).size === scope.targets.length && requested.every(id => scope.targets.includes(id))
       && !options.retryTopics.reasons?.length
     finishingTopicRecovery = Boolean(finishing)
