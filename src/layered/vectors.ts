@@ -1,8 +1,9 @@
+import type { TopicState } from './schema.js'
 import { hash, hashName, immutableWrite, readVerifiedObject } from './files.js'
 
 export type VectorPrecision = 'float32' | 'float16'
 export interface VectorIdentity { provider: string; service_url?: string; model: string; revision: string; preprocessing: string; query_preprocessing?: string; dimensions: number; input_hash: string }
-export interface VectorReference { vector_id: string; input_hash: string; vector: number[] }
+export interface VectorReference { vector_id: string; input_hash: string; vector: readonly number[] }
 const magic = Buffer.from('LWV1')
 
 // IEEE 754 binary16，最近偶数舍入；只接收有限数值。
@@ -20,7 +21,7 @@ function unhalf(bits: number): number {
   if (exponent === 31) throw new Error('向量含非有限数值。')
   return sign * (exponent ? (1 + fraction / 1024) * 2 ** (exponent - 15) : fraction * 2 ** -24)
 }
-export function encodeVector(vector: number[], precision: VectorPrecision): Buffer {
+export function encodeVector(vector: readonly number[], precision: VectorPrecision): Buffer {
   if (!vector.length || vector.some(value => !Number.isFinite(value))) throw new Error('向量为空或含非有限数值。')
   const bytes = Buffer.alloc(vector.length * (precision === 'float16' ? 2 : 4))
   vector.forEach((value, index) => precision === 'float16' ? bytes.writeUInt16LE(half(value), index * 2) : bytes.writeFloatLE(value, index * 4))
@@ -42,7 +43,7 @@ export const vectorPath = (id: string): string => {
   if (!/^sha256:[a-f0-9]{64}$/.test(id)) throw new Error('向量 ID 无效。')
   return `objects/vectors/${hashName(id)}.bin`
 }
-export async function putVector(root: string, identity: VectorIdentity, vector: number[], precision: VectorPrecision): Promise<VectorReference> {
+export async function putVector(root: string, identity: VectorIdentity, vector: readonly number[], precision: VectorPrecision): Promise<VectorReference> {
   if (identity.dimensions !== vector.length || !identity.revision || !identity.provider || !identity.model || !identity.preprocessing) throw new Error('向量身份或维数无效。')
   identity = { provider: identity.provider, model: identity.model, revision: identity.revision, preprocessing: identity.preprocessing, ...(identity.query_preprocessing ? { query_preprocessing: identity.query_preprocessing } : {}), dimensions: identity.dimensions, input_hash: identity.input_hash,
     ...(identity.service_url ? { service_url: identity.service_url } : {}) }
@@ -80,6 +81,14 @@ function parseVector(bytes: Buffer, id: string) {
   if (payload.length / width !== header.identity.dimensions) throw new Error('向量维数不匹配。')
   let vector: number[] | undefined
   return { identity: header.identity, precision: header.precision, get vector() { return vector ??= decodeVector(payload, header.precision) } }
+}
+
+// 只复制可变主题元数据；向量和质心只读共享，修改数值必须整体替换数组。
+export function cloneTopicState(state: TopicState): TopicState {
+  const cloned: TopicState = structuredClone({ ...state, vectors: {}, topics: state.topics.map(topic => ({ ...topic, centroid: [] })) })
+  cloned.vectors = Object.fromEntries(Object.entries(state.vectors).map(([id, reference]) => [id, { ...reference }]))
+  cloned.topics.forEach((topic, index) => { topic.centroid = state.topics[index]!.centroid })
+  return cloned
 }
 
 // 所有分层 JSON 共用一个持久化边界，禁止把运行时向量和衍生质心写入状态。
@@ -129,7 +138,7 @@ export async function hydrateVectors<T>(root: string, value: T, tolerateMissing 
       const { readPageObject } = await import('./objects.js')
       record.content = await readPageObject(root, record.content_id)
     }
-    for (const [key, child] of Object.entries(record)) if (key !== 'vector' && key !== 'page_vectors') await visit(child)
+    for (const [key, child] of Object.entries(record)) if (key !== 'vector' && key !== 'centroid' && key !== 'page_vectors') await visit(child)
     if (Array.isArray(record.topics) && record.vectors) {
       const { refreshTree } = await import('./hierarchy.js')
       refreshTree(record as unknown as import('./schema.js').TopicState)

@@ -2,7 +2,7 @@
 
 llmwiki-local 是独立运行的本地 stdio MCP 服务，让 Codex 等客户端查询 Markdown 知识库、生成预览、确认发布，以及复制已有库并更换向量模型。无需安装 dsh。
 
-代码最初复制自 dsh-llmwiki 的 `ff44903`，共享建库、存储和查询代码按固定提交同步，独立安装、独立维护。当前预览版本为 **[0.3.0-preview.10](https://github.com/yunguotianming/mcp-llmwiki-local/releases/tag/0.3.0-preview.10)**，通过本仓 GitHub Release 独立分发。本版让来源定向补缺在牵涉主题时沿用原主题嵌入成果继续执行；补缺核对未形成可接受结果时保留上一版提取与原判定，在构建日志登记“补缺延后”，续跑时把旧版本留下的无接受来源补缺成果恢复后重新核对；自定义提取档位的未变来源续建时不再重复提取。主题定向恢复新增显式选项 `renewReviewWindow`，可为核对期限已过的选中主题再授予一次 20 分钟核对窗口，从首次实际续核起算并固定保存，不增加轮次，保留已有修复稿、接受成果与费用记录。更新包后重启 MCP 服务以加载新构建。正式 0.3.0、三库补建与 AC27 查询质量验收另行记录，预览包验证不替代这些验收。适配层负责配置、模型调用与 MCP；package.json 的 repository 记录本仓发布地址，source 记录同源插件的同步依据。许可与第三方声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+代码最初复制自 dsh-llmwiki 的 `ff44903`，共享建库、存储和查询代码按固定提交同步，独立安装、独立维护。当前预览版本为 **[0.3.0-preview.11](https://github.com/yunguotianming/mcp-llmwiki-local/releases/tag/0.3.0-preview.11)**，通过本仓 GitHub Release 独立分发。本版修复两处续建问题：主题定向恢复续跑时，上一段已判失败、没有页面的主题与本次失败项一并移出发布树，发布前发布树中仍有无页主题时以 `TOPIC_PAGE_MISSING` 暂停并保留检查点，不再报类型错误；主题恢复先校验检查点版本与身份再展开向量，克隆主题状态时共享只读向量，在约 3.3 万条 4096 维向量的库上，主题恢复阶段的堆峰值从约 7.8GB 降到约 1.6GB。此前的来源补缺沿用主题嵌入成果、补缺延后登记、自定义档位未变来源零重提、`renewReviewWindow` 续时选项、旧库升级、引文换行兼容、旧页导航保留和历史要点向量缓存恢复继续保留。更新包后重启 MCP 服务以加载新构建。预览版的发布与各库续建、正式质量验收分别记录。实际同步提交和适配范围见[源仓库文件对照](docs/06-验收与测试/01-源仓库文件对照.md)，验收与发布状态见[项目进度](docs/00-项目进度/01-项目进度.md)。适配层负责配置、模型调用与 MCP；package.json 的 repository 记录本仓发布地址，source 记录同源插件的同步依据。许可与第三方声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 ## 1. 安装与启动
 

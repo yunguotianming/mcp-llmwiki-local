@@ -431,6 +431,10 @@ export async function publishLibrary(root: string, pending: PendingBuild, signal
     dependency.sources = [...new Set(dependency.points.map(point => point.point_id.split(':')[0]!))].sort()
   }
   indexDependencies(deps)
+  // 发布树中的主题必须已有可发布页面；未完成或残留的无页主题保留检查点并暂停，不发布半成品。
+  const unpublished = (pending.topics?.state.topics ?? []).filter(topic => !deps.pages[topic.path])
+  if (unpublished.length) throw Object.assign(new Error('主题尚未形成可发布页面，保留检查点并暂停：' + unpublished.map(topic => topic.id).join('、')),
+    { stagePause: true, stage: 'topic', code: 'TOPIC_PAGE_MISSING' })
   for (const topic of pending.topics?.state.topics ?? []) topic.sources = [...deps.pages[topic.path]!.sources]
   const card = pending.card, navigation = [`# ${card.name}`, card.domain, `来源数：${card.source_count}；更新时间：${card.updated_at}`, '## 来源',
     ...pending.manifest.sources.map(entry => `- [${entry.source_id} ${entry.metadata.title.replace(/[\r\n]+/g, ' ').replaceAll('[', '\\[').replaceAll(']', '\\]')}](sources/${entry.source_id}.md) — ${entry.metadata.source_type.replace(/[\r\n]+/g, ' ')}；${entry.metadata.source_date}；${entry.current_path.replace(/[\r\n]/g, ' ')}`)]

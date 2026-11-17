@@ -13,20 +13,22 @@ import type { EmbeddingClient, EmbeddingIdentity, Point, TopicState } from './sc
 
 export { embeddingBackoff as backoff } from './embedding-service.js'
 
-export function normalized(vector: number[]): number[] {
+export function normalized(vector: readonly number[]): number[] {
   if (!Array.isArray(vector) || !vector.length || vector.some(value => typeof value !== 'number' || !Number.isFinite(value))) throw new Error('嵌入向量为空或包含无效数值。')
   const length = Math.hypot(...vector)
   if (!Number.isFinite(length) || !length) throw new Error('嵌入向量长度无效。')
   return vector.map(value => value / length)
 }
-export function similarity(left: number[], right: number[]): number {
+export function similarity(left: readonly number[], right: readonly number[]): number {
   if (left.length !== right.length) throw new Error('嵌入向量维度不一致。')
   let sum = 0
   // 维度顺序和逐项乘加保持不变，避免高维近邻循环为每个元素调用回调。
   for (let index = 0; index < left.length; index++) sum += left[index]! * right[index]!
   return sum
 }
-export function centroid(vectors: number[][]): number[] {
+export function centroid(vectors: number[][]): number[]
+export function centroid(vectors: readonly (readonly number[])[]): readonly number[]
+export function centroid(vectors: readonly (readonly number[])[]): readonly number[] {
   if (!vectors.length) return []
   const sum = vectors[0]!.map(() => 0)
   for (const vector of vectors) {
@@ -37,13 +39,13 @@ export function centroid(vectors: number[][]): number[] {
   return sum.some(value => value !== 0) ? normalized(sum) : vectors[0]!
 }
 
-interface CentroidInput { vector: number[]; vector_id?: string; input_hash: string }
-interface CentroidSnapshot { ids: string[]; inputs: { vector: number[] | undefined; vectorId: string | undefined; inputHash: string | undefined }[]; value: number[] }
+interface CentroidInput { vector: readonly number[]; vector_id?: string; input_hash: string }
+interface CentroidSnapshot { ids: string[]; inputs: { vector: readonly number[] | undefined; vectorId: string | undefined; inputHash: string | undefined }[]; value: readonly number[] }
 // 严格与容忍缺失两种口径结果不同，分开缓存，交替调用时互不挤出。
 const centroidCaches = [new WeakMap<object, CentroidSnapshot>(), new WeakMap<object, CentroidSnapshot>()] as const
 // 向量数组写入后不原地修改（解码、嵌入、归一化都返回新数组），按数组身份、对象 ID 和输入哈希判定命中。
 // 命中只比较成员身份，不逐维比较、不另存数值副本：护士库 3 万余条 4096 维向量另存副本约占 1GB。
-export function cachedCentroid(owner: object, ids: readonly string[], vectors: Record<string, CentroidInput>, tolerateMissing = false): number[] {
+export function cachedCentroid(owner: object, ids: readonly string[], vectors: Record<string, CentroidInput>, tolerateMissing = false): readonly number[] {
   const cache = centroidCaches[tolerateMissing ? 1 : 0], previous = cache.get(owner)
   if (previous && previous.ids.length === ids.length && ids.every((id, index) => {
     const input = vectors[id], saved = previous.inputs[index]!

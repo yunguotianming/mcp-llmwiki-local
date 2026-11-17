@@ -10,7 +10,7 @@ import { memberContentHash } from './membership.js'
 import { identityRule, attributionRule, topicEvidenceContextRule, topicStudyRule } from './quality-prompts.js'
 import { compactCitationVersions, evidenceBlockIds, expandCitationVersions, restoreCitationVersions } from './anchors.js'
 import { readPageObject, readVersion, versionPage } from './objects.js'
-import { hydrateVectors, readVectorRecord, storageJson } from './vectors.js'
+import { cloneTopicState, hydrateVectors, readVectorRecord, storageJson } from './vectors.js'
 import { recordIdentity, sameIdentity } from './vector-identity.js'
 import { mapConcurrent } from '../llm/scheduler.js'
 import { localReferences } from './references.js'
@@ -189,16 +189,16 @@ function rebindCitations(content: string, points: Map<string, Point>, previous: 
       ? prefix + [...new Set(ids.filter(pointId => pointId.startsWith(id + ':')).map(pointId => points.get(pointId)!.locator))].join('、') : line)
 }
 export async function previousState(root: string, committed: SnapshotManifest, deps: Dependencies, settings: ReturnType<typeof layeredSettings>): Promise<TopicState> {
-  if (committed.rebuild_pages?.length && committed.topics) return hydrateVectors(root, structuredClone(committed.topics), true)
-  const saved = await hydrateVectors(root, await readOptional<TopicState>(await safePath(root, 'state/topics.json')), true)
+  if (committed.rebuild_pages?.length && committed.topics) return hydrateVectors(root, cloneTopicState(committed.topics), true)
+  const saved = await readOptional<TopicState>(await safePath(root, 'state/topics.json'))
   if (saved?.version === committed.version && saved.format_version === 1
     && saved.topics.length === Object.keys(deps.pages).filter(page => page.startsWith('topics/')).length
     && saved.topics.every(topic => deps.pages[topic.path] && (deps.pages[topic.path]!.children?.length || JSON.stringify(topic.point_ids) === JSON.stringify(deps.pages[topic.path]!.points.map(point => point.point_id))))) {
     for (const topic of saved.topics) topic.revisions = Number.isSafeInteger(topic.revisions) && topic.revisions >= 0 ? topic.revisions : 0
-    return saved
+    return hydrateVectors(root, saved, true)
   }
   // 派生状态丢失时从发布清单恢复候选及其旧向量，不能把它们当成本轮新点。
-  if (committed.topics) return hydrateVectors(root, structuredClone(committed.topics), true)
+  if (committed.topics) return hydrateVectors(root, cloneTopicState(committed.topics), true)
   const topics: Topic[] = []
   for (const [page, dependency] of Object.entries(deps.pages)) {
     if (!page.startsWith('topics/')) continue
@@ -248,7 +248,7 @@ export async function preserveRecoveryEmbedding(root: string, pending: PendingBu
     if (!sameIdentity(recordIdentity(record, original.url), locked) || record.identity.input_hash !== reference.input_hash) return reject()
   }
   pending.topics.state.embedding = structuredClone(original)
-  pending.topics.state.vectors = (await hydrateVectors(root, structuredClone(committed.topics))).vectors
+  pending.topics.state.vectors = cloneTopicState(committed.topics).vectors
   if (pending.manifest.topics) {
     pending.manifest.topics.embedding = structuredClone(original)
     pending.manifest.topics.vectors = pending.topics.state.vectors
@@ -265,7 +265,10 @@ export async function prepareTopics(root: string, pending: PendingBuild, committ
   }
   const requestedTopics = options.retryTopics ? requestTopicRecovery(pending, options.retryTopics) : undefined
   const restoredEmbedding = await preserveRecoveryEmbedding(root, pending, committed)
-  if (restoredEmbedding) await writeJson(root, 'work/pending.json', pending)
+  if (restoredEmbedding) {
+    await hydrateVectors(root, pending.topics!.state)
+    await writeJson(root, 'work/pending.json', pending)
+  }
   if (requestedTopics && !requestedTopics.length) return { changed: restoredEmbedding, modelCalls: 0 }
   const scope = pending.topic_scope, scopeIds = new Set(scope?.targets)
   if (scope) {
@@ -391,7 +394,7 @@ export async function prepareTopics(root: string, pending: PendingBuild, committ
       pages[topic.path] = { content, dependencies: deps.pages[topic.path]!, input_fingerprint: String(header.input_fingerprint ?? ''),
         ...(header.generation_input_fingerprint ? { generation_input_fingerprint: String(header.generation_input_fingerprint) } : {}) }
     }
-    pending.topics = { fingerprint: '', configuration_fingerprint: configurationFingerprint, state: structuredClone(previous), pages,
+    pending.topics = { fingerprint: '', configuration_fingerprint: configurationFingerprint, state: cloneTopicState(previous), pages,
       gaps: structuredClone(committed.topic_gaps), repairs: structuredClone(committed.topic_recovery?.repairs ?? {}), rewritten: [], model_calls: 0 }
   }
   const saved = pending.topics
@@ -447,7 +450,7 @@ export async function prepareTopics(root: string, pending: PendingBuild, committ
   const stale = saved?.state.topics.some(topic => [...topic.point_ids, ...(topic.direct_point_ids ?? [])].some(id => !points.has(id)))
   if (saved?.fingerprint !== fingerprint || stale || retrying) {
     let baseline = resumable ? saved.state : previous
-    const state = structuredClone(baseline), identity = scope ? structuredClone(baseline.embedding) : { ...(lexical ? { url: 'lexical:', model: lexical.identity.model } : embeddingEndpoint(settings)), precision: lexical ? lexical.identity.precision : settings.vectorPrecision,
+    const state = cloneTopicState(baseline), identity = scope ? structuredClone(baseline.embedding) : { ...(lexical ? { url: 'lexical:', model: lexical.identity.model } : embeddingEndpoint(settings)), precision: lexical ? lexical.identity.precision : settings.vectorPrecision,
       ...(options.vectorIdentity ? { identity: options.vectorIdentity } : {}) }
     const pages = resumable ? { ...saved.pages } : {}
     if (resumable) {
@@ -477,7 +480,7 @@ export async function prepareTopics(root: string, pending: PendingBuild, committ
     const candidateBaseline = baseline
     if (lexical || baseline.embedding.identity?.provider === 'lexical') {
       // 切换及 IDF 更新时，身份接续只看成员；涉及距离的旧树比较也使用本轮词项/语义空间。
-      baseline = { ...structuredClone(baseline), embedding: state.embedding, vectors: state.vectors }
+      baseline = { ...cloneTopicState(baseline), embedding: state.embedding, vectors: state.vectors }
       refreshTree(baseline)
     }
     const vectors = Object.values(state.vectors)
@@ -1440,6 +1443,8 @@ export async function prepareTopics(root: string, pending: PendingBuild, committ
   if (stopped) throw failure
   // 整个主题阶段已结束；已合并、被替代或不再存在的缺口也不遗留重试队列项。
   if (pending.retry_units) pending.retry_units = pending.retry_units.filter(unit => !unit.startsWith('topic:') || scope && !scopeIds.has(unit.slice(6)))
+  // 续跑承接范围内已完成的失败判定；未处理目标仍按原范围保留。
+  for (const topic of build.state.topics) if (scope?.completed.includes(topic.id) && topic.page_status === 'failed' && !build.pages[topic.path]) failed.add(topic.id)
   build.state.topics = build.state.topics.filter(topic => !failed.has(topic.id))
   for (const [id, target] of Object.entries(build.aliases ?? {})) if (failed.has(target)) delete build.aliases![id]
   pending.manifest.topic_gaps = build.gaps ?? []

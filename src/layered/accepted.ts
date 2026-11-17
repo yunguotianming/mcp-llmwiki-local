@@ -380,6 +380,8 @@ export async function verifyAcceptedRefs(value: unknown, activeOnly = false): Pr
   const visit = async (node: unknown): Promise<void> => {
     if (!node || typeof node !== 'object') return
     for (const [key, child] of Object.entries(node)) {
+      // 数值数组不含接受引用，避免为整库向量逐维创建遍历条目。
+      if (key === 'vector' || key === 'centroid') continue
       if (key === 'acceptedRef' && child) {
         const ref = child as AcceptedRef
         if (activeOnly && !activeAcceptedRefs([ref]).length) continue

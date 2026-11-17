@@ -29,7 +29,7 @@ import { extractSourceReceipt, extractionFingerprint, extractionNeedsRetry, grou
 import { finishPublication, initializeLibrary, publishLibrary, readCurrent, readExtraction, readManifest } from './publication.js'
 import { readLocalSource, segmentResources, snapshotSource } from './snapshot.js'
 import { formatVersion } from './schema.js'
-import { prepareTopics } from './topics.js'
+import { prepareTopics, preserveRecoveryEmbedding } from './topics.js'
 import { prepareTerms } from './terms.js'
 import { prepareTagMerges } from './tag-merges.js'
 import { checkGeneration, readRevocations, revokeSourcesAtRoot } from './revocations.js'
@@ -127,7 +127,7 @@ export async function buildLayeredLibrary(options: RecoveryBuildOptions): Promis
     await claimWriter(root, settingsForWriter.writerTakeoverToken)
     return withStorageGeneration(root, async () => {
     const current = await readCurrent(root)
-    let pending = await hydrateVectors(root, await readOptional<IncrementalPending>(await safePath(root, 'work/pending.json')), true)
+    let pending = await readOptional<IncrementalPending>(await safePath(root, 'work/pending.json'))
     if (pending?.version && pending.version === current?.version) {
       await finishPublication(root, pending); pending = undefined
       await unlink(await safePath(root, 'work/preview.json')).catch(error => { if (error.code !== 'ENOENT') throw error })
@@ -143,7 +143,7 @@ export async function buildLayeredLibrary(options: RecoveryBuildOptions): Promis
     if (pending && (pending.format_version !== formatVersion || pending.base_version !== (current?.version ?? null))) throw new Error('待更新清单基线不匹配，已保留现场。')
     const card: LibraryCard = { ...initialCard, ...parse(await readFile(await safePath(root, 'library.yaml'), 'utf8')) }
     if (card.origin_type !== initialCard.origin_type) throw new Error('库的来源载体与建库配置不一致。')
-    const originalCard = JSON.stringify(card)
+    const originalCard = JSON.stringify(card), restoring = Boolean(pending)
     card.name = options.name ?? card.name; card.domain = options.domain ?? card.domain
     card.source_type = options.sourceType ?? card.source_type; card.default_credibility = options.defaultCredibility ?? card.default_credibility
     pending ??= { format_version: formatVersion, base_version: current?.version ?? null, version: null, manifest: structuredClone(committed), card,
@@ -189,6 +189,9 @@ export async function buildLayeredLibrary(options: RecoveryBuildOptions): Promis
       }
     }
     if (pending.topic_scope) pending.topic_scope.source_input ??= JSON.stringify(pending.manifest.sources.map(source => [source.source_id, source.source_version, source.content_hash]).sort())
+    // 检查点基线与定向恢复身份通过后才展开向量；已发布收尾无需水合。
+    await preserveRecoveryEmbedding(root, pending, committed)
+    if (restoring) await hydrateVectors(root, pending, true)
     options = { ...options, retryGaps: false }
     const finishRetry = async (unit: string) => {
       if (!pending.retry_units?.includes(unit)) return

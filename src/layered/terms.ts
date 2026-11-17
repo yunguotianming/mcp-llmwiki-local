@@ -36,8 +36,8 @@ interface PackedVector { values: Float32Array; scale: number }
 
 // 调用方提供本轮不可变的成员向量和按成员数失效的质心；缓存不跨发布轮次。
 export function createTermSearch<T extends { id: string }>() {
-  const packed = new WeakMap<number[], PackedVector>()
-  const prepare = (vector: number[]) => {
+  const packed = new WeakMap<readonly number[], PackedVector>()
+  const prepare = (vector: readonly number[]) => {
     let result = packed.get(vector)
     if (!result) {
       const scale = Math.hypot(...vector)
@@ -46,7 +46,7 @@ export function createTermSearch<T extends { id: string }>() {
     }
     return result
   }
-  return (records: T[], eligible: T[], vector: number[], center: (record: T) => number[], threshold: number): T | undefined => {
+  return (records: T[], eligible: T[], vector: readonly number[], center: (record: T) => readonly number[], threshold: number): T | undefined => {
     if (!eligible.length) return undefined
     const input = prepare(vector)
     const score = (record: T) => {
@@ -173,7 +173,7 @@ export async function prepareTerms(root: string, pending: PendingBuild, committe
     // 仍有贡献的旧身份先保留，后来的同名项不能抢走尚未遍历到的身份。
     const reservedIds = new Set(contributions.flatMap(item => retainedKeys.get(item.key)?.id ?? []))
     // 本循环对记录只做追加或合并成员，成员数变化即需重算；同一数组对象、同样成员数时质心不变。
-    const centroids = new WeakMap<TermRecord, { count: number; value: number[] }>()
+    const centroids = new WeakMap<TermRecord, { count: number; value: readonly number[] }>()
     const recordCentroid = (record: TermRecord) => {
       const cached = centroids.get(record)
       if (cached && cached.count === record.contributions.length) return cached.value

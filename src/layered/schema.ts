@@ -190,14 +190,14 @@ export interface Topic {
   models?: ModelRef[]
   aliases?: string[]
   id: string; parent_id: string | null; path: string; title: string; summary: string
-  centroid: number[]; sources: string[]; point_ids: string[]; revisions: number
+  centroid: readonly number[]; sources: string[]; point_ids: string[]; revisions: number
   archived?: boolean; direct_point_ids?: string[]
 }
 export interface TopicState {
   excluded_members?: Record<string, Record<string, { content_hash: string; reason: string }>>
   format_version: number; version: string | null; next_topic_number: number
   embedding: { url: string; model: string; precision?: 'float32' | 'float16'; identity?: EmbeddingIdentity }; topics: Topic[]
-  vectors: Record<string, { input_hash: string; vector: number[]; vector_id?: string }>
+  vectors: Record<string, { input_hash: string; vector: readonly number[]; vector_id?: string }>
   next_children?: Record<string, number>
   candidates?: string[][]
   logical_sources?: Record<string, string>
@@ -221,7 +221,7 @@ export interface TermContribution {
   referent?: string | undefined
   logical_source_id?: string
   key: string; source_id: string; source_version: string; text_hash: string; locator: string
-  note: string | null; name: string; category: string; aliases: string[]; point_ids: string[]; vector: number[]
+  note: string | null; name: string; category: string; aliases: string[]; point_ids: string[]; vector: readonly number[]
   embedding?: string
   vector_id?: string
 }

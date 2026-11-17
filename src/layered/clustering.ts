@@ -10,10 +10,10 @@ export interface ClusterStats {
   maxBlockSize: number; maxNeighbors: number; graphEdges: number; peakHeap: number
   comparisons: number; clusteredPoints: number
 }
-interface Group { ids: string[]; mean: number[] }
+interface Group { ids: string[]; mean: readonly number[] }
 interface Edge { a: number; b: number; score: number }
 const order = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0
-const dot = (a: number[], b: number[]) => { let sum = 0; for (let i = 0; i < a.length; i++) sum += a[i]! * b[i]!; return sum }
+const dot = (a: readonly number[], b: readonly number[]) => { let sum = 0; for (let i = 0; i < a.length; i++) sum += a[i]! * b[i]!; return sum }
 
 class Heap<T> {
   items: T[] = []
